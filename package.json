@@ -2,12 +2,23 @@
   "name": "lain-memory",
   "version": "0.1.0",
   "private": true,
-  "description": "Standalone memory MCP server for Lain — Mem0/Qdrant vector memory + GraphRAG + contradiction detection",
-  "workspaces": ["packages/*"],
+  "type": "module",
+  "description": "Standalone memory server for Lain — Mem0/Qdrant vector memory + GraphRAG + contradiction detection",
   "scripts": {
-    "dev": "bun --cwd packages/memory-core run dev",
-    "start": "bun --cwd packages/memory-core run start",
-    "typecheck": "bun --cwd packages/memory-core run typecheck",
-    "test": "bun --cwd packages/memory-core test"
+    "dev": "bun run src/server.ts",
+    "start": "bun run src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src/"
+  },
+  "dependencies": {
+    "graphology": "^0.26.0",
+    "graphology-traversal": "^0.3.1",
+    "ioredis": "^5.10.1",
+    "mem0ai": "3.3.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.9.2"
   }
 }
