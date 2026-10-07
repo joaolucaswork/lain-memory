@@ -30,6 +30,7 @@ import {
   initGraph,
   query as graphQuery,
   cachedGetStats,
+  cachedGetGraphForPGS,
   listAllNodes,
   removeNodes,
   removeRelationships,
@@ -72,10 +73,11 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
   switch (path) {
     case '/api/memory/remember': {
-      const memOpts: { skipConflictCheck?: boolean; bundleMode?: boolean; inferFalse?: boolean } = {};
+      const memOpts: { skipConflictCheck?: boolean; bundleMode?: boolean; inferFalse?: boolean; skipQualityCheck?: boolean } = {};
       if (data.mode === 'index') memOpts.skipConflictCheck = true;
       else if (data.mode === 'bundle') memOpts.bundleMode = true;
       else if (data.mode === 'raw') memOpts.inferFalse = true;
+      if (data.skipQualityCheck) memOpts.skipQualityCheck = true;
       const result = await addMemoryWithConflictCheck(data.text, data.project, memOpts);
       return json(result);
     }
@@ -191,6 +193,11 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/graph/autoclean':
       return json(await runAutoclean());
+
+    case '/api/graph/dump': {
+      // Full graph payload for PGS sweeps running outside this server.
+      return json(await cachedGetGraphForPGS());
+    }
 
     case '/api/graph/ingest': {
       await ingestExtracted(data.entities ?? [], data.relationships ?? []);
