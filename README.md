@@ -6,7 +6,7 @@
 
 **This service** is Lain's long-term memory: it remembers what's worth keeping, resolves conflicts on write, ranks by relevance + freshness on read, and forgets what's stale. Vector memory (Mem0/Qdrant) for semantic recall, a knowledge graph (GraphRAG) for entity relationships, and background maintenance that keeps the whole thing trustworthy.
 
-Extracted from the Lain monorepo as an independently deployable HTTP service (`:3341`). Route shapes match Lain's `api-routes.ts`, so Lain cuts over by changing only its base URL. Frozen contract: [CONTRACT.md](./CONTRACT.md).
+Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for everything memory-related.
 
 ## How it answers that
 
@@ -23,8 +23,7 @@ Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an
 ```bash
 docker compose up -d          # Qdrant :6333 + Redis :6379
 
-cp .env.example .env          # set LAIN_WORKSPACE_DIR (must match Lain's)
-                              # + LAIN_LLM_BASE_URL / LAIN_LLM_API_KEY
+cp .env.example .env          # set LAIN_WORKSPACE_DIR + LLM keys
 
 bun install && bun run dev    # :3341
 curl localhost:3341/health
@@ -32,7 +31,7 @@ curl localhost:3341/health
 
 Supervised: `pm2 start ecosystem.config.cjs --only lain-memory`.
 
-> Strangler phase: `LAIN_INSTANCE_ID`, `LAIN_WORKSPACE_DIR`, `QDRANT_HOST/PORT`, `LAIN_REDIS_*` must match Lain's env (shared collection suffix, graph file, workspace). See CONTRACT.md.
+> `LAIN_INSTANCE_ID` suffixes the Qdrant collection, graph file and Redis prefix — instances sharing a workspace must use the same one.
 
 ## Configuration
 
@@ -107,4 +106,4 @@ bun test src/
 
 Notes: `@qdrant/js-client-rest` pinned to `1.18.0` (`1.19` breaks `client.search`). Back up Qdrant via the **snapshot API**, not by copying `./data/qdrant` live. Redis is cache-only — safe to drop.
 
-Deliberately **not** here (stays in Lain): session side-effects, Telegram/Obsidian bridge, file-store boot ingest, agent-spawn machinery, MCP proxy. See CONTRACT.md.
+Non-goals: channels, agent lifecycle, session side-effects, MCP proxying — this server owns persistence and retrieval only.

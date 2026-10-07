@@ -1,16 +1,13 @@
 /**
  * lain-memory HTTP server.
  *
- * Route shapes are intentionally identical to the lain monorepo's
- * api-routes.ts memory/graph endpoints (minus the `/api` consumer prefix
- * handling — this server serves the full paths itself), so the lain MCP
- * proxy can cut over by changing only its base URL (LAIN_MEMORY_BASE_URL).
+ * Serves the full `/api/...` memory/graph/seed/pgs surface:
+ * remember, recall, list, forget, add, context, update, consolidate,
+ * scan, resolve-entities, contradiction-scan, metrics, graph query/stats/
+ * nodes/remove/autoclean/dump/ingest, seed extract/list, pgs execute/stats.
  *
- * Deliberately NOT replicated from lain:
- * - session side-effects in remember (active-project hook, [FLUSH:id] hook)
- * - file-store bridge boot ingest (stays in lain until cutover)
- * - agent-stopped / claude-hooks / SSE / pending_count / Telegram piggyback
- * - MCP proxy protocol (:3340), vault store
+ * This server owns persistence and retrieval. It has no channels, no agent
+ * lifecycle, no session side-effects — consumers talk to it over HTTP.
  */
 
 import {
@@ -111,7 +108,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/context': {
-      // Spawn-context composition (ex-getContextForSpawn). Keeps the
+      // Spawn-context composition. Keeps the
       // query-building + budget logic server-side with the ranker.
       const result = await getContextForSpawn(data.message, data.project, data.charBudget, data.limits);
       return json({ context: result });
@@ -209,7 +206,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/seed/extract': {
-      // Same shape as lain api-routes.ts /api/seed/extract (Fase 4 move).
+      // Chunked fact/entity extraction from raw text or PDFs into seed files.
       const input = {
         type: data.type,
         source: data.source,
@@ -239,8 +236,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/pgs/execute': {
-      // Same shape as lain api-routes.ts /api/pgs/execute, but the graph
-      // comes from the local GraphRAG instead of an HTTP fetch.
+      // Partition → route → sweep → synthesize over the local GraphRAG.
       if (!data.query) return json({ error: 'query required' });
       const pgsGraph = await cachedGetGraphForPGS();
       if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });

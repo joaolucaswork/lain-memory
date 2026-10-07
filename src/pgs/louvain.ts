@@ -1,6 +1,6 @@
 /**
  * Louvain community detection — pure TypeScript, no dependencies.
- * Ported from pgs-engine for Lain's GraphRAG.
+ * Partitions the knowledge graph into communities for PGS sweeps.
  */
 
 import type { Community } from './defaults.js';

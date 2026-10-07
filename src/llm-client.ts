@@ -2,9 +2,8 @@
  * Shared LLM client — any OpenAI-compatible chat-completions endpoint.
  * Works with OpenRouter, Vercel AI Gateway, LiteLLM, Ollama, plain OpenAI, etc.
  *
- * Renamed from haiku.ts (legacy name from when this shelled out to Claude Haiku;
- * it has been plain HTTPS for a while). The old `runHaiku*` export names are kept
- * so existing callers keep working — prefer the `runFastLlm*` names in new code.
+ * The `runHaiku*` export names are aliases kept for existing callers —
+ * prefer the `runFastLlm*` names in new code.
  *
  * Env vars (new unified schema — LAIN_LLM_* wins, legacy keys are fallbacks):
  *   LAIN_LLM_BASE_URL    — OpenAI-compatible base URL (default: https://openrouter.ai/api/v1)

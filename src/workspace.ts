@@ -52,9 +52,7 @@ export const NOTES_DIR = join(WORKSPACE_DIR, 'notes');
 export const POOLS_STATE_PATH = join(WORKSPACE_DIR, 'agent-pools.json');
 export const REMOTE_HOSTS_PATH = join(WORKSPACE_DIR, 'remote-hosts.json');
 export const WORKSPACE_PREFS_PATH = join(WORKSPACE_DIR, '.workspace-prefs.json');
-// NOTE (lain-memory port): dropped the legacy `getClaudeBin` re-export from
-// cli-backend.ts (spawn machinery, stays in lain). It has zero consumers
-// anywhere in the lain monorepo.
+// NOTE: no spawn-machinery helpers live here — this module is paths only.
 
 export function ensureWorkspace(): void {
   for (const dir of [

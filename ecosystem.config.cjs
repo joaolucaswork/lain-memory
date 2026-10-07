@@ -1,13 +1,13 @@
 const fs = require('fs');
 const path = require('path');
 
-// Env source of truth is lain's server/.env (shared LLM/Qdrant/Redis keys).
-// Overrides below pin the memory server's port and workspace.
-const LAIN_ENV_PATH = '/Users/lucas/Documents/lain/server/.env';
+// Env source of truth is the repo-local .env (see .env.example).
+// Only the port is pinned here; everything else comes from .env.
+const ENV_PATH = path.join(__dirname, '.env');
 const envVars = {};
 
-if (fs.existsSync(LAIN_ENV_PATH)) {
-  const envContent = fs.readFileSync(LAIN_ENV_PATH, 'utf8');
+if (fs.existsSync(ENV_PATH)) {
+  const envContent = fs.readFileSync(ENV_PATH, 'utf8');
   envContent.split('\n').forEach(line => {
     const trimmed = line.trim();
     if (trimmed && !trimmed.startsWith('#')) {
@@ -42,8 +42,9 @@ module.exports = {
         ...envVars,
         NODE_ENV: 'production',
         LAIN_MEMORY_PORT: '3341',
-        // MUST match lain's workspace (shared graph.json/seeds) until cutover.
-        LAIN_WORKSPACE_DIR: '/Users/lucas/Documents/lain/lain-workspace',
+        // Live data path. Overridable via .env; the fallback keeps the
+        // current workspace (graph.json, seeds) if .env doesn't set it.
+        LAIN_WORKSPACE_DIR: envVars.LAIN_WORKSPACE_DIR ?? '/Users/lucas/Documents/lain/lain-workspace',
         PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || '/usr/bin:/bin'}`,
       },
     },

@@ -16,7 +16,6 @@ import { KNOWLEDGE_DIR, INSTANCE_ID } from './workspace.js';
 import { getConfig } from './config.js';
 import { getRedis, isRedisAvailable } from './redis.js';
 import { shouldRejectEntity, shouldRejectRelationship, sweepGraph, type SweepResult } from './graph-autoclean.js';
-import { getBridge } from './integration-bridge.js';
 import { withDistributedLock } from './distributed-lock.js';
 
 const GRAPH_FILENAME = INSTANCE_ID ? `graph-${INSTANCE_ID}.json` : 'graph.json';
@@ -297,7 +296,6 @@ function upsertEntity(name: string, type: EntityType, description?: string): str
       attrs.description = description;
     }
     graph.replaceNodeAttributes(id, attrs);
-    try { getBridge().syncGraphNodeToObsidian?.(id, { type, description: attrs.description }); } catch {}
   } else {
     graph.addNode(id, {
       type,
@@ -306,7 +304,6 @@ function upsertEntity(name: string, type: EntityType, description?: string): str
       lastSeen: now,
       mentions: 1,
     } as EntityAttrs);
-    try { getBridge().syncGraphNodeToObsidian?.(id, { type, description }); } catch {}
   }
 
   return id;

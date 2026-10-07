@@ -1,7 +1,7 @@
 /**
  * Mem0 Memory Backend
  *
- * Wraps the Mem0 SDK to provide semantic memory for Lain.
+ * Wraps the Mem0 SDK to provide semantic long-term memory.
  * Organizes memories by user (global) and project (scoped).
  *
  * Entity scheme:
@@ -13,13 +13,18 @@
 import { Memory, OpenAILLM, OpenAIEmbedder } from 'mem0ai/oss';
 import * as graphrag from './graphrag.js';
 import { getRedis, isRedisAvailable } from './redis.js';
-import { INSTANCE_ID } from './workspace.js';
+import { INSTANCE_ID, listProjects } from './workspace.js';
 import { withDistributedLock } from './distributed-lock.js';
-import type { MemoryLimits } from './progressive-context.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
-import { getBridge } from './integration-bridge.js';
 import { incrementMetric } from './mem-metrics.js';
 import { BOILERPLATE_PATTERNS } from './memory-patterns.js';
+
+/** Budget limits for spawn-context composition (see getContextForSpawn). */
+export interface MemoryLimits {
+  globalLimit: number;
+  projectLimit: number;
+  graphEnabled: boolean;
+}
 
 let client: Memory | null = null;
 
@@ -768,13 +773,6 @@ Original: ${text}`
     }
   }
 
-  // Fire-and-forget: sync to Obsidian vault
-  for (const item of mapped) {
-    if (item.id && item.id !== 'unknown' && item.id !== 'rejected') {
-      try { getBridge().syncMemoryToObsidian?.({ id: item.id, memory: item.memory, project, created_at: new Date().toISOString() }); } catch {}
-    }
-  }
-
   return mapped;
 }
 
@@ -1237,7 +1235,6 @@ export async function deleteMemory(memoryId: string): Promise<void> {
   const m = getClient();
   await m.delete(memoryId);
   invalidateMem0Cache().catch(() => {});
-  try { getBridge().deleteMemoryFromObsidian?.(memoryId); } catch {}
 }
 
 // C3: Update an existing memory by ID. Uses Mem0 SDK native update.
@@ -1597,7 +1594,7 @@ export function startMemoryMaintenance(): void {
       if (now.getDay() === 0 && now.getHours() < 6) {
         let weeklyDeleted = 0;
         let weeklyTotal = 0;
-        const projects = ['lain', 'reino-capital', 'kapso'];
+        const projects = listProjects().map(p => p.name);
         for (const proj of projects) {
           try {
             const scanStart = Date.now();
@@ -1617,14 +1614,7 @@ export function startMemoryMaintenance(): void {
             console.error(`[mem0] Auto-cleanup error for ${proj}:`, err);
           }
         }
-        try {
-          const { getBridge } = await import('./integration-bridge.js');
-          const sendTelegram = getBridge().sendTelegram;
-          if (sendTelegram) {
-            const chatId = process.env.LAIN_TELEGRAM_DEFAULT_CHAT_ID || '6187428254';
-            await sendTelegram(chatId, `🧹 <b>Weekly Mem0 cleanup</b>\n${weeklyTotal} revisadas, ${weeklyDeleted} removidas, ${result.consolidated} consolidadas`);
-          }
-        } catch { /* non-critical */ }
+        console.log(`[mem0] Weekly auto-cleanup: ${weeklyDeleted}/${weeklyTotal} deleted across ${projects.length} projects`);
       }
 
       // ── Importance backfill: score memories missing importance in Redis ──

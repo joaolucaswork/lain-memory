@@ -25,7 +25,7 @@ export const BOILERPLATE_PATTERNS: RegExp[] = [
 ];
 
 // ─── Technical-memory quality helpers ───────────────────────────────────────
-// Verbatim from lain memory-patterns.ts (Fase 4). Pure regex, zero deps.
+// Pure regex, zero deps.
 
 const TECHNICAL_PATTERNS: RegExp[] = [
   /https?:\/\/[^\s]+/i,                          // URL
@@ -71,7 +71,6 @@ export function scoreActionability(text: string): number {
 /**
  * Score a fact for quality. Higher = more valuable.
  * Filters out boilerplate and scores based on specificity.
- * Verbatim from lain seed-extraction.ts (Fase 4).
  */
 export function scoreFactQuality(fact: string): number {
   let score = 0;
