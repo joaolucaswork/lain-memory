@@ -40,3 +40,6 @@ services:
 
 volumes:
   lain-memory-redis:
+    # Explicit name: without this, compose prefixes the volume with the
+    # project name (lain-memory_lain-memory-redis), orphaning manual ops.
+    name: lain-memory-redis
