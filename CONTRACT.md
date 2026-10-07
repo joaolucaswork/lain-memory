@@ -39,7 +39,11 @@ resolve-entities contradiction-scan metrics`, plus thin-client endpoints
 `add` (direct addMemory with opts), `context` (spawn composition), and
 `graph/ingest` (seed entity ingestion). Recall accepts `cached: true` for
 the Redis-backed `cachedSearchMemory` path. Graph: `query stats nodes
-remove-nodes remove-relationships autoclean ingest`. Auth: Bearer
+remove-nodes remove-relationships autoclean ingest`. Seeds: `seed/extract`
+(`{ type source rawText? project? phone? }` → `{ success id title summary
+facts_count entities_count message }`), `seed/list` (`{ project? }` → array).
+PGS: `pgs/execute` (`{ query mode? sessionId? }`, graph from local GraphRAG),
+`pgs/stats` (partition summaries). Auth: Bearer
 `LAIN_API_KEY`; empty key = open localhost (same as lain `validateApiKey`).
 
 ## Deliberate divergences from lain
@@ -51,4 +55,6 @@ remove-nodes remove-relationships autoclean ingest`. Auth: Bearer
 4. `progressive-context.ts` is a stub exporting only `MemoryLimits`
    (interface copied verbatim; spawn machinery stays in lain).
 5. `workspace.ts` drops the dead `getClaudeBin` re-export (zero consumers).
-6. No PGS, seeds, agent-stopped, claude-hooks, SSE, MCP proxy (phase 4 / never).
+6. No agent-stopped, claude-hooks, SSE, MCP proxy (never).
+7. Fase 4 moved: `pgs/` engine, `seed-extraction.ts`, `pdf-reader/` (seed PDF
+   ingestion only; the `pdf_read` MCP tool stays in lain).

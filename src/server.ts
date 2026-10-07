@@ -10,7 +10,7 @@
  * - session side-effects in remember (active-project hook, [FLUSH:id] hook)
  * - file-store bridge boot ingest (stays in lain until cutover)
  * - agent-stopped / claude-hooks / SSE / pending_count / Telegram piggyback
- * - MCP proxy protocol (:3340), vault store, PGS, seeds (phase 4)
+ * - MCP proxy protocol (:3340), vault store
  */
 
 import {
@@ -40,6 +40,10 @@ import {
 } from './graphrag.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
 import { getMetrics } from './mem-metrics.js';
+import { extractSeed, listSeeds } from './seed-extraction.js';
+import { PGSEngine } from './pgs/index.js';
+import { createPGSProviders } from './pgs/haiku-provider.js';
+import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
@@ -202,6 +206,69 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/graph/ingest': {
       await ingestExtracted(data.entities ?? [], data.relationships ?? []);
       return json({ success: true });
+    }
+
+    case '/api/seed/extract': {
+      // Same shape as lain api-routes.ts /api/seed/extract (Fase 4 move).
+      const input = {
+        type: data.type,
+        source: data.source,
+        rawText: data.rawText,
+        project: data.project,
+        phone: data.phone,
+      };
+      try {
+        const output = await extractSeed(input);
+        return json({
+          success: true,
+          id: output.id,
+          title: output.title,
+          summary: output.summary,
+          facts_count: output.facts.length,
+          entities_count: output.entities.length,
+          message: `Extracted ${output.facts.length} facts and ${output.entities.length} entities from "${output.title}"`,
+        });
+      } catch (err: unknown) {
+        console.error('[lain-memory] seed/extract handler error:', err);
+        return json({ success: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    case '/api/seed/list': {
+      return json(listSeeds(data.project));
+    }
+
+    case '/api/pgs/execute': {
+      // Same shape as lain api-routes.ts /api/pgs/execute, but the graph
+      // comes from the local GraphRAG instead of an HTTP fetch.
+      if (!data.query) return json({ error: 'query required' });
+      const pgsGraph = await cachedGetGraphForPGS();
+      if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
+      const providers = createPGSProviders();
+      const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
+      const result = await pgsEngine.execute(data.query, pgsGraph, {
+        mode: data.mode,
+        sessionId: data.sessionId,
+      });
+      return json(result);
+    }
+
+    case '/api/pgs/stats': {
+      const pgsGraph = await cachedGetGraphForPGS();
+      const providers = createPGSProviders();
+      const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
+      const partitions = pgsEngine.partition(pgsGraph);
+      return json({
+        nodes: pgsGraph.nodes.length,
+        edges: pgsGraph.edges.length,
+        partitions: partitions.length,
+        partitionSummaries: partitions.map(p => ({
+          id: p.id,
+          nodeCount: p.nodeCount,
+          keywords: p.keywords.slice(0, 5),
+          summary: p.summary?.substring(0, 80),
+        })),
+      });
     }
 
     case '/health':
