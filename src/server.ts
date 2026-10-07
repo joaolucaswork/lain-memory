@@ -14,13 +14,16 @@
  */
 
 import {
+  addMemory,
   addMemoryWithConflictCheck,
   searchMemory,
+  cachedSearchMemory,
   getMemories,
   deleteMemory,
   updateMemory,
   consolidateMemories,
   scanAndCleanProjectMemories,
+  getContextForSpawn,
   isMem0Configured,
 } from './mem0.js';
 import {
@@ -32,6 +35,7 @@ import {
   removeRelationships,
   runAutoclean,
   resolveEntities,
+  ingestExtracted,
 } from './graphrag.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
 import { getMetrics } from './mem-metrics.js';
@@ -77,7 +81,9 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/recall': {
-      const result = await searchMemory(data.query, data.project, data.limit);
+      const result = data.cached
+        ? await cachedSearchMemory(data.query, data.project, data.limit)
+        : await searchMemory(data.query, data.project, data.limit);
       return json(result);
     }
 
@@ -89,6 +95,20 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/memory/forget': {
       await deleteMemory(data.memory_id);
       return json({ success: true });
+    }
+
+    case '/api/memory/add': {
+      // Direct addMemory (no conflict check). Used by notes/file ingests
+      // that pre-filter. Same AddMemoryOpts shape as in-process calls.
+      const result = await addMemory(data.text, data.project, data.opts);
+      return json(result);
+    }
+
+    case '/api/memory/context': {
+      // Spawn-context composition (ex-getContextForSpawn). Keeps the
+      // query-building + budget logic server-side with the ranker.
+      const result = await getContextForSpawn(data.message, data.project, data.charBudget, data.limits);
+      return json({ context: result });
     }
 
     case '/api/memory/update': {
@@ -147,7 +167,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
       return json(getMetrics());
 
     case '/api/graph/query': {
-      const ctx = await graphQuery(data.query || '', { maxDepth: data.depth });
+      const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes });
       return json(ctx);
     }
 
@@ -171,6 +191,11 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/graph/autoclean':
       return json(await runAutoclean());
+
+    case '/api/graph/ingest': {
+      await ingestExtracted(data.entities ?? [], data.relationships ?? []);
+      return json({ success: true });
+    }
 
     case '/health':
     case '/api/health':

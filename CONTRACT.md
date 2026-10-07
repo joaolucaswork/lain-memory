@@ -35,8 +35,11 @@ changes to anything below require a coordinated cutover.
 
 Identical to lain `api-routes.ts` memory/graph endpoints (served with the
 full `/api/...` paths): `remember recall list forget update consolidate scan
-resolve-entities contradiction-scan metrics`, `graph/{query,stats,nodes,
-remove-nodes,remove-relationships,autoclean}`, `health`. Auth: Bearer
+resolve-entities contradiction-scan metrics`, plus thin-client endpoints
+`add` (direct addMemory with opts), `context` (spawn composition), and
+`graph/ingest` (seed entity ingestion). Recall accepts `cached: true` for
+the Redis-backed `cachedSearchMemory` path. Graph: `query stats nodes
+remove-nodes remove-relationships autoclean ingest`. Auth: Bearer
 `LAIN_API_KEY`; empty key = open localhost (same as lain `validateApiKey`).
 
 ## Deliberate divergences from lain
