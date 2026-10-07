@@ -1,0 +1,42 @@
+# lain-memory data stack: Qdrant (vectors) + Redis (cache).
+# Qdrant uses a repo-local bind mount (visible, rsync-able); Redis uses a
+# named volume (cache only — safe to drop, rebuilds on its own).
+# Back up Qdrant via the snapshot API, not by copying the bind dir live.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: lain-redis
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    command: redis-server --appendonly yes
+    volumes:
+      - lain-memory-redis:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli set __hc__ $(date +%s%N) PX 2000 && redis-cli get __hc__ | grep -q . && redis-cli del __hc__']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    container_name: lain-qdrant
+    restart: unless-stopped
+    ports:
+      - '6333:6333'
+      - '6334:6334'
+    volumes:
+      # Repo-local data dir (gitignored — vectors don't belong in git).
+      # Survives container recreation. Back up via Qdrant snapshot API.
+      - ./data/qdrant:/qdrant/storage
+    healthcheck:
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/localhost/6333 && printf "GET /collections HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && head -1 <&3 | grep -q "200"']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  lain-memory-redis:
