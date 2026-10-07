@@ -33,6 +33,21 @@ Supervised: `pm2 start ecosystem.config.cjs --only lain-memory`.
 
 > `LAIN_INSTANCE_ID` suffixes the Qdrant collection, graph file and Redis prefix — instances sharing a workspace must use the same one.
 
+## Workspace
+
+All file state lives under `LAIN_WORKSPACE_DIR` (default `~/lain-memory-workspace`), owned entirely by this server:
+
+```
+<workspace>/
+└── .knowledge/
+    ├── graph.json            # knowledge graph (GraphRAG)
+    ├── graph-blocklist.json  # autoclean reject list
+    ├── seeds/                # extracted seed files
+    └── pgs-sessions/         # resumable PGS sessions
+```
+
+The dir is created on boot if missing. Vector memories live separately in Qdrant (`./data/qdrant`); Redis holds cache only. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
+
 ## Configuration
 
 All via env (see [.env.example](./.env.example)):
@@ -41,7 +56,7 @@ All via env (see [.env.example](./.env.example)):
 |-----|---------|-------------|
 | `LAIN_MEMORY_PORT` | `3341` | HTTP port |
 | `LAIN_API_KEY` | empty (open localhost) | Bearer auth |
-| `LAIN_WORKSPACE_DIR` | `~/lain-workspace` | Shared workspace (graph, seeds, MEMORY.md) |
+| `LAIN_WORKSPACE_DIR` | `~/lain-workspace` | Own workspace (graph, seeds, PGS sessions) |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Vector backend |
 | `LAIN_LLM_BASE_URL` / `LAIN_LLM_API_KEY` / `LAIN_LLM_MODEL` / `LAIN_EMBED_MODEL` | gateway defaults | Unified LLM contract (`LAIN_LLM_*` → `AI_GATEWAY_*` → OpenAI) |
 | `LAIN_REDIS_ENABLED` / `LAIN_REDIS_HOST` / `LAIN_REDIS_PORT` | `true` / `127.0.0.1` / `6379` | Cache (all paths degrade without it) |

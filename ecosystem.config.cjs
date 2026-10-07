@@ -44,7 +44,7 @@ module.exports = {
         LAIN_MEMORY_PORT: '3341',
         // Live data path. Overridable via .env; the fallback keeps the
         // current workspace (graph.json, seeds) if .env doesn't set it.
-        LAIN_WORKSPACE_DIR: envVars.LAIN_WORKSPACE_DIR ?? '/Users/lucas/Documents/lain/lain-workspace',
+        LAIN_WORKSPACE_DIR: envVars.LAIN_WORKSPACE_DIR ?? '/Users/lucas/lain-memory-workspace',
         PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || '/usr/bin:/bin'}`,
       },
     },
