@@ -7,10 +7,13 @@
   "scripts": {
     "dev": "bun run src/server.ts",
     "start": "bun run src/server.ts",
+    "mcp": "bun run src/mcp.ts",
+    "smoke": "bun run scripts/smoke-mcp.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
     "@qdrant/js-client-rest": "1.18.0",
     "graphology": "^0.26.0",
     "graphology-traversal": "^0.3.1",

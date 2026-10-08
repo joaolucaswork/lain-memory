@@ -62,12 +62,15 @@ export function createOpenAIProvider(model = 'gpt-4o-mini'): LLMProvider {
 
 /**
  * Create the default PGS providers — sweep (fast) + synthesis (capable).
+ *
+ * Both go through the shared llm-client (unified contract: LAIN_LLM_* →
+ * AI_GATEWAY_* → OpenAI). The previous direct-OpenAI path ignored gateway
+ * keys, so sweeps 401'd ("All sweeps failed") on gateway-only setups.
+ * Both roles already shared one model, so a single provider loses nothing.
  */
 export function createPGSProviders(): { sweepProvider: LLMProvider; synthesisProvider: LLMProvider } {
-  return {
-    sweepProvider: createOpenAIProvider('gpt-4o-mini'),
-    synthesisProvider: createOpenAIProvider('gpt-4o-mini'),
-  };
+  const provider = createLlmProvider();
+  return { sweepProvider: provider, synthesisProvider: provider };
 }
 
 /**

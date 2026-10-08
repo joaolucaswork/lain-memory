@@ -10,8 +10,16 @@ import { join } from 'path';
 import { homedir } from 'os';
 
 export const INSTANCE_ID = process.env.LAIN_INSTANCE_ID ?? '';
+
+/** Expand a leading `~` (Bun/dotenv don't do it) so `~/...` works in .env. */
+export function expandHome(p: string): string {
+  if (p === '~') return homedir();
+  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  return p;
+}
+
 const WORKSPACE_DIR_ENV = process.env.LAIN_WORKSPACE_DIR;
-export const WORKSPACE_DIR = WORKSPACE_DIR_ENV ?? join(homedir(), 'lain-workspace');
+export const WORKSPACE_DIR = WORKSPACE_DIR_ENV ? expandHome(WORKSPACE_DIR_ENV) : join(homedir(), 'lain-memory-workspace');
 console.log(`[workspace] WORKSPACE_DIR=${WORKSPACE_DIR} (source: ${WORKSPACE_DIR_ENV ? 'env' : 'default'})`);
 
 // Module-load guard: if env explicitly set a path that does NOT exist, fail
@@ -20,7 +28,7 @@ console.log(`[workspace] WORKSPACE_DIR=${WORKSPACE_DIR} (source: ${WORKSPACE_DIR
 // elsewhere in the codebase silently creates a phantom workspace.
 // Module-level (not inside ensureWorkspace) so it covers every importer:
 // notes.ts:174, task-manager.ts:56, session-store.ts:71, etc.
-if (WORKSPACE_DIR_ENV && !existsSync(WORKSPACE_DIR_ENV)) {
+if (WORKSPACE_DIR_ENV && !existsSync(WORKSPACE_DIR)) {
   throw new Error(
     `[workspace] LAIN_WORKSPACE_DIR=${WORKSPACE_DIR_ENV} não existe.\n` +
     `Possíveis causas:\n` +
@@ -31,7 +39,7 @@ if (WORKSPACE_DIR_ENV && !existsSync(WORKSPACE_DIR_ENV)) {
     `  - Para MCP stdio (Claude Code): fechar e reabrir o terminal, ou /mcp reload no Claude Code.\n`
   );
 }
-export const PROJECTS_BASE = process.env.LAIN_PROJECTS_BASE ?? join(homedir(), 'Documents', 'GitHub');
+export const PROJECTS_BASE = expandHome(process.env.LAIN_PROJECTS_BASE ?? join(homedir(), 'Documents', 'GitHub'));
 export const MEMORY_FILE = join(WORKSPACE_DIR, 'MEMORY.md');
 export const MEMORY_DIR = join(WORKSPACE_DIR, 'memory');
 export const SESSIONS_DIR = join(WORKSPACE_DIR, 'sessions');
@@ -77,7 +85,7 @@ export function readMemory(): string {
 }
 
 export function listProjects(): Array<{ name: string; path: string }> {
-  const base = process.env.LAIN_PROJECTS_BASE ?? join(homedir(), 'Documents', 'GitHub');
+  const base = expandHome(process.env.LAIN_PROJECTS_BASE ?? join(homedir(), 'Documents', 'GitHub'));
   try {
     return readdirSync(base, { withFileTypes: true })
       .filter(e => {

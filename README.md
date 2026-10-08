@@ -21,17 +21,58 @@ Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for ev
 Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an OpenAI-compatible LLM endpoint.
 
 ```bash
+./setup.sh   # checks deps, starts Qdrant+Redis, creates .env + workspace, installs, smoke-tests MCP, prints harness configs
+```
+
+Then edit `.env` (workspace dir + LLM keys) and re-run `./setup.sh`. Manual equivalent:
+
+```bash
 docker compose up -d          # Qdrant :6333 + Redis :6379
-
 cp .env.example .env          # set LAIN_WORKSPACE_DIR + LLM keys
-
 bun install && bun run dev    # :3341
 curl localhost:3341/health
+bun run smoke                 # stdio MCP self-check (12 tools)
 ```
 
 Supervised: `pm2 start ecosystem.config.cjs --only lain-memory`.
 
 > `LAIN_INSTANCE_ID` suffixes the Qdrant collection, graph file and Redis prefix — instances sharing a workspace must use the same one.
+
+## MCP (stdio) — any harness
+
+Native MCP server with only the memory surface (12 tools: `remember`, `recall`, `forget`, `update_memory`, `list_memories`, `scan_memories`, `graph_query`, `graph_stats`, `pgs_query`, `pgs_stats`, `seed_extract`, `list_seeds`). In-process backends — no `:3341` hop, no session hooks (active-project / `[FLUSH:id]` were dropped; they belong to Lain's channel layer).
+
+Transport is plain stdio (`bun run mcp`), so any MCP-compatible harness works. `./setup.sh` prints the exact snippets with your paths filled in; generically:
+
+- **OpenCode** (`~/.config/opencode/opencode.jsonc`):
+
+```jsonc
+"mcp": {
+  "lain_memory": {
+    "type": "local",
+    "command": ["<bun>", "run", "--cwd", "<path>/lain-memory", "mcp"],
+    "enabled": true,
+    "environment": { "LAIN_WORKSPACE_DIR": "<same as .env>" },
+    "timeout": 120000
+  }
+}
+```
+
+- **Claude Code**:
+
+```bash
+claude mcp add lain-memory --env LAIN_WORKSPACE_DIR=<same-as-.env> -- <bun> run --cwd <path>/lain-memory mcp
+```
+
+- **Any MCP client (generic stdio JSON)**:
+
+```json
+{ "command": "<bun>",
+  "args": ["run", "--cwd", "<path>/lain-memory", "mcp"],
+  "env": { "LAIN_WORKSPACE_DIR": "<same-as-.env>" } }
+```
+
+Notes: `LAIN_WORKSPACE_DIR` must match this repo's `.env` (same graph/Qdrant collection as `:3341`) and the directory must exist (`./setup.sh` creates it; otherwise the server refuses to boot). `timeout` 120s is recommended — `remember`/`pgs_query` chain several LLM calls. Verify with `bun run smoke`.
 
 ## Workspace
 
@@ -46,7 +87,7 @@ All file state lives under `LAIN_WORKSPACE_DIR` (default `~/lain-memory-workspac
     └── pgs-sessions/         # resumable PGS sessions
 ```
 
-The dir is created on boot if missing. Vector memories live separately in Qdrant (`./data/qdrant`); Redis holds cache only. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
+The dir must exist before boot (the server refuses to start otherwise — `./setup.sh` creates it). Vector memories live separately in Qdrant (`./data/qdrant`); Redis holds cache only. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
 
 ## Configuration
 
@@ -56,7 +97,7 @@ All via env (see [.env.example](./.env.example)):
 |-----|---------|-------------|
 | `LAIN_MEMORY_PORT` | `3341` | HTTP port |
 | `LAIN_API_KEY` | empty (open localhost) | Bearer auth |
-| `LAIN_WORKSPACE_DIR` | `~/lain-workspace` | Own workspace (graph, seeds, PGS sessions) |
+| `LAIN_WORKSPACE_DIR` | `~/lain-memory-workspace` | Own workspace (graph, seeds, PGS sessions; `~` expanded, dir must exist) |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Vector backend |
 | `LAIN_LLM_BASE_URL` / `LAIN_LLM_API_KEY` / `LAIN_LLM_MODEL` / `LAIN_EMBED_MODEL` | gateway defaults | Unified LLM contract (`LAIN_LLM_*` → `AI_GATEWAY_*` → OpenAI) |
 | `LAIN_REDIS_ENABLED` / `LAIN_REDIS_HOST` / `LAIN_REDIS_PORT` | `true` / `127.0.0.1` / `6379` | Cache (all paths degrade without it) |
