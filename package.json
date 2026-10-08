@@ -9,6 +9,7 @@
     "start": "bun run src/server.ts",
     "mcp": "bun run src/mcp.ts",
     "smoke": "bun run scripts/smoke-mcp.ts",
+    "smoke:live": "bun run scripts/smoke-mcp.ts --live",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/"
   },

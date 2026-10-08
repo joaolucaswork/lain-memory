@@ -21,10 +21,16 @@ Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for ev
 Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an OpenAI-compatible LLM endpoint.
 
 ```bash
-./setup.sh   # checks deps, starts Qdrant+Redis, creates .env + workspace, installs, smoke-tests MCP, prints harness configs
+./setup.sh   # macOS/Linux: checks deps, starts Qdrant+Redis, creates .env + workspace, installs, smoke-tests MCP, prints harness configs
 ```
 
-Then edit `.env` (workspace dir + LLM keys) and re-run `./setup.sh`. Manual equivalent:
+Windows (PowerShell nativo — mesma coisa que o `.sh`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+Then edit `.env` (workspace dir + LLM keys) and re-run the setup script. Without keys, only `tools/list` is verified — run `bun run smoke:live` afterwards to prove the write path (remember→recall→forget, zero residue) against real Qdrant+LLM. Manual equivalent:
 
 ```bash
 docker compose up -d          # Qdrant :6333 + Redis :6379
@@ -72,7 +78,9 @@ claude mcp add lain-memory --env LAIN_WORKSPACE_DIR=<same-as-.env> -- <bun> run 
   "env": { "LAIN_WORKSPACE_DIR": "<same-as-.env>" } }
 ```
 
-Notes: `LAIN_WORKSPACE_DIR` must match this repo's `.env` (same graph/Qdrant collection as `:3341`) and the directory must exist (`./setup.sh` creates it; otherwise the server refuses to boot). `timeout` 120s is recommended — `remember`/`pgs_query` chain several LLM calls. Verify with `bun run smoke`.
+Notes: `LAIN_WORKSPACE_DIR` must match this repo's `.env` (same graph/Qdrant collection as `:3341`) and the directory must exist (`./setup.sh` creates it; otherwise the server refuses to boot). `timeout` 120s is recommended — `remember`/`pgs_query` chain several LLM calls. Verify with `bun run smoke` (tool list) or `bun run smoke:live` (full write path, needs Qdrant + LLM key).
+
+Windows notes: use `setup.ps1` (paths with `~\` work; `~` in `.env` expands to `%USERPROFILE%`). Needs Bun for Windows, Docker Desktop (Compose v2) and PowerShell 5.1+. The MCP itself is pure TS with no native deps, so `bun run mcp` behaves the same. Not yet run end-to-end on a real Windows box — the `.ps1` mirrors the tested `.sh` step by step, but treat the first Windows run as beta and report back.
 
 ## Workspace
 
