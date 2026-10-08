@@ -3,10 +3,11 @@
 .SYNOPSIS
   lain-memory setup — fresh-machine installer for Windows.
 
-  Right-click > "Run with PowerShell" or:  powershell -ExecutionPolicy Bypass -File .\setup.ps1
+  Right-click > "Run with PowerShell" or:  powershell -ExecutionPolicy Bypass -File .\setup.ps1 [-InstallMissing]
 
 .DESCRIPTION
-  1. checks prerequisites (bun, docker + compose)
+  1. checks prerequisites (bun, docker + compose) — or installs them via
+     winget with -InstallMissing (needs admin for Docker Desktop)
   2. starts Qdrant + Redis (docker compose up -d) and waits for Qdrant
   3. creates .env from .env.example (never overwrites yours)
   4. creates the workspace dir (LAIN_WORKSPACE_DIR, ~ expanded)
@@ -17,6 +18,7 @@
 
   Does NOT set your LLM keys (edit .env afterwards), touch git, or migrate data.
 #>
+param([switch]$InstallMissing)
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Repo
@@ -24,12 +26,55 @@ Set-Location $Repo
 function Fail($msg) { Write-Host "setup: ERROR: $msg" -ForegroundColor Red; exit 1 }
 function Info($msg) { Write-Host "setup: $msg" }
 
+function NeedInstallFlag($what, $manual) {
+  if (-not $InstallMissing) { Fail "$what — re-run with -InstallMissing to install it automatically. Manual: $manual" }
+}
+
+function RefreshPath {
+  $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+  $user = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+  $env:Path = "$machine;$user"
+}
+
 # ── 1. prerequisites ─────────────────────────────────────────────────────────
 if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-  Fail "bun not found — install from https://bun.sh (Windows: powershell -c `"irm bun.sh/install.ps1|iex`")"
+  NeedInstallFlag "bun not found" "powershell -c `"irm bun.sh/install.ps1|iex`""
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Info "winget not found — installing bun via official script..."
+    powershell -c "irm bun.sh/install.ps1|iex"
+  } else {
+    Info "installing bun via winget..."
+    winget install -e --id Oven-sh.Bun --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) { Fail "winget install of bun failed" }
+  }
+  RefreshPath
+  if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+    Fail "bun installed but not on PATH — close and reopen the terminal, then re-run"
+  }
 }
-try { docker info 2>&1 | Out-Null } catch { Fail "docker is not running — start Docker Desktop" }
-try { docker compose version 2>&1 | Out-Null } catch { Fail "docker compose plugin not found" }
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+  NeedInstallFlag "docker not found" "https://docs.docker.com/desktop/setup/install/windows-install/"
+  if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+    Fail "winget not found — install Docker Desktop manually: https://docs.docker.com/desktop/setup/install/windows-install/"
+  }
+  Info "installing Docker Desktop via winget (needs admin, may take a while)..."
+  winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements
+  if ($LASTEXITCODE -ne 0) { Fail "winget install of Docker Desktop failed" }
+  RefreshPath
+  Info "starting Docker Desktop (first launch initializes WSL2 — can take minutes)..."
+  Start-Process "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+}
+Info "waiting for the docker daemon (start Docker Desktop if needed)..."
+$daemon = $false
+# NOTE: native-command failure is NOT a throwing error — must check $LASTEXITCODE.
+for ($i = 0; $i -lt 60; $i++) {
+  docker info 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) { $daemon = $true; break }
+  Start-Sleep -Seconds 5
+}
+if (-not $daemon) { Fail "docker daemon did not start in 5 minutes" }
+docker compose version 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail "docker compose plugin not found — update Docker Desktop" }
 
 # ── 2. data stack ────────────────────────────────────────────────────────────
 Info "starting Qdrant + Redis..."
@@ -55,9 +100,11 @@ if (-not (Test-Path .env)) {
 }
 
 # ── 4. workspace dir ─────────────────────────────────────────────────────────
-$wsRaw = (Select-String -Path .env -Pattern '^LAIN_WORKSPACE_DIR=' |
-  Select-Object -Last 1) -replace '^LAIN_WORKSPACE_DIR=', ''
-$wsRaw = $wsRaw.Trim().Trim('"').Trim("'")
+# NOTE: Select-String yields MatchInfo — use .Line, never the object itself.
+$wsMatch = Select-String -Path .env -Pattern '^LAIN_WORKSPACE_DIR=' |
+  Select-Object -Last 1
+if (-not $wsMatch) { Fail "LAIN_WORKSPACE_DIR not found in .env" }
+$wsRaw = ($wsMatch.Line -replace '^LAIN_WORKSPACE_DIR=', '').Trim().Trim('"').Trim("'")
 if ($wsRaw.StartsWith('~/')) { $ws = Join-Path $HOME $wsRaw.Substring(2) }
 elseif ($wsRaw -eq '~') { $ws = $HOME }
 else { $ws = $wsRaw }

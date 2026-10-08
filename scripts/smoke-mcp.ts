@@ -106,28 +106,28 @@ try {
       throw new Error('Qdrant unhealthy — aborting live checks');
     }
 
-    let markerId: string | null = null;
+    // NOTE: one remember can store SEVERAL atoms (Mem0 decomposes the text),
+    // so track every returned id and forget them all.
+    let markerIds: string[] = [];
     const liveStart = Date.now();
     try {
       const remembered = await callTool('remember', { text: LIVE_TEXT, project: LIVE_PROJECT, mode: 'atomic' });
-      const m = remembered.match(/\(id: ([0-9a-f-]{36})\)/);
-      markerId = m?.[1] ?? null;
-      check(!!markerId && !remembered.includes('skipped') && !remembered.includes('rejected'),
-        'live remember stores the marker', remembered);
-      const found = await callTool('recall', { query: 'Zephyr probe dashboard accents violet amber', project: LIVE_PROJECT, limit: 3 });
-      check(found.includes('Zephyr probe') || (markerId !== null && found.includes(markerId)),
-        'live recall retrieves the marker', found);
+      markerIds = [...remembered.matchAll(/\(id: ([0-9a-f-]{36})\)/g)].map(m => m[1]);
+      check(markerIds.length > 0 && !remembered.includes('skipped') && !remembered.includes('rejected'),
+        `live remember stores the marker (${markerIds.length} atom(s))`, remembered);
+      const found = await callTool('recall', { query: 'Zephyr probe dashboard accents violet amber', project: LIVE_PROJECT, limit: 5 });
+      check(markerIds.every(id => found.includes(id)),
+        'live recall retrieves the marker atom(s)', found);
       const stats = await callTool('graph_stats', {});
       check(stats.includes('"nodes"'), 'live graph_stats reads the graph', stats);
     } finally {
-      if (markerId) {
-        try {
-          await callTool('forget', { memory_id: markerId });
-          const gone = await callTool('recall', { query: 'Zephyr probe dashboard accents', project: LIVE_PROJECT, limit: 3 });
-          check(gone.includes('No memories found'), 'live forget removes the marker', gone);
-        } catch (e) {
-          check(false, 'live cleanup (forget marker)', e instanceof Error ? e.message : String(e));
-        }
+      for (const id of markerIds) {
+        try { await callTool('forget', { memory_id: id }); }
+        catch (e) { check(false, `live cleanup (forget ${id})`, e instanceof Error ? e.message : String(e)); }
+      }
+      if (markerIds.length > 0) {
+        const gone = await callTool('recall', { query: 'Zephyr probe dashboard accents', project: LIVE_PROJECT, limit: 5 });
+        check(gone.includes('No memories found'), 'live forget removes all marker atoms', gone);
       }
       // remember also ingests entities into graph.json — remove nodes created
       // during this run (matched by firstSeen, not keywords). The MCP has no

@@ -21,14 +21,20 @@ Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for ev
 Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an OpenAI-compatible LLM endpoint.
 
 ```bash
-./setup.sh   # macOS/Linux: checks deps, starts Qdrant+Redis, creates .env + workspace, installs, smoke-tests MCP, prints harness configs
+./setup.sh [--install-missing]   # macOS/Linux
 ```
 
-Windows (PowerShell nativo — mesma coisa que o `.sh`):
+- Without flags it **checks** prerequisites (Bun, Docker + Compose) and fails with instructions when missing.
+- With `--install-missing` it **installs** them: Bun via the official script; Docker Desktop via Homebrew (macOS) or `get.docker.com` on apt-based Linux. Other platforms print manual steps.
+- Then: starts Qdrant+Redis, creates `.env` (never overwrites) + workspace dir, `bun install`, MCP smoke test (`--live` write-path proof when an LLM key exists), and prints harness configs.
+
+Windows (PowerShell nativo):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -ExecutionPolicy Bypass -File .\setup.ps1 [-InstallMissing]
 ```
+
+`-InstallMissing` installs Bun + Docker Desktop via winget (admin needed for Docker; first launch initializes WSL2 and can take minutes). Without it, missing prerequisites fail with manual steps — same contract as the `.sh`.
 
 Then edit `.env` (workspace dir + LLM keys) and re-run the setup script. Without keys, only `tools/list` is verified — run `bun run smoke:live` afterwards to prove the write path (remember→recall→forget, zero residue) against real Qdrant+LLM. Manual equivalent:
 

@@ -2,15 +2,18 @@
 #
 # lain-memory setup — fresh-machine installer.
 #
-#   ./setup.sh
+#   ./setup.sh [--install-missing]
 #
 # What it does:
-#   1. checks prerequisites (bun, docker + compose)
+#   1. checks prerequisites (bun, docker + compose) — or installs them
+#      with --install-missing (macOS: brew/curl; Debian/Ubuntu: apt/official
+#      scripts; otherwise prints instructions)
 #   2. starts Qdrant + Redis (docker compose up -d) and waits for Qdrant
 #   3. creates .env from .env.example (never overwrites yours)
 #   4. creates the workspace dir (LAIN_WORKSPACE_DIR, `~` expanded)
 #   5. bun install
-#   6. smoke-tests the MCP server over stdio (expects the 12 memory tools)
+#   6. smoke-tests the MCP server over stdio (expects the 12 memory tools;
+#      live write-path test when an LLM key is configured)
 #   7. prints ready-to-paste configs for OpenCode / Claude Code / any MCP client
 #
 # What it does NOT do: set your LLM keys (edit .env afterwards), touch git,
@@ -19,14 +22,60 @@ set -u
 REPO="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO"
 
+INSTALL_MISSING=0
+for arg in "$@"; do
+  case "$arg" in
+    --install-missing) INSTALL_MISSING=1 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "setup: unknown flag $arg (try --help)" >&2; exit 2 ;;
+  esac
+done
+
 fail() { echo "setup: ERROR: $1" >&2; exit 1; }
 info() { echo "setup: $1"; }
 warn() { echo "setup: WARNING: $1" >&2; }
+os() { uname -s; }
+
+need_install_flag() {
+  [ "$INSTALL_MISSING" = 1 ] || fail "$1 — re-run with --install-missing to install it automatically"
+}
 
 # ── 1. prerequisites ─────────────────────────────────────────────────────────
-command -v bun >/dev/null 2>&1 || fail "bun not found — install from https://bun.sh"
-docker info >/dev/null 2>&1 || fail "docker is not running — start Docker Desktop (or dockerd)"
-docker compose version >/dev/null 2>&1 || fail "docker compose plugin not found"
+if ! command -v bun >/dev/null 2>&1; then
+  need_install_flag "bun not found"
+  info "installing bun..."
+  curl -fsSL https://bun.sh/install | bash || fail "bun install failed"
+  export PATH="$HOME/.bun/bin:$PATH"
+  command -v bun >/dev/null 2>&1 || fail "bun installed but not on PATH — restart your shell and re-run"
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  need_install_flag "docker not found"
+  case "$(os)" in
+    Darwin)
+      command -v brew >/dev/null 2>&1 || fail "Homebrew required for auto-install — see https://brew.sh"
+      info "installing Docker Desktop (cask, may take a while)..."
+      brew install --cask docker || fail "brew install --cask docker failed"
+      open -a Docker || warn "installed, but could not launch Docker Desktop — start it manually"
+      ;;
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        info "installing Docker via get.docker.com (needs sudo)..."
+        curl -fsSL https://get.docker.com | sh || fail "docker install script failed"
+      else
+        fail "auto-install supports apt-based distros only — install Docker from https://docs.docker.com/engine/install"
+      fi
+      ;;
+    *) fail "auto-install supports macOS and Debian/Ubuntu only — install Docker from https://docs.docker.com/get-docker" ;;
+  esac
+fi
+info "waiting for the docker daemon (start Docker Desktop if needed)..."
+for _ in $(seq 1 30); do
+  docker info >/dev/null 2>&1 && break
+  sleep 2
+  if [ "$_" = 30 ]; then fail "docker daemon did not start in 60s"; fi
+done
+docker compose version >/dev/null 2>&1 || fail "docker compose plugin not found — update Docker Desktop / docker-compose-plugin"
 
 # ── 2. data stack ────────────────────────────────────────────────────────────
 info "starting Qdrant + Redis..."
