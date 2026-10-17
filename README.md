@@ -16,6 +16,51 @@ Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for ev
 - **Forgetting on purpose** — dedup sweep + memory reaper expire stale memories (with audit log), GraphRAG autoclean prunes the graph.
 - **Graph context** — entity/relationship extraction plus partition-based search (PGS) and seed ingestion from text/PDFs.
 
+### How chat-web uses this (plain English)
+
+Think of it in two parts.
+
+**1. Mem0 is the main memory.**
+
+It is like sticky notes. Each `remember` saves one sentence: "Lucas prefers Bun".
+When chat-web asks, it calls `recall` — semantic search in Qdrant for similar notes.
+
+The automatic endpoint only does this:
+`POST /api/memory/context` -> `getContextForSpawn()` in `src/mem0.ts:1559`.
+It fetches global + project memories and builds text. It does not touch the graph.
+
+**2. The graph is a map of connections.**
+
+It does not store sentences. It stores nodes and edges:
+`lucas -USES-> bun`, `reino-capital -DEPENDS_ON-> supabase`.
+
+Code in `src/graphrag.ts:343` (`ingest`) and `src/graphrag.ts:411` (`query`).
+
+It is good for questions that `recall` answers badly: "what depends on what?", "who works on what?", "what did we decide about X?".
+
+**3. On save, both are fed together.**
+
+When you save something, `addMemory()` in `src/mem0.ts:759` saves to mem0 and triggers `graphrag.ingest()` in the background.
+
+So even if chat-web only reads mem0, the graph was already fed.
+
+**4. On read, they are separate paths.**
+
+Chat-web has 3 options:
+
+* fast/automatic: `/api/memory/recall` or `/api/memory/context` in `src/server.ts:86,110` — mem0 only.
+* relations: `/api/graph/query` in `src/server.ts:172` — must be called on purpose. Example BFF pattern in `lain-chat-web/server/server.ts:236` (`queryGraph`) + `245` (`buildMemoryBlock` puts `[MEMORIAS RELEVANTES]` + `[GRAFO]` together).
+* deep analysis: `/api/pgs/execute` in `src/server.ts:238` — sweeps the whole graph in parts and synthesizes.
+
+If chat-web only calls `context`/`recall`, it gets nothing from the graph.
+
+**5. It is off by default.**
+
+The graph ships disabled: `LAIN_GRAPHRAG_ENABLED=false` in `src/config.ts:79`.
+Turn it on with `LAIN_GRAPHRAG_ENABLED=true`. When off, `query()` returns empty and `ingest()` does nothing.
+
+Short version: mem0 = what was said, every day. Graph = bonus for connections and decisions, but chat-web has to ask for it explicitly.
+
 ## Quickstart
 
 Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an OpenAI-compatible LLM endpoint.
