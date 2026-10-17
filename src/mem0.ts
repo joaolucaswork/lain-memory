@@ -499,6 +499,10 @@ export interface AddMemoryOpts {
   skipConflictCheck?: boolean;
   /** Treat input as a bundle/summary — informs LLM to prefer UPDATE over NOOP for overlapping atoms. */
   bundleMode?: boolean;
+  /** Metadata stored on the Mem0 item (provenance, trash records, etc.). */
+  metadata?: Record<string, unknown>;
+  /** Skip graph ingestion (trash copies must not pollute the knowledge graph). */
+  skipGraphIngest?: boolean;
   /**
    * Verbatim mode (mode:raw). Passes infer:false to the Mem0 SDK (no
    * gpt-4o-mini decomposition) AND bypasses pre-save Haiku enrichment
@@ -746,14 +750,16 @@ Original: ${text}`
   const m = getClient();
   const result = await m.add(
     [{ role: 'user', content: enrichedText }],
-    { userId: userId(project), ...(opts?.inferFalse ? { infer: false } : {}) }
+    { userId: userId(project), ...(opts?.inferFalse ? { infer: false } : {}), ...(opts?.metadata ? { metadata: opts.metadata } : {}) }
   );
 
   incrementMetric('memoriesAdded');
-  // Fire-and-forget: async graph ingestion + cache invalidation
-  graphrag.ingest(enrichedText, project).catch(err =>
-    console.error('[graphrag] ingestion error:', err)
-  );
+  // Fire-and-forget: async graph ingestion + cache invalidation (skipped for trash copies)
+  if (!opts?.skipGraphIngest) {
+    graphrag.ingest(enrichedText, project).catch(err =>
+      console.error('[graphrag] ingestion error:', err)
+    );
+  }
   invalidateMem0Cache(project).catch(() => {});
 
   const items = result.results ?? [];
@@ -864,18 +870,40 @@ export async function addMemoryWithConflictCheck(
       func: 'addMemoryWithConflictCheck', dedup_decision: classification.action,
     }));
   }
+  // Snapshot doomed memories BEFORE saving — audit trail needs full texts.
+  const doomed = classification.supersedes.length > 0
+    ? await snapshotMemories(classification.supersedes, project)
+    : [];
+
   // Save the new memory first — only supersede old ones if save succeeded
   const result = await addMemory(text, project, opts);
 
-  if (classification.supersedes.length > 0 && result[0] && result[0].id !== 'rejected') {
-    for (const oldId of classification.supersedes) {
+  if (doomed.length > 0 && result[0] && result[0].id !== 'rejected') {
+    const newId = result[0].id;
+    const trashIds: Record<string, string | null> = {};
+    for (const snap of doomed) {
       try {
-        await deleteMemory(oldId);
-        console.log(`[mem0] Superseded memory ${oldId}`);
+        const { trashId } = await trashAndDelete(snap, project, {
+          reason: classification.reason,
+          trigger: `conflict_check:${classification.action}`,
+          replacedById: newId,
+        });
+        trashIds[snap.id] = trashId;
+        console.log(`[mem0] Superseded memory ${snap.id} (trash: ${trashId ?? 'copy-failed'})`);
       } catch (err) {
-        console.error(`[mem0] Failed to supersede ${oldId}:`, err);
+        console.error(`[mem0] Failed to supersede ${snap.id}:`, err);
       }
     }
+    try {
+      const { logMaintenance } = await import('./maintenance-log.js');
+      logMaintenance('memory_supersede', {
+        project: project ?? 'global',
+        classification: classification.action,
+        reason: classification.reason,
+        deleted: doomed.map(s => ({ id: s.id, memory: s.memory, created_at: s.created_at ?? null, missing: s.missing ?? false, trash_id: trashIds[s.id] ?? null })),
+        replaced_by: { id: newId, memory: result[0].memory },
+      });
+    } catch { /* non-critical */ }
   }
 
   return result.map(r => ({
@@ -1215,7 +1243,7 @@ export async function invalidateMem0Cache(project?: string): Promise<void> {
   }
 }
 
-export async function getMemories(project?: string, limit: number = 20): Promise<{ id: string; memory: string; created_at?: string; updated_at?: string }[]> {
+export async function getMemories(project?: string, limit: number = 20): Promise<{ id: string; memory: string; created_at?: string; updated_at?: string; metadata?: Record<string, unknown> }[]> {
   const m = getClient();
   const result = await m.getAll({
     // v3 requires snake_case entity keys in filters (camelCase throws).
@@ -1228,6 +1256,7 @@ export async function getMemories(project?: string, limit: number = 20): Promise
     memory: item.memory,
     created_at: item.created_at ?? item.createdAt,
     updated_at: item.updated_at ?? item.updatedAt,
+    ...(item.metadata ? { metadata: item.metadata } : {}),
   }));
 }
 
@@ -1235,6 +1264,80 @@ export async function deleteMemory(memoryId: string): Promise<void> {
   const m = getClient();
   await m.delete(memoryId);
   invalidateMem0Cache().catch(() => {});
+}
+
+// ─── Delete audit trail (snapshot-before-delete + trash) ───
+
+/** Mem0 project scope holding deleted memories. Invisible to recall sweeps
+ * (reaper/dedup/consolidation only scan workspace projects + global scope). */
+export const TRASH_PROJECT = 'trash';
+
+export interface MemorySnapshot {
+  id: string;
+  memory: string;
+  created_at?: string;
+  /** True when the id was not found (already gone) — nothing to snapshot. */
+  missing?: boolean;
+}
+
+/** Fetch full texts for ids BEFORE deleting. Never throws — returns
+ * `{id, missing:true}` entries for anything unfetchable. */
+export async function snapshotMemories(ids: string[], project?: string): Promise<MemorySnapshot[]> {
+  try {
+    const all = await getMemories(project, 100);
+    const byId = new Map(all.map(m => [m.id, m]));
+    return ids.map(id => {
+      const found = byId.get(id);
+      if (!found) return { id, memory: '', missing: true as const };
+      return { id, memory: found.memory ?? '', ...(found.created_at ? { created_at: found.created_at } : {}) };
+    });
+  } catch (err) {
+    console.error('[mem0] snapshotMemories failed:', err instanceof Error ? err.message : err);
+    return ids.map(id => ({ id, memory: '', missing: true as const }));
+  }
+}
+
+export interface TrashProvenance {
+  reason: string;
+  trigger: string;
+  replacedById?: string;
+}
+
+/**
+ * Copy a memory to the trash scope (with provenance metadata), then hard-delete
+ * the original. Trash copies skip quality/conflict checks and graph ingestion.
+ * Best-effort on the trash copy: if it fails, the original is still deleted
+ * (and the failure is logged) so maintenance never blocks.
+ */
+export async function trashAndDelete(
+  snapshot: MemorySnapshot,
+  fromProject: string | undefined,
+  provenance: TrashProvenance,
+): Promise<{ trashId: string | null }> {
+  let trashId: string | null = null;
+  if (!snapshot.missing && snapshot.memory) {
+    try {
+      const saved = await addMemory(snapshot.memory, TRASH_PROJECT, {
+        skipQualityCheck: true,
+        skipConflictCheck: true,
+        skipGraphIngest: true,
+        metadata: {
+          original_id: snapshot.id,
+          deleted_from: fromProject ?? 'global',
+          original_created_at: snapshot.created_at ?? null,
+          reason: provenance.reason,
+          trigger: provenance.trigger,
+          ...(provenance.replacedById ? { replaced_by: provenance.replacedById } : {}),
+          trashed_at: new Date().toISOString(),
+        },
+      });
+      trashId = saved[0]?.id ?? null;
+    } catch (err) {
+      console.error(`[mem0] trash copy failed for ${snapshot.id}:`, err instanceof Error ? err.message : err);
+    }
+  }
+  await deleteMemory(snapshot.id);
+  return { trashId };
 }
 
 // C3: Update an existing memory by ID. Uses Mem0 SDK native update.
@@ -1311,6 +1414,10 @@ function groupMemories(memories: { id: string; memory: string }[]): Map<string, 
 export interface ConsolidationDetail {
   fragments: string[];
   result: string;
+  /** Full-fidelity audit (untruncated). Present on entries written by the audit-trail path. */
+  fragmentsFull?: { id: string; memory: string; created_at: string | null; missing: boolean; trash_id: string | null }[];
+  resultFull?: string;
+  newId?: string;
 }
 
 export async function consolidateMemories(project?: string): Promise<{
@@ -1350,20 +1457,33 @@ Memórias:
           console.log(`[mem0] Consolidation rejected low-quality result: ${result.consolidated.slice(0, 60)}...`);
           continue;
         }
-        await addMemory(result.consolidated, project, { skipQualityCheck: true, skipConflictCheck: true });
+        // Snapshot fragments BEFORE replacing — full texts for the audit trail.
+        const doomed = await snapshotMemories(group.map(m => m.id).filter(id => id && id !== 'pending'), project);
+        const saved = await addMemory(result.consolidated, project, { skipQualityCheck: true, skipConflictCheck: true });
+        const newId = saved[0]?.id ?? 'unknown';
         consolidated++;
+
+        const trashIds: Record<string, string | null> = {};
+        // Delete fragments (via trash)
+        for (const snap of doomed) {
+          try {
+            const { trashId } = await trashAndDelete(snap, project, {
+              reason: 'merged into consolidated memory',
+              trigger: 'consolidation',
+              replacedById: newId,
+            });
+            trashIds[snap.id] = trashId;
+            deleted++;
+          } catch {}
+        }
 
         details.push({
           fragments: fragmentTexts.map(f => f.slice(0, 120)),
           result: result.consolidated.slice(0, 200),
+          fragmentsFull: doomed.map(s => ({ id: s.id, memory: s.memory, created_at: s.created_at ?? null, missing: s.missing ?? false, trash_id: trashIds[s.id] ?? null })),
+          resultFull: result.consolidated,
+          newId,
         });
-
-        // Delete fragments
-        for (const mem of group) {
-          if (mem.id && mem.id !== 'pending') {
-            try { await deleteMemory(mem.id); deleted++; } catch {}
-          }
-        }
       }
     } catch (err) {
       console.error(`[mem0] Consolidation failed for group:`, err);
@@ -1651,9 +1771,19 @@ export function startMemoryMaintenance(): void {
           const classification = await classifyMemoryAction(mem.memory, others);
           if (classification.action === 'NOOP' && classification.supersedes.length === 0) {
             try {
-              await deleteMemory(mem.id);
+              const [snap] = await snapshotMemories([mem.id], undefined);
+              const { trashId } = await trashAndDelete(
+                snap ?? { id: mem.id, memory: mem.memory, missing: false },
+                undefined,
+                { reason: classification.reason, trigger: 'maintenance:contradiction_scan' },
+              );
               contradictionsFound++;
-              console.log(`[mem0] Maintenance: removed duplicate ${mem.id}`);
+              console.log(`[mem0] Maintenance: removed duplicate ${mem.id} (trash: ${trashId ?? 'copy-failed'})`);
+              logMaintenance('memory_duplicate_purge', {
+                trigger: 'maintenance:contradiction_scan',
+                reason: classification.reason,
+                deleted: [{ id: mem.id, memory: mem.memory, created_at: mem.created_at ?? null, trash_id: trashId }],
+              });
             } catch {}
           }
         }

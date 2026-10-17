@@ -153,6 +153,30 @@ curl -s localhost:3341/api/memory/recall -X POST -H 'Content-Type: application/j
 
 Entity scheme: `lucas` → global facts, `lucas:<project>` → project-scoped.
 
+### Delete audit trail (trash + log)
+
+Every automated delete (conflict-check supersede, consolidation, contradiction-scan)
+copies the full memory to the `trash` scope first (no quality/conflict checks, no
+graph ingestion) with provenance metadata, then hard-deletes the original. The
+`maintenance.jsonl` log (`$WORKSPACE/.maintenance-logs/`) records the full texts,
+reason, and replacement id (`memory_supersede`, `memory_consolidation`,
+`memory_duplicate_purge` actions). Sweeps (reaper/dedup/consolidation) never touch
+`trash`, so restores are always possible:
+
+```bash
+KEY="Authorization: Bearer $LAIN_API_KEY"
+# 1. Find what was deleted (full text + reason in the log)
+grep -a memory_supersede "$WORKSPACE/.maintenance-logs/maintenance.jsonl" | tail -2
+# 2. List trash copies (metadata.original_id / reason / replaced_by)
+curl -s localhost:3341/api/memory/list -X POST -H 'Content-Type: application/json' -H "$KEY" \
+  -d '{"project":"trash","limit":50}'
+# 3. Restore: re-add the text to its scope, then forget the trash copy
+curl -s localhost:3341/api/memory/add -X POST -H 'Content-Type: application/json' -H "$KEY" \
+  -d '{"text":"<texto restaurado>","opts":{"skipQualityCheck":true}}'
+curl -s localhost:3341/api/memory/forget -X POST -H 'Content-Type: application/json' -H "$KEY" \
+  -d '{"memory_id":"<trash_id>"}'
+```
+
 ### Graph / Seeds / PGS
 
 | Path | Body | Description |
