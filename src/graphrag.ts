@@ -186,15 +186,20 @@ export function nodeProject(id: string): string | undefined {
 }
 
 /**
- * Visibility rule.
+ * Visibility rule (explicit contract — Opção 2: compatibilidade documentada).
  * - Scoped read (project P): global nodes + P's local nodes. Never another
  *   project's locals.
- * - Unscoped read (no project): EVERYTHING (legacy/admin behavior).
- *   This preserves HTTP/MCP compatibility: pre-scope consumers keep seeing
- *   the same data as before. Isolation is enforced on project-scoped reads.
+ * - Unscoped read (no project): EVERYTHING (legacy/admin behavior, NOT
+ *   global-only). Pre-scope consumers keep seeing the same data as before.
+ *   Restricted to trusted consumers — do not expose unscoped reads to
+ *   untrusted multi-user clients.
+ * - Explicit all-projects read (project '*'): same as unscoped. Prefer this
+ *   over omitting the parameter when you mean "all projects" — it declares
+ *   intent and survives the future multi-user flip (unscoped reads will
+ *   become global-only; '*' will keep meaning all).
  */
 export function isNodeVisibleToProject(id: string, project?: string): boolean {
-  if (!project) return true;
+  if (!project || project === '*') return true;
   const scope = nodeProject(id);
   if (!scope) return true;
   return scope === normalizeProject(project);

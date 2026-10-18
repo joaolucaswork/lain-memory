@@ -133,7 +133,7 @@ const TOOL_DEFINITIONS = [
         query: { type: 'string', description: 'Natural language query' },
         depth: { type: 'number', description: 'Traversal depth (default: 2)' },
         maxNodes: { type: 'number', description: 'Max entities in context (default: 10)' },
-        project: { type: 'string', description: 'Project scope (e.g. "lain"). Omit for global-only scope.' },
+        project: { type: 'string', description: 'Project scope (e.g. "lain"). Omit to search across ALL projects (legacy/admin behavior — includes every project, not just global). Use "*" to declare that intent explicitly.' },
       },
       required: ['query'],
     },
