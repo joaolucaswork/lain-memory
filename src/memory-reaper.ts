@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { getMemories, deleteMemory, getMemoryImportance } from './mem0.js';
+import { getMemories, getMemoryImportance } from './mem0.js';
 import { incrementMetric } from './mem-metrics.js';
 import { listProjects } from './workspace.js';
 import { emitReaperEvent } from './memory-reaper-audit.js';
@@ -190,13 +190,35 @@ export async function runMemoryReaper(): Promise<{ purged: number; dryPurged?: n
       });
 
       try {
-        await deleteMemory(mem.id);
-        purged++;
-        incrementMetric('coldPurged');
-        console.log(
-          `[reaper] Purged cold memory ${mem.id.slice(0, 8)} ` +
-          `(importance=${importance.toFixed(2)}, project=${project})`,
-        );
+        // Fase 4: archive via the shared domain policy (trash + audit),
+        // not a direct hard delete.
+        const { deleteMemoriesWithPolicy } = await import('./mem0.js');
+        const report = await deleteMemoriesWithPolicy({
+          ids: [mem.id],
+          project,
+          reason: `cold memory (age > ${COLD_THRESHOLD_DAYS}d, importance < ${IMPORTANCE_THRESHOLD})`,
+          trigger: 'memory-reaper',
+        });
+        if (report.archived.includes(mem.id)) {
+          purged++;
+          incrementMetric('coldPurged');
+          console.log(
+            `[reaper] Archived cold memory ${mem.id.slice(0, 8)} ` +
+            `(importance=${importance.toFixed(2)}, project=${project}, trash=${report.trashIds[mem.id] ?? 'copy-failed'})`,
+          );
+        } else {
+          const errMsg = report.failed.find(f => f.id === mem.id)?.error ?? 'unknown policy failure';
+          console.error(`[reaper] Failed to archive ${mem.id}:`, errMsg);
+          void emitReaperEvent({
+            schema_version: 1,
+            run_id: runId,
+            ts: new Date().toISOString(),
+            event_type: 'error_delete',
+            memory_id: mem.id,
+            project,
+            message: errMsg,
+          });
+        }
       } catch (err) {
         console.error(`[reaper] Failed to delete ${mem.id}:`, err);
         void emitReaperEvent({

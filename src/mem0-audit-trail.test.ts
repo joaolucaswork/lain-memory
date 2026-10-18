@@ -3,9 +3,16 @@ import { describe, it, expect, mock, beforeEach, afterEach, afterAll } from 'bun
 import * as realMem0aiOssNs from 'mem0ai/oss';
 const realMem0aiOss = { ...realMem0aiOssNs };
 
+import * as realMaintenanceNs from './maintenance-log.js';
+const realMaintenance = { ...realMaintenanceNs };
+
 // Must mock mem0ai/oss (it loads sqlite3 native binary) before importing mem0.ts
 const calls: { getAll: unknown[]; add: unknown[]; delete: string[] } = { getAll: [], add: [], delete: [] };
 let cannedGetAll: { results: unknown[] } = { results: [] };
+// Fase 4 failure injection (default off — existing tests unaffected)
+let failAdd = false;
+const failDeleteFor = new Set<string>();
+const maintenanceCalls: unknown[][] = [];
 
 mock.module('mem0ai/oss', () => ({
   Memory: class MockMemory {
@@ -15,16 +22,24 @@ mock.module('mem0ai/oss', () => ({
       return cannedGetAll;
     }
     async add(messages: unknown, config: unknown) {
+      if (failAdd) throw new Error('add failed');
       calls.add.push({ messages, config });
       return { results: [{ id: 'trash-id-1', memory: 'copied' }] };
     }
     async delete(id: string) {
+      if (failDeleteFor.has(id)) throw new Error('delete failed');
       calls.delete.push(id);
       return { message: 'deleted' };
     }
   },
   OpenAILLM: class MockOpenAILLM {},
   OpenAIEmbedder: class MockOpenAIEmbedder {},
+}));
+
+// Redirect the audit sink to a recorder — never touches prod maintenance logs.
+mock.module('./maintenance-log.js', () => ({
+  ...realMaintenance,
+  logMaintenance: (...args: unknown[]) => { maintenanceCalls.push(args); },
 }));
 
 // Dynamic import AFTER mocks are set up
@@ -38,6 +53,9 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     calls.getAll.length = 0;
     calls.add.length = 0;
     calls.delete.length = 0;
+    maintenanceCalls.length = 0;
+    failAdd = false;
+    failDeleteFor.clear();
     cannedGetAll = {
       results: [
         { id: 'aaa', memory: 'Full text of memory A with details worth keeping verbatim.', created_at: '2026-10-01T00:00:00.000Z' },
@@ -98,8 +116,78 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     expect(calls.add).toHaveLength(0); // nothing to copy
     expect(calls.delete).toEqual(['gone']);
   });
+
+  describe('deleteMemoriesWithPolicy (Fase 4 wiring)', () => {
+  it('archives via trash with provenance + audit, then hard-deletes', async () => {
+    const { deleteMemoriesWithPolicy } = mem0 as any;
+    const report = await deleteMemoriesWithPolicy({
+      ids: ['aaa'],
+      project: undefined,
+      reason: 'test hygiene',
+      trigger: 'test-run',
+    });
+    expect(report.archived).toEqual(['aaa']);
+    expect(report.failed).toEqual([]);
+    expect(report.trashIds).toEqual({ aaa: 'trash-id-1' });
+    // Trash copy carried provenance
+    const cfg = (calls.add[0] as any).config;
+    expect(cfg.userId).toBe('lucas:trash');
+    expect(cfg.metadata.trigger).toBe('test-run');
+    // Original hard-deleted (which also prunes graph provenance — best-effort)
+    expect(calls.delete).toEqual(['aaa']);
+    // Audit recorded
+    expect(maintenanceCalls.length).toBeGreaterThan(0);
+    const auditAction = (maintenanceCalls[0] as any[])[0];
+    expect(auditAction).toBe('memory_policy_delete');
+  });
+
+  it('refuses the trash scope itself', async () => {
+    const { deleteMemoriesWithPolicy } = mem0 as any;
+    const report = await deleteMemoriesWithPolicy({
+      ids: ['x'],
+      project: 'trash',
+      reason: 'r',
+      trigger: 't',
+    });
+    expect(report.archived).toEqual([]);
+    expect(report.failed).toHaveLength(1);
+    expect(calls.add).toHaveLength(0);
+    expect(calls.delete).toHaveLength(0);
+  });
+
+  it('trash copy failure still deletes and reports trashId null', async () => {
+    failAdd = true;
+    const { deleteMemoriesWithPolicy } = mem0 as any;
+    const report = await deleteMemoriesWithPolicy({
+      ids: ['aaa'],
+      project: undefined,
+      reason: 'r',
+      trigger: 't',
+    });
+    expect(report.archived).toEqual(['aaa']);
+    expect(report.trashIds).toEqual({ aaa: null });
+    expect(calls.delete).toEqual(['aaa']);
+  });
+
+  it('hard delete failure lands in failed, no silent success', async () => {
+    failDeleteFor.add('aaa');
+    const { deleteMemoriesWithPolicy } = mem0 as any;
+    const report = await deleteMemoriesWithPolicy({
+      ids: ['aaa'],
+      project: undefined,
+      reason: 'r',
+      trigger: 't',
+    });
+    expect(report.archived).toEqual([]);
+    expect(report.failed).toHaveLength(1);
+    expect(report.failed[0].id).toBe('aaa');
+    expect(report.failed[0].error).toContain('delete failed');
+  });
+});
+
 });
 
 afterAll(() => {
   mock.module('mem0ai/oss', () => realMem0aiOss);
+  mock.module('./maintenance-log.js', () => realMaintenance);
 });

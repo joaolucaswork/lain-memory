@@ -8,7 +8,7 @@
  * avoiding LLM calls for performance.
  */
 
-import { getMemories, deleteMemory } from './mem0.js';
+import { getMemories } from './mem0.js';
 import { incrementMetric } from './mem-metrics.js';
 
 const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -42,6 +42,9 @@ async function runDedupSweep(): Promise<{ duplicatesRemoved: number }> {
   const memories = await getMemories(undefined, 500);
   let duplicatesRemoved = 0;
   const deleted = new Set<string>();
+  // Fase 4: collect hygiene candidates; archive as one policy batch
+  // (trash + audit) instead of direct hard deletes.
+  const doomed = new Map<string, number>();
 
   const tokenized = memories.map(m => ({ ...m, tokens: tokenize(m.memory) }));
 
@@ -51,21 +54,34 @@ async function runDedupSweep(): Promise<{ duplicatesRemoved: number }> {
       if (deleted.has(tokenized[j].id)) continue;
       const sim = cosineSimilarity(tokenized[i].tokens, tokenized[j].tokens);
       if (sim >= SIMILARITY_THRESHOLD) {
-        // Keep most recent, delete the other
+        // Keep most recent, archive the other
         const tsA = tokenized[i].updated_at ?? tokenized[i].created_at ?? '';
         const tsB = tokenized[j].updated_at ?? tokenized[j].created_at ?? '';
         const deleteIdx = tsA >= tsB ? j : i;
         const deleteId = tokenized[deleteIdx].id;
-        try {
-          await deleteMemory(deleteId);
-          deleted.add(deleteId);
-          duplicatesRemoved++;
-          incrementMetric('deduplicationsRun');
-          console.log(`[dedup] Removed duplicate ${deleteId.slice(0, 8)} (sim=${sim.toFixed(3)})`);
-        } catch (err) {
-          console.error(`[dedup] Failed to delete ${deleteId}:`, err);
-        }
+        deleted.add(deleteId);
+        const prev = doomed.get(deleteId) ?? 0;
+        doomed.set(deleteId, Math.max(prev, sim));
       }
+    }
+  }
+
+  if (doomed.size > 0) {
+    const { deleteMemoriesWithPolicy } = await import('./mem0.js');
+    const bestSim = [...doomed.values()].reduce((a, b) => Math.max(a, b), 0);
+    const report = await deleteMemoriesWithPolicy({
+      ids: [...doomed.keys()],
+      project: undefined,
+      reason: `near-duplicate global memory (cosine >= ${SIMILARITY_THRESHOLD}, best sim=${bestSim.toFixed(3)})`,
+      trigger: 'dedup-sweep',
+    });
+    duplicatesRemoved = report.archived.length;
+    for (const id of report.archived) {
+      incrementMetric('deduplicationsRun');
+      console.log(`[dedup] Archived duplicate ${id.slice(0, 8)} (sim=${(doomed.get(id) ?? 0).toFixed(3)})`);
+    }
+    for (const f of report.failed) {
+      console.error(`[dedup] Failed to archive ${f.id}:`, f.error);
     }
   }
 

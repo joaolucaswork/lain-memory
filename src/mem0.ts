@@ -1176,14 +1176,57 @@ export async function getMemoryTouchTimestamp(memoryId: string): Promise<number 
 }
 
 // ─── Memory Cleanup (memoryScan) ───
+// Fase 4: automatic deletions go through the shared domain policy
+// (archive to trash + audit). The trash scope itself is never scanned.
 
 /**
- * Scan project memories and delete those that are cold AND low quality.
+ * Shared domain policy for AUTOMATIC deletions (Fase 4).
+ * Snapshot → trash copy with provenance → hard delete → audit record.
+ * Per-item failures are collected in the report, never thrown.
+ */
+export async function deleteMemoriesWithPolicy(input: {
+  ids: string[];
+  project?: string;
+  reason: string;
+  trigger: string;
+  replacedById?: string;
+}): Promise<{
+  archived: string[];
+  trashIds: Record<string, string | null>;
+  failed: { id: string; error: string }[];
+}> {
+  if (input.project === TRASH_PROJECT) {
+    return {
+      archived: [],
+      trashIds: {},
+      failed: input.ids.map(id => ({ id, error: 'refusing to archive the trash scope itself' })),
+    };
+  }
+  const { applyDeletionPolicy } = await import('./memory-policy.js');
+  const { logMaintenance } = await import('./maintenance-log.js');
+  const report = await applyDeletionPolicy(
+    { ...input, op: 'archive' },
+    {
+      snapshot: ids => snapshotMemories(ids, input.project),
+      trashAndDelete: (snap, fromProject, provenance) => trashAndDelete(snap, fromProject, provenance),
+      audit: record => logMaintenance('memory_policy_delete', { ...record }),
+    }
+  );
+  try {
+    await invalidateMem0Cache(input.project);
+  } catch { /* non-critical */ }
+  return { archived: report.archived, trashIds: report.trashIds, failed: report.failed };
+}
+
+/**
+ * Scan project memories and archive those that are cold AND low quality.
  * Safety rules:
- *   - Only deletes project-scoped memories (global memories are permanent)
- *   - Only deletes memories > 90 days old (3x the cold threshold — extra safety margin)
- *   - Only deletes memories with quality score < 3 (low-value content)
- *   - Returns a report of what was deleted
+ *   - Only archives project-scoped memories (global memories are permanent)
+ *   - Refuses the trash scope itself
+ *   - Only archives memories > 90 days old (3x the cold threshold — extra safety margin)
+ *   - Only archives memories with quality score < 3 (low-value content)
+ *   - Archived items land in the trash scope with provenance + audit trail
+ *   - Returns a report of what was archived
  */
 export async function scanAndCleanProjectMemories(project: string): Promise<{
   total: number;
@@ -1191,8 +1234,9 @@ export async function scanAndCleanProjectMemories(project: string): Promise<{
   deletedItems: { id: string; memory: string; daysOld: number }[];
 }> {
   const memories = await getMemories(project, 200);
-  const deletedItems: { id: string; memory: string; daysOld: number }[] = [];
 
+  // Collect hygiene candidates first; the policy archives them as one batch.
+  const candidates = new Map<string, { memory: string; daysOld: number; quality: number }>();
   for (const mem of memories) {
     const createdMs = mem.created_at ? new Date(mem.created_at).getTime() : null;
     if (!createdMs || isNaN(createdMs)) continue;
@@ -1200,12 +1244,24 @@ export async function scanAndCleanProjectMemories(project: string): Promise<{
     if (daysOld < 90) continue; // extra safety margin — only 90+ days
     const quality = scoreMemoryQuality(mem.memory);
     if (quality >= 3) continue; // keep quality memories even if old
-    await deleteMemory(mem.id);
-    deletedItems.push({ id: mem.id, memory: mem.memory.slice(0, 80), daysOld: Math.round(daysOld) });
+    candidates.set(mem.id, { memory: mem.memory.slice(0, 80), daysOld: Math.round(daysOld), quality });
   }
 
-  if (deletedItems.length > 0) {
-    await invalidateMem0Cache(project);
+  const deletedItems: { id: string; memory: string; daysOld: number }[] = [];
+  if (candidates.size > 0) {
+    const report = await deleteMemoriesWithPolicy({
+      ids: [...candidates.keys()],
+      project,
+      reason: 'stale low-quality memory (90+ days old, quality < 3)',
+      trigger: 'memory_scan',
+    });
+    for (const id of report.archived) {
+      const c = candidates.get(id);
+      if (c) deletedItems.push({ id, memory: c.memory, daysOld: c.daysOld });
+    }
+    for (const f of report.failed) {
+      console.error(`[mem0] memory_scan failed to archive ${f.id}: ${f.error}`);
+    }
   }
 
   try {
@@ -1798,21 +1854,25 @@ export function startMemoryMaintenance(): void {
           if (others.length === 0) continue;
 
           const classification = await classifyMemoryAction(mem.memory, others);
+          // Fase 4: NOOP duplicates are archived through the shared policy
+          // (explicit rule: automatic hygiene archives with trash + audit).
           if (classification.action === 'NOOP' && classification.supersedes.length === 0) {
             try {
-              const [snap] = await snapshotMemories([mem.id], undefined);
-              const { trashId } = await trashAndDelete(
-                snap ?? { id: mem.id, memory: mem.memory, missing: false },
-                undefined,
-                { reason: classification.reason, trigger: 'maintenance:contradiction_scan' },
-              );
-              contradictionsFound++;
-              console.log(`[mem0] Maintenance: removed duplicate ${mem.id} (trash: ${trashId ?? 'copy-failed'})`);
-              logMaintenance('memory_duplicate_purge', {
-                trigger: 'maintenance:contradiction_scan',
+              const report = await deleteMemoriesWithPolicy({
+                ids: [mem.id],
+                project: undefined,
                 reason: classification.reason,
-                deleted: [{ id: mem.id, memory: mem.memory, created_at: mem.created_at ?? null, trash_id: trashId }],
+                trigger: 'maintenance:contradiction_scan',
               });
+              if (report.archived.includes(mem.id)) {
+                contradictionsFound++;
+                console.log(`[mem0] Maintenance: archived duplicate ${mem.id} (trash: ${report.trashIds[mem.id] ?? 'copy-failed'})`);
+                logMaintenance('memory_duplicate_purge', {
+                  trigger: 'maintenance:contradiction_scan',
+                  reason: classification.reason,
+                  deleted: [{ id: mem.id, memory: mem.memory, created_at: mem.created_at ?? null, trash_id: report.trashIds[mem.id] ?? null }],
+                });
+              }
             } catch {}
           }
         }

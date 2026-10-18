@@ -145,9 +145,12 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/contradiction-scan': {
+      // Fase 4: diagnostic only — detects and reports, never writes.
+      // NOOP means "ignore" (not "delete"); UPDATE/DELETE verdicts are
+      // actioned by the maintenance/policy flows, not by this scan.
       const project = data?.project as string | undefined;
       const memories = await getMemories(project, 100);
-      const results: { id: string; action: string; reason: string; memory: string }[] = [];
+      const results: { id: string; action: string; domainOp: string; reason: string; memory: string }[] = [];
       for (const mem of memories) {
         const similar = await searchMemory(mem.memory, project, 5);
         const others = similar
@@ -156,16 +159,17 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
         if (others.length === 0) continue;
         const classification = await classifyMemoryAction(mem.memory, others);
         if (classification.action !== 'ADD') {
+          const { domainOpForClassification } = await import('./memory-policy.js');
           results.push({
             id: mem.id,
             action: classification.action,
+            domainOp: domainOpForClassification(classification.action),
             reason: classification.reason,
             memory: mem.memory.slice(0, 100),
           });
-          if (classification.action === 'NOOP') await deleteMemory(mem.id);
         }
       }
-      return json({ scanned: memories.length, issues: results.length, results });
+      return json({ scanned: memories.length, issues: results.length, results, writes: 0 });
     }
 
     case '/api/memory/metrics':
