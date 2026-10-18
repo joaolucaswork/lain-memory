@@ -148,7 +148,7 @@ function normalize(name: string): string {
 export async function initGraph(): Promise<void> {
   if (!existsSync(KNOWLEDGE_DIR)) mkdirSync(KNOWLEDGE_DIR, { recursive: true });
 
-  graph = new Graph({ type: 'directed', multi: false });
+  graph = new Graph({ type: 'directed', multi: true });
 
   if (existsSync(GRAPH_PATH)) {
     try {
@@ -309,9 +309,19 @@ function upsertEntity(name: string, type: EntityType, description?: string): str
   return id;
 }
 
+/**
+ * Identity of a relationship: source + predicate + target.
+ * Same nodes with different predicates are distinct relationships
+ * and must not be merged. The key format preserves existing
+ * single-predicate edges so persisted graphs remain readable.
+ */
+export function relationshipKey(sourceId: string, targetId: string, predicate: string): string {
+  return `${sourceId}-${predicate}-${targetId}`;
+}
+
 function upsertRelationship(sourceId: string, targetId: string, predicate: string): void {
   const now = Date.now();
-  const edgeKey = `${sourceId}-${predicate}-${targetId}`;
+  const edgeKey = relationshipKey(sourceId, targetId, predicate);
 
   if (graph.hasEdge(edgeKey)) {
     const attrs = graph.getEdgeAttributes(edgeKey) as RelationshipAttrs;
@@ -320,15 +330,6 @@ function upsertRelationship(sourceId: string, targetId: string, predicate: strin
     graph.replaceEdgeAttributes(edgeKey, attrs);
   } else {
     if (!graph.hasNode(sourceId) || !graph.hasNode(targetId)) return;
-    // Non-multi graph: check if any edge already links these nodes (different predicate)
-    if (graph.hasEdge(sourceId, targetId)) {
-      const existingEdge = graph.edge(sourceId, targetId)!;
-      const attrs = graph.getEdgeAttributes(existingEdge) as RelationshipAttrs;
-      attrs.weight += 1;
-      attrs.lastSeen = now;
-      graph.replaceEdgeAttributes(existingEdge, attrs);
-      return;
-    }
     graph.addEdgeWithKey(edgeKey, sourceId, targetId, {
       predicate,
       weight: 1,
