@@ -19,11 +19,31 @@ const mockDeleteMemory = mock(async (_id: string) => undefined);
 const mockGetImportance = mock(async (_id: string): Promise<number | null> => null);
 const mockListProjects = mock((): Array<{ name: string }> => []);
 const mockIncrementMetric = mock((_key: string) => undefined);
+// Emulates the real fail-closed deleteMemoriesWithPolicy through the mocked
+// primitives (trash copy always confirms here; failing mockDeleteMemory
+// lands in `failed` with its message — policy behavior itself is covered
+// in memory-policy.test.ts + mem0-audit-trail.test.ts).
+const mockDeleteMemoriesWithPolicy = mock(async (input: { ids: string[]; project?: string; reason: string; trigger: string }) => {
+  const archived: string[] = [];
+  const trashIds: Record<string, string | null> = {};
+  const failed: { id: string; error: string }[] = [];
+  for (const id of input.ids) {
+    try {
+      await mockDeleteMemory(id);
+      trashIds[id] = `trash-${id}`;
+      archived.push(id);
+    } catch (err) {
+      failed.push({ id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { archived, trashIds, failed, audit: [], auditFailed: [] };
+});
 
 mock.module('../mem0.js', () => ({
   getMemories: mockGetMemories,
   deleteMemory: mockDeleteMemory,
   getMemoryImportance: mockGetImportance,
+  deleteMemoriesWithPolicy: mockDeleteMemoriesWithPolicy,
 }));
 mock.module('../workspace.js', () => ({
   listProjects: mockListProjects,
@@ -44,6 +64,7 @@ const savedEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
   ENV_KEYS.forEach(k => { savedEnv[k] = process.env[k]; delete process.env[k]; });
   mockDeleteMemory.mockClear();
+  mockDeleteMemoriesWithPolicy.mockClear();
   mockGetMemories.mockClear();
   mockGetImportance.mockClear();
   mockListProjects.mockClear();

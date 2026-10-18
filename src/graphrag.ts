@@ -999,21 +999,60 @@ function outboxPath(): string {
   return path.join(outboxDir(), 'graph-outbox.jsonl');
 }
 
-function readOutboxFile(file: string): GraphOutboxEntry[] {
+function quarantinePath(): string {
+  return path.join(outboxDir(), 'graph-outbox.quarantine.jsonl');
+}
+
+function readOutboxFile(file: string): { entries: GraphOutboxEntry[]; corrupt: { lineNo: number; raw: string }[] } {
   try {
     const raw = readFileSync(file, 'utf8');
     const entries: GraphOutboxEntry[] = [];
+    const corrupt: { lineNo: number; raw: string }[] = [];
+    let lineNo = 0;
     for (const line of raw.split('\n')) {
+      lineNo++;
       const t = line.trim();
       if (!t) continue;
       try {
         entries.push(JSON.parse(t) as GraphOutboxEntry);
-      } catch { /* skip corrupt line, keep draining the rest */ }
+      } catch {
+        // Never silently drop: corrupt lines go to quarantine below.
+        corrupt.push({ lineNo, raw: t.slice(0, 2000) });
+      }
     }
-    return entries;
+    return { entries, corrupt };
   } catch {
-    return [];
+    return { entries: [], corrupt: [] };
   }
+}
+
+/**
+ * Preserve unparseable outbox lines for investigation before the claimed
+ * file is removed. Best-effort: a quarantine failure is logged, never fatal.
+ * Returns the number of lines quarantined.
+ */
+function quarantineOutboxLines(sourceFile: string, corrupt: { lineNo: number; raw: string }[]): number {
+  if (corrupt.length === 0) return 0;
+  let quarantined = 0;
+  for (const c of corrupt) {
+    try {
+      if (!existsSync(outboxDir())) mkdirSync(outboxDir(), { recursive: true });
+      appendFileSync(quarantinePath(), JSON.stringify({
+        ts: Date.now(),
+        reason: 'unparseable outbox line',
+        file: path.basename(sourceFile),
+        lineNo: c.lineNo,
+        raw: c.raw,
+      }) + '\n', 'utf8');
+      quarantined++;
+    } catch (err) {
+      console.error('[graphrag] Failed to quarantine corrupt outbox line:', err instanceof Error ? err.message : err);
+    }
+  }
+  if (quarantined > 0) {
+    console.error(`[graphrag] Quarantined ${quarantined} corrupt outbox line(s) from ${path.basename(sourceFile)} — see ${path.basename(quarantinePath())}`);
+  }
+  return quarantined;
 }
 
 export function appendGraphOutbox(entry: Omit<GraphOutboxEntry, 'id' | 'ts' | 'attempts'> & { attempts?: number }): GraphOutboxEntry {
@@ -1059,8 +1098,8 @@ async function applyOutboxEntry(
  */
 export async function drainGraphOutbox(
   exec?: (entry: GraphOutboxEntry) => Promise<void>
-): Promise<{ processed: number; failed: number; deadLettered: number; pending: number }> {
-  if (!graph && !exec) return { processed: 0, failed: 0, deadLettered: 0, pending: 0 };
+): Promise<{ processed: number; failed: number; deadLettered: number; pending: number; quarantined: number }> {
+  if (!graph && !exec) return { processed: 0, failed: 0, deadLettered: 0, pending: 0, quarantined: 0 };
   const dir = outboxDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
@@ -1081,11 +1120,14 @@ export async function drainGraphOutbox(
   for (const f of processing) claim(path.join(dir, f));
 
   let entries: GraphOutboxEntry[] = [];
+  let quarantined = 0;
   for (const f of claimed) {
-    entries.push(...readOutboxFile(f));
+    const read = readOutboxFile(f);
+    entries.push(...read.entries);
+    quarantined += quarantineOutboxLines(f, read.corrupt);
     try { unlinkSync(f); } catch { /* already gone */ }
   }
-  if (entries.length === 0) return { processed: 0, failed: 0, deadLettered: 0, pending: 0 };
+  if (entries.length === 0) return { processed: 0, failed: 0, deadLettered: 0, pending: 0, quarantined };
 
   let processed = 0;
   let failed = 0;
@@ -1120,7 +1162,7 @@ export async function drainGraphOutbox(
       console.error('[graphrag] Failed to re-queue outbox entry:', err instanceof Error ? err.message : err);
     }
   }
-  return { processed, failed, deadLettered, pending: survivors.length };
+  return { processed, failed, deadLettered, pending: survivors.length, quarantined };
 }
 
 function triggerOutboxDrain(): void {
@@ -1231,7 +1273,7 @@ export function getGraphSyncStatus(): {
   let pending = 0;
   let processing = 0;
   try {
-    pending = readOutboxFile(outboxPath()).length;
+    pending = readOutboxFile(outboxPath()).entries.length;
     processing = readdirSync(outboxDir()).filter(
       f => f.startsWith('.graph-outbox.processing-') || f.startsWith('.graph-outbox.claimed-')
     ).length;

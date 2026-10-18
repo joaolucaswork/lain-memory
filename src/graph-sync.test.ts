@@ -78,8 +78,8 @@ describe('drainGraphOutbox', () => {
     expect(seen).toEqual(['orphan']);
   });
 
-  test('linha corrompida não trava o drain', async () => {
-    const { appendFileSync } = await import('fs');
+  test('linha corrompida vai para quarentena (não some em silêncio)', async () => {
+    const { appendFileSync, readFileSync, existsSync } = await import('fs');
     const { appendGraphOutbox: append } = await import('./graphrag.js');
     append({ text: 'good' });
     appendFileSync(join(tmp, 'graph-outbox.jsonl'), 'THIS IS NOT JSON\n', 'utf8');
@@ -87,6 +87,14 @@ describe('drainGraphOutbox', () => {
     const result = await drainGraphOutbox(async (e) => { seen.push(e.id); });
     expect(result.processed).toBe(1);
     expect(seen.length).toBe(1);
+    expect(result.quarantined).toBe(1);
+    // Quarentena preservada com motivo + linha original
+    const qPath = join(tmp, 'graph-outbox.quarantine.jsonl');
+    expect(existsSync(qPath)).toBe(true);
+    const q = JSON.parse(readFileSync(qPath, 'utf8').trim().split('\n').at(-1)!);
+    expect(q.reason).toBe('unparseable outbox line');
+    expect(q.raw).toBe('THIS IS NOT JSON');
+    expect(typeof q.ts).toBe('number');
   });
 });
 

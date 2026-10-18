@@ -12,6 +12,23 @@ function post(body: unknown, headers: Record<string, string> = {}): Request {
   });
 }
 
+/** POST com corpo em stream (sem Content-Length) — exercita o limite no fluxo. */
+function streamPost(chunks: (string | Uint8Array)[]): Request {
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      for (const ch of chunks) c.enqueue(typeof ch === 'string' ? enc.encode(ch) : ch);
+      c.close();
+    },
+  });
+  return new Request('http://x/api/memory/remember', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit);
+}
+
 describe('validateRoute', () => {
   test('remember exige text; modo inválido rejeita', () => {
     expect(validateRoute('/api/memory/remember', { text: 'oi' }).ok).toBe(true);
@@ -87,9 +104,33 @@ describe('parseBody', () => {
     expect(r).toMatchObject({ ok: false, status: 413 });
   });
 
-  test('corpo gigante sem content-length → 413 pelo tamanho real', async () => {
+  test('corpo gigante com content-length automático → 413 pelo tamanho real', async () => {
     const big = 'x'.repeat(100);
     const r = await parseBody(post({ big: big.repeat(20000) }));
     expect(r).toMatchObject({ ok: false, status: 413 });
+  });
+
+  test('stream sem content-length gigante → 413 no meio da leitura', async () => {
+    const chunk = new TextEncoder().encode('y'.repeat(65536));
+    const pieces = Array.from({ length: 32 }, () => chunk); // 2 MiB total
+    const r = await parseBody(streamPost(pieces));
+    expect(r).toMatchObject({ ok: false, status: 413 });
+  });
+
+  test('contagem é em bytes, não em unidades UTF-16', async () => {
+    // 'é' = 2 bytes em UTF-8: 600k chars = 1.2 MiB (acima do limite),
+    // mas JSON.stringify().length ≈ 600k (abaixo) — o código antigo passaria.
+    const r = await parseBody(streamPost(['{"big":"' + 'é'.repeat(600_000) + '"}']));
+    expect(r).toMatchObject({ ok: false, status: 413 });
+  });
+
+  test('stream pequeno e válido passa', async () => {
+    const r = await parseBody(streamPost(['{"text":"oi"}']));
+    expect(r).toEqual({ ok: true, data: { text: 'oi' } });
+  });
+
+  test('corpo vazio → 400', async () => {
+    const r = await parseBody(new Request('http://x/api/memory/remember', { method: 'POST' }));
+    expect(r).toMatchObject({ ok: false, status: 400 });
   });
 });

@@ -160,22 +160,55 @@ export async function parseBody(
       return { ok: false, status: 413, error: `body too large (limit ${MAX_BODY_BYTES} bytes)` };
     }
   }
+  // Stream the body with byte counting: abort WITHOUT buffering when the
+  // limit is exceeded, even if Content-Length is absent or lies.
+  // (Byte count, not UTF-16 units — 1 MiB means 1 MiB on the wire.)
+  const body = req.body;
+  if (!body) {
+    return { ok: false, status: 400, error: 'empty body' };
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    let read: Awaited<ReturnType<typeof reader.read>> | null = null;
+    try {
+      read = await reader.read();
+    } catch {
+      read = null;
+    }
+    if (!read) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return { ok: false, status: 400, error: 'invalid JSON body' };
+    }
+    if (read.done) break;
+    total += read.value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      return { ok: false, status: 413, error: `body too large (limit ${MAX_BODY_BYTES} bytes)` };
+    }
+    chunks.push(read.value);
+  }
+  let text: string;
+  try {
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      bytes.set(c, offset);
+      offset += c.byteLength;
+    }
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return { ok: false, status: 400, error: 'invalid JSON body' };
+  }
   let raw: unknown;
   try {
-    raw = await req.json();
+    raw = JSON.parse(text);
   } catch {
     return { ok: false, status: 400, error: 'invalid JSON body' };
   }
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return { ok: false, status: 400, error: 'body must be a JSON object' };
-  }
-  try {
-    const text = JSON.stringify(raw);
-    if (text.length > MAX_BODY_BYTES) {
-      return { ok: false, status: 413, error: `body too large (limit ${MAX_BODY_BYTES} bytes)` };
-    }
-  } catch {
-    return { ok: false, status: 400, error: 'invalid JSON body' };
   }
   return { ok: true, data: raw };
 }
