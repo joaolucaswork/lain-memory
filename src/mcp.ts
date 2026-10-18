@@ -133,6 +133,7 @@ const TOOL_DEFINITIONS = [
         query: { type: 'string', description: 'Natural language query' },
         depth: { type: 'number', description: 'Traversal depth (default: 2)' },
         maxNodes: { type: 'number', description: 'Max entities in context (default: 10)' },
+        project: { type: 'string', description: 'Project scope (e.g. "lain"). Omit for global-only scope.' },
       },
       required: ['query'],
     },
@@ -261,7 +262,7 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
     }
 
     case 'graph_query': {
-      const ctx = await graphQuery(args.query ?? '', { maxDepth: args.depth, maxNodes: args.maxNodes });
+      const ctx = await graphQuery(args.query ?? '', { maxDepth: args.depth, maxNodes: args.maxNodes, project: args.project });
       return text(JSON.stringify(ctx));
     }
 

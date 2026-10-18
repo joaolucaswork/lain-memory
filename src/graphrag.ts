@@ -143,6 +143,61 @@ function normalize(name: string): string {
     .replace(/\s+/g, ' ');
 }
 
+// ─── Project scope (Fase 2) ───
+//
+// Policy v1 (mirrors Mem0's userId scheme `lucas` vs `lucas:project`):
+// - ingest WITHOUT project → GLOBAL nodes (bare normalized ids), visible everywhere.
+// - ingest WITH project P → LOCAL nodes (`p::name`), visible only to queries
+//   with project P (plus global nodes, which are always visible).
+// - No cross-scope edges in v1: every ingest scopes all endpoints uniformly.
+// - Legacy bare ids (pre-scope data) read as GLOBAL: no rewrite, rollback-safe.
+// - Promotion local→global is explicitly out of scope for v1.
+
+export const SCOPE_SEPARATOR = '::';
+
+export function normalizeProject(project: string): string {
+  return normalize(project).replace(/\s+/g, '-');
+}
+
+/** Scoped node id. Preserves already-qualified ids (idempotent). */
+export function scopedId(name: string, project?: string): string {
+  const normalized = normalize(name);
+  if (!project) return normalized;
+  const scope = normalizeProject(project);
+  if (!scope) return normalized;
+  if (normalized.startsWith(`${scope}${SCOPE_SEPARATOR}`)) return normalized;
+  return `${scope}${SCOPE_SEPARATOR}${normalized}`;
+}
+
+/** Project prefix of a node id, or undefined for global/legacy nodes. */
+export function nodeProject(id: string): string | undefined {
+  const idx = id.indexOf(SCOPE_SEPARATOR);
+  if (idx <= 0) return undefined;
+  return id.slice(0, idx) || undefined;
+}
+
+/**
+ * Visibility rule.
+ * - Scoped read (project P): global nodes + P's local nodes. Never another
+ *   project's locals.
+ * - Unscoped read (no project): EVERYTHING (legacy/admin behavior).
+ *   This preserves HTTP/MCP compatibility: pre-scope consumers keep seeing
+ *   the same data as before. Isolation is enforced on project-scoped reads.
+ */
+export function isNodeVisibleToProject(id: string, project?: string): boolean {
+  if (!project) return true;
+  const scope = nodeProject(id);
+  if (!scope) return true;
+  return scope === normalizeProject(project);
+}
+
+/** Resolve user input (bare or qualified) to a stored node id. */
+export function resolveNodeId(input: string, project?: string): string {
+  const normalized = normalize(input);
+  if (normalized.includes(SCOPE_SEPARATOR)) return normalized;
+  return scopedId(normalized, project);
+}
+
 // ─── Initialization & Persistence ───
 
 export async function initGraph(): Promise<void> {
@@ -203,22 +258,30 @@ export function isGraphEnabled(): boolean {
   return ENABLED;
 }
 
-export async function cachedGetStats(): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
-  const cached = await cacheGet<{ nodes: number; edges: number; types: Record<string, number> }>('stats');
+export async function cachedGetStats(project?: string): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
+  const scopeSuffix = project ? normalizeProject(project) : '';
+  const cached = await cacheGet<{ nodes: number; edges: number; types: Record<string, number> }>(`stats:${scopeSuffix}`);
   if (cached) return cached;
-  const result = getStats();
-  await cacheSet('stats', result, CACHE_TTL_STATS);
+  const result = getStats(project);
+  await cacheSet(`stats:${scopeSuffix}`, result, CACHE_TTL_STATS);
   return result;
 }
 
-export function getStats(): { nodes: number; edges: number; types: Record<string, number> } {
+export function getStats(project?: string): { nodes: number; edges: number; types: Record<string, number> } {
   if (!graph) return { nodes: 0, edges: 0, types: {} };
   const types: Record<string, number> = {};
-  graph.forEachNode((_, attrs) => {
+  let nodes = 0;
+  graph.forEachNode((key, attrs) => {
+    if (!isNodeVisibleToProject(key, project)) return;
+    nodes++;
     const t = (attrs as EntityAttrs).type || 'Other';
     types[t] = (types[t] || 0) + 1;
   });
-  return { nodes: graph.order, edges: graph.size, types };
+  let edges = 0;
+  graph.forEachEdge((_edge, _attrs, source, target) => {
+    if (isNodeVisibleToProject(source, project) && isNodeVisibleToProject(target, project)) edges++;
+  });
+  return { nodes, edges, types };
 }
 
 // ─── Entity Extraction ───
@@ -284,8 +347,8 @@ async function extractEntities(text: string): Promise<ExtractionResult> {
 
 // ─── Graph Mutations ───
 
-function upsertEntity(name: string, type: EntityType, description?: string): string {
-  const id = normalize(name);
+function upsertEntity(name: string, type: EntityType, description?: string, project?: string): string {
+  const id = scopedId(name, project);
   const now = Date.now();
 
   if (graph.hasNode(id)) {
@@ -341,7 +404,7 @@ function upsertRelationship(sourceId: string, targetId: string, predicate: strin
 
 // ─── Public API ───
 
-export async function ingest(text: string, _project?: string): Promise<{ entities: number; relationships: number }> {
+export async function ingest(text: string, project?: string): Promise<{ entities: number; relationships: number }> {
   if (!ENABLED || !graph) return { entities: 0, relationships: 0 };
 
   try {
@@ -349,15 +412,15 @@ export async function ingest(text: string, _project?: string): Promise<{ entitie
 
     for (const entity of result.entities) {
       if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-      upsertEntity(entity.name, entity.type, entity.description);
+      upsertEntity(entity.name, entity.type, entity.description, project);
     }
 
     for (const rel of result.relationships) {
-      const sourceId = normalize(rel.subject);
-      const targetId = normalize(rel.object);
-      if (shouldRejectRelationship(sourceId, rel.predicate, targetId)) continue;
-      if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other');
-      if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other');
+      if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
+      const sourceId = scopedId(rel.subject, project);
+      const targetId = scopedId(rel.object, project);
+      if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project);
+      if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project);
       upsertRelationship(sourceId, targetId, rel.predicate);
     }
 
@@ -369,7 +432,7 @@ export async function ingest(text: string, _project?: string): Promise<{ entitie
     if (containsDecisionLanguage(text)) {
       extractDecision(text).then(decision => {
         if (decision) {
-          addDecision(decision).catch(err =>
+          addDecision(decision, project).catch(err =>
             console.error('[graphrag] Auto-decision extraction error:', err)
           );
         }
@@ -387,21 +450,22 @@ export async function ingest(text: string, _project?: string): Promise<{ entitie
 
 export async function ingestExtracted(
   entities: Array<{ name: string; type: string; description: string }>,
-  relationships: Array<{ subject: string; predicate: string; object: string }>
+  relationships: Array<{ subject: string; predicate: string; object: string }>,
+  project?: string
 ): Promise<void> {
   if (!ENABLED || !graph) return;
 
   for (const entity of entities) {
     if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-    upsertEntity(entity.name, entity.type as EntityType, entity.description);
+    upsertEntity(entity.name, entity.type as EntityType, entity.description, project);
   }
 
   for (const rel of relationships) {
-    const sourceId = normalize(rel.subject);
-    const targetId = normalize(rel.object);
-    if (shouldRejectRelationship(sourceId, rel.predicate, targetId)) continue;
-    if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other');
-    if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other');
+    if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
+    const sourceId = scopedId(rel.subject, project);
+    const targetId = scopedId(rel.object, project);
+    if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project);
+    if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project);
     upsertRelationship(sourceId, targetId, rel.predicate);
   }
 
@@ -411,7 +475,7 @@ export async function ingestExtracted(
 
 export async function query(
   queryText: string,
-  opts?: { maxDepth?: number; maxNodes?: number }
+  opts?: { maxDepth?: number; maxNodes?: number; project?: string }
 ): Promise<GraphContext> {
   if (!ENABLED || !graph || graph.order === 0) {
     return { entities: [], relationships: [], markdown: '' };
@@ -419,7 +483,8 @@ export async function query(
 
   const maxDepth = opts?.maxDepth ?? MAX_DEPTH;
   const maxNodes = opts?.maxNodes ?? MAX_CONTEXT_NODES;
-  const cacheKey = `query:${hashText(queryText)}:${maxDepth}:${maxNodes}`;
+  const project = opts?.project;
+  const cacheKey = `query:${hashText(queryText)}:${maxDepth}:${maxNodes}:${project ? normalizeProject(project) : ''}`;
 
   // Check cache
   const cached = await cacheGet<GraphContext>(cacheKey);
@@ -443,6 +508,7 @@ export async function query(
   const minMatches = queryWords.length > 1 ? 2 : 1;
   const matchingNodes: string[] = [];
   graph.forEachNode((nodeId) => {
+    if (!isNodeVisibleToProject(nodeId, project)) return;
     const matchCount = queryWords.filter(w => nodeId.includes(w)).length;
     if (matchCount >= minMatches) {
       matchingNodes.push(nodeId);
@@ -462,9 +528,11 @@ export async function query(
 
     bfsFromNode(graph, startNode, (node, _attrs, depth) => {
       if (depth > maxDepth || visited.size >= maxNodes) return true;
+      if (!isNodeVisibleToProject(node, project)) return true;
       visited.add(node);
 
       graph.forEachOutEdge(node, (_edge, attrs, source, target) => {
+        if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
         const relAttrs = attrs as RelationshipAttrs;
         contextEdges.push({
           source,
@@ -541,10 +609,10 @@ function toMarkdown(ctx: GraphContext): string {
 
 // ─── Decision Framework ───
 
-export async function addDecision(decision: DecisionInput): Promise<string> {
+export async function addDecision(decision: DecisionInput, project?: string): Promise<string> {
   if (!ENABLED || !graph) return '';
 
-  const id = normalize(decision.name);
+  const id = scopedId(decision.name, project);
   const now = Date.now();
 
   const attrs: DecisionAttrs = {
@@ -567,13 +635,13 @@ export async function addDecision(decision: DecisionInput): Promise<string> {
   }
 
   // Create DECIDED_FOR edge to the chosen option
-  const chosenId = upsertEntity(decision.chosen, 'Concept');
+  const chosenId = upsertEntity(decision.chosen, 'Concept', undefined, project);
   upsertRelationship(id, chosenId, 'DECIDED_FOR');
 
   // Create DECIDED_AGAINST edges to rejected options
   for (const option of decision.options) {
     if (option !== decision.chosen) {
-      const optionId = upsertEntity(option, 'Concept');
+      const optionId = upsertEntity(option, 'Concept', undefined, project);
       upsertRelationship(id, optionId, 'DECIDED_AGAINST');
     }
   }
@@ -581,7 +649,7 @@ export async function addDecision(decision: DecisionInput): Promise<string> {
   // Link to related entities
   if (decision.relatedEntities) {
     for (const related of decision.relatedEntities) {
-      const relatedId = upsertEntity(related.name, related.type);
+      const relatedId = upsertEntity(related.name, related.type, undefined, project);
       upsertRelationship(id, relatedId, 'RELATED_TO');
     }
   }
@@ -592,10 +660,10 @@ export async function addDecision(decision: DecisionInput): Promise<string> {
   return id;
 }
 
-export async function queryDecisions(context: string): Promise<Array<DecisionAttrs & { id: string }>> {
+export async function queryDecisions(context: string, project?: string): Promise<Array<DecisionAttrs & { id: string }>> {
   if (!ENABLED || !graph || graph.order === 0) return [];
 
-  const cacheKey = `decisions:${hashText(context)}`;
+  const cacheKey = `decisions:${hashText(context)}:${project ? normalizeProject(project) : ''}`;
   const cached = await cacheGet<Array<DecisionAttrs & { id: string }>>(cacheKey);
   if (cached) return cached;
 
@@ -605,6 +673,7 @@ export async function queryDecisions(context: string): Promise<Array<DecisionAtt
   const decisions: Array<DecisionAttrs & { id: string; relevance: number }> = [];
 
   graph.forEachNode((nodeId, attrs) => {
+    if (!isNodeVisibleToProject(nodeId, project)) return;
     const a = attrs as EntityAttrs;
     if (a.type !== 'Decision') return;
 
@@ -627,6 +696,7 @@ export async function queryDecisions(context: string): Promise<Array<DecisionAtt
 
     // Also check connected entities
     graph.forEachOutNeighbor(nodeId, (neighbor) => {
+      if (!isNodeVisibleToProject(neighbor, project)) return;
       if (contextWords.some(w => neighbor.includes(w))) relevance += 0.5;
     });
 
@@ -726,21 +796,27 @@ function entitySimilarity(a: string, b: string): number {
  * - Transfers edges from duplicates to canonical entity
  * Returns number of entities merged.
  */
-export async function resolveEntities(threshold = 0.75): Promise<{ merged: number; pairs: string[][] }> {
+export async function resolveEntities(threshold = 0.75, project?: string): Promise<{ merged: number; pairs: string[][] }> {
   if (!ENABLED || !graph || graph.order < 2) return { merged: 0, pairs: [] };
+
+  const onlyScope = project ? normalizeProject(project) : undefined;
 
   const nodes = graph.mapNodes((key, attrs) => ({
     key,
     attrs: attrs as EntityAttrs,
   }));
 
-  // Group by type for faster comparison
+  // Group by scope + type: never merge across scopes (Fase 2).
+  // A project-scoped sweep only touches that project's group.
   const byType = new Map<string, typeof nodes>();
   for (const node of nodes) {
+    const scope = nodeProject(node.key) ?? '';
+    if (onlyScope && scope !== onlyScope) continue;
     const type = node.attrs.type || 'Other';
-    const group = byType.get(type) || [];
+    const groupKey = `${scope} ${type}`;
+    const group = byType.get(groupKey) || [];
     group.push(node);
-    byType.set(type, group);
+    byType.set(groupKey, group);
   }
 
   const mergedPairs: string[][] = [];
@@ -774,7 +850,7 @@ export async function resolveEntities(threshold = 0.75): Promise<{ merged: numbe
           graph.forEachEdge(duplicate.key, (edge, attrs, source, target) => {
             const newSource = source === duplicate.key ? canonical.key : source;
             const newTarget = target === duplicate.key ? canonical.key : target;
-            const edgeKey = `${newSource}-${(attrs as RelationshipAttrs).predicate}-${newTarget}`;
+            const edgeKey = relationshipKey(newSource, newTarget, (attrs as RelationshipAttrs).predicate);
             if (!graph.hasEdge(edgeKey) && newSource !== newTarget) {
               try {
                 graph.addEdgeWithKey(edgeKey, newSource, newTarget, attrs);
@@ -856,11 +932,11 @@ export async function runAutoclean(): Promise<SweepResult> {
  * Remove specific nodes (and all their edges) from the graph.
  * Returns the list of nodes actually removed.
  */
-export async function removeNodes(nodeIds: string[]): Promise<string[]> {
+export async function removeNodes(nodeIds: string[], project?: string): Promise<string[]> {
   if (!graph) return [];
   const removed: string[] = [];
   for (const id of nodeIds) {
-    const key = normalize(id);
+    const key = resolveNodeId(id, project);
     if (graph.hasNode(key)) {
       graph.dropNode(key);
       removed.push(key);
@@ -881,17 +957,19 @@ export async function removeNodes(nodeIds: string[]): Promise<string[]> {
 export async function removeRelationships(
   source: string,
   predicates?: string[],
-  targets?: string[]
+  targets?: string[],
+  project?: string
 ): Promise<number> {
   if (!graph) return 0;
-  const srcKey = normalize(source);
+  const srcKey = resolveNodeId(source, project);
   if (!graph.hasNode(srcKey)) return 0;
 
+  const scopedTargets = targets?.map(t => resolveNodeId(t, project));
   const toRemove: string[] = [];
   graph.forEachOutEdge(srcKey, (edge, attrs, _src, tgt) => {
     const relAttrs = attrs as RelationshipAttrs;
     if (predicates && !predicates.includes(relAttrs.predicate)) return;
-    if (targets && !targets.includes(tgt)) return;
+    if (scopedTargets && !scopedTargets.includes(tgt)) return;
     toRemove.push(edge);
   });
 
@@ -909,18 +987,22 @@ export async function removeRelationships(
 
 /**
  * List all nodes in the graph with basic info.
+ * With project: only nodes visible to that project (global + its scope).
  */
-export function listAllNodes(): Array<{ id: string; type: string; mentions: number; edgeCount: number }> {
+export function listAllNodes(project?: string): Array<{ id: string; type: string; mentions: number; edgeCount: number }> {
   if (!graph) return [];
-  return graph.mapNodes((key, attrs) => {
+  const out: Array<{ id: string; type: string; mentions: number; edgeCount: number }> = [];
+  graph.forEachNode((key, attrs) => {
+    if (!isNodeVisibleToProject(key, project)) return;
     const a = attrs as EntityAttrs;
-    return {
+    out.push({
       id: key,
       type: a.type || 'Other',
       mentions: a.mentions || 0,
       edgeCount: graph!.degree(key),
-    };
+    });
   });
+  return out;
 }
 
 // ─── PGS Integration ───
@@ -929,15 +1011,16 @@ export function listAllNodes(): Array<{ id: string; type: string; mentions: numb
  * Export graph data in PGS-compatible format.
  * Maps entity descriptions to `concept` field for PGS consumption.
  */
-export async function cachedGetGraphForPGS(): Promise<ReturnType<typeof getGraphForPGS>> {
-  const cached = await cacheGet<ReturnType<typeof getGraphForPGS>>('pgs');
+export async function cachedGetGraphForPGS(project?: string): Promise<ReturnType<typeof getGraphForPGS>> {
+  const scopeSuffix = project ? normalizeProject(project) : '';
+  const cached = await cacheGet<ReturnType<typeof getGraphForPGS>>(`pgs:${scopeSuffix}`);
   if (cached) return cached;
-  const result = getGraphForPGS();
-  await cacheSet('pgs', result, CACHE_TTL_PGS);
+  const result = getGraphForPGS(project);
+  await cacheSet(`pgs:${scopeSuffix}`, result, CACHE_TTL_PGS);
   return result;
 }
 
-export function getGraphForPGS(): {
+export function getGraphForPGS(project?: string): {
   nodes: Array<{ id: string; concept: string; tag: string; weight: number }>;
   edges: Array<{ source: string; target: string; weight: number }>;
 } {
@@ -947,6 +1030,7 @@ export function getGraphForPGS(): {
 
   const nodes: Array<{ id: string; concept: string; tag: string; weight: number }> = [];
   graph.forEachNode((nodeId, attrs) => {
+    if (!isNodeVisibleToProject(nodeId, project)) return;
     const a = attrs as EntityAttrs;
     nodes.push({
       id: nodeId,
@@ -958,6 +1042,7 @@ export function getGraphForPGS(): {
 
   const edges: Array<{ source: string; target: string; weight: number }> = [];
   graph.forEachEdge((_edge, attrs, source, target) => {
+    if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
     const a = attrs as RelationshipAttrs;
     edges.push({
       source,

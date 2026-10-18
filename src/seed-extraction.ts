@@ -353,7 +353,7 @@ async function storeSeedResults(output: SeedOutput, project?: string): Promise<s
 
   if (isGraphEnabled()) {
     try {
-      await ingestExtracted(output.entities, output.relationships);
+      await ingestExtracted(output.entities, output.relationships, project);
     } catch (err) {
       console.error('[seed] GraphRAG ingestion error:', err);
     }

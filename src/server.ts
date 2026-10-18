@@ -138,7 +138,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/resolve-entities': {
-      const result = await resolveEntities(data.threshold ?? 0.75);
+      const result = await resolveEntities(data.threshold ?? 0.75, data.project);
       return json(result);
     }
 
@@ -170,26 +170,26 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
       return json(getMetrics());
 
     case '/api/graph/query': {
-      const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes });
+      const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
       return json(ctx);
     }
 
     case '/api/graph/stats':
-      return json(await cachedGetStats());
+      return json(await cachedGetStats(data.project));
 
     case '/api/graph/nodes':
-      return json(listAllNodes());
+      return json(listAllNodes(data.project));
 
     case '/api/graph/remove-nodes': {
       const ids = data.ids as string[];
       if (!ids || !Array.isArray(ids)) return json({ error: 'ids array required' }, 400);
-      return json({ removed: await removeNodes(ids) });
+      return json({ removed: await removeNodes(ids, data.project) });
     }
 
     case '/api/graph/remove-relationships': {
-      const { source, predicates, targets } = data;
+      const { source, predicates, targets, project } = data;
       if (!source) return json({ error: 'source required' }, 400);
-      return json({ removed: await removeRelationships(source, predicates, targets) });
+      return json({ removed: await removeRelationships(source, predicates, targets, project) });
     }
 
     case '/api/graph/autoclean':
@@ -197,11 +197,11 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/graph/dump': {
       // Full graph payload for PGS sweeps running outside this server.
-      return json(await cachedGetGraphForPGS());
+      return json(await cachedGetGraphForPGS(data.project));
     }
 
     case '/api/graph/ingest': {
-      await ingestExtracted(data.entities ?? [], data.relationships ?? []);
+      await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project);
       return json({ success: true });
     }
 
@@ -238,7 +238,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/pgs/execute': {
       // Partition → route → sweep → synthesize over the local GraphRAG.
       if (!data.query) return json({ error: 'query required' });
-      const pgsGraph = await cachedGetGraphForPGS();
+      const pgsGraph = await cachedGetGraphForPGS(data.project);
       if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
       const providers = createPGSProviders();
       const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
@@ -250,7 +250,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/pgs/stats': {
-      const pgsGraph = await cachedGetGraphForPGS();
+      const pgsGraph = await cachedGetGraphForPGS(data.project);
       const providers = createPGSProviders();
       const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
       const partitions = pgsEngine.partition(pgsGraph);
