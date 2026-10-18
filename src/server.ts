@@ -46,23 +46,25 @@ import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
+import { parseBody, validateRoute } from './http-validation.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
+const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
 const API_KEY = process.env.LAIN_API_KEY ?? '';
 
 function unauthorized(req: Request): boolean {
-  if (!API_KEY) return false; // empty key = open localhost (same semantics as lain validateApiKey)
+  if (!API_KEY) return false; // empty key = open (same semantics as lain validateApiKey)
   const h = req.headers.get('authorization') ?? '';
   return h !== `Bearer ${API_KEY}`;
 }
 
-async function readJson(req: Request): Promise<Record<string, any>> {
-  try {
-    return (await req.json()) as Record<string, any>;
-  } catch {
-    return {};
-  }
-}
+const GET_ROUTES = new Set([
+  '/health',
+  '/api/health',
+  '/api/memory/metrics',
+  '/api/graph/stats',
+  '/api/graph/nodes',
+]);
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
@@ -298,7 +300,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/health':
     case '/api/health':
-      return json({ ok: true, service: 'lain-memory' });
+      return json({ ok: true, service: 'lain-memory', auth: API_KEY ? 'bearer' : 'open' });
 
     default:
       return json({ error: `unknown route: ${path}` }, 404);
@@ -313,24 +315,38 @@ async function boot(): Promise<void> {
 
   Bun.serve({
     port: PORT,
+    hostname: BIND,
     async fetch(req) {
       const url = new URL(req.url);
       if (unauthorized(req)) return json({ error: 'unauthorized' }, 401);
-      if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/api/health' ||
-          url.pathname === '/api/memory/metrics' || url.pathname === '/api/graph/stats' ||
-          url.pathname === '/api/graph/nodes')) {
-        return route(url.pathname, Object.fromEntries(url.searchParams));
+      if (req.method === 'GET' && GET_ROUTES.has(url.pathname)) {
+        const validated = validateRoute(url.pathname, Object.fromEntries(url.searchParams));
+        if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
+        try {
+          return await route(url.pathname, validated.data);
+        } catch (err) {
+          console.error(`[lain-memory] route ${url.pathname} failed:`, err);
+          return json({ error: 'internal error' }, 500);
+        }
       }
       if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
+      const body = await parseBody(req);
+      if (!body.ok) return json({ error: body.error }, body.status);
+      const validated = validateRoute(url.pathname, body.data);
+      if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
       try {
-        return await route(url.pathname, await readJson(req));
+        return await route(url.pathname, validated.data);
       } catch (err) {
+        // Never leak internals (stacks, paths, backend messages) to callers.
         console.error(`[lain-memory] route ${url.pathname} failed:`, err);
-        return json({ error: err instanceof Error ? err.message : String(err) }, 500);
+        return json({ error: 'internal error' }, 500);
       }
     },
   });
-  console.log(`[lain-memory] listening on :${PORT}`);
+  if (!API_KEY) {
+    console.warn('[lain-memory] WARNING: LAIN_API_KEY is empty — HTTP API is OPEN. Set LAIN_API_KEY to require bearer auth.');
+  }
+  console.log(`[lain-memory] listening on ${BIND}:${PORT} (auth: ${API_KEY ? 'bearer' : 'open'})`);
 }
 
 boot().catch(err => {
