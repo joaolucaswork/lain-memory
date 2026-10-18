@@ -90,7 +90,7 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
       trigger: 'conflict_check:UPDATE',
       replacedById: 'new-id',
     });
-    expect(result).toEqual({ trashId: 'trash-id-1' });
+    expect(result).toEqual({ trashId: 'trash-id-1', deleted: true });
     // Trash copy went to lucas:trash with provenance metadata
     expect(addSpy).toHaveLength(1);
     const cfg = (addSpy[0] as any).config;
@@ -106,15 +106,15 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     expect(delSpy).toEqual(['aaa']);
   });
 
-  it('trashAndDelete still deletes when the snapshot is missing', async () => {
+  it('trashAndDelete preserves the original when the snapshot is missing', async () => {
     const { trashAndDelete } = mem0 as any;
     const result = await trashAndDelete({ id: 'gone', memory: '', missing: true }, 'proj', {
       reason: 'r',
       trigger: 't',
     });
-    expect(result).toEqual({ trashId: null });
+    expect(result).toEqual({ trashId: null, deleted: false });
     expect(calls.add).toHaveLength(0); // nothing to copy
-    expect(calls.delete).toEqual(['gone']);
+    expect(calls.delete).toEqual([]); // ...and nothing deleted
   });
 
   describe('deleteMemoriesWithPolicy (Fase 4 wiring)', () => {
@@ -155,7 +155,7 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     expect(calls.delete).toHaveLength(0);
   });
 
-  it('trash copy failure still deletes and reports trashId null', async () => {
+  it('trash copy failure preserves the original and reports failed', async () => {
     failAdd = true;
     const { deleteMemoriesWithPolicy } = mem0 as any;
     const report = await deleteMemoriesWithPolicy({
@@ -164,9 +164,15 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
       reason: 'r',
       trigger: 't',
     });
-    expect(report.archived).toEqual(['aaa']);
-    expect(report.trashIds).toEqual({ aaa: null });
-    expect(calls.delete).toEqual(['aaa']);
+    expect(report.archived).toEqual([]);
+    expect(report.trashIds).toEqual({});
+    expect(report.failed).toHaveLength(1);
+    expect(report.failed[0].id).toBe('aaa');
+    expect(calls.delete).toEqual([]); // original preserved for retry
+    // Audit trail is visible to the caller (no silent audit loss)
+    expect(report.audit).toHaveLength(1);
+    expect(report.audit[0]).toMatchObject({ result: 'trash-failed', trashId: null });
+    expect(report.auditFailed).toEqual([]);
   });
 
   it('hard delete failure lands in failed, no silent success', async () => {

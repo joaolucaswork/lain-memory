@@ -58,14 +58,15 @@ export interface PolicyDeps {
   snapshot(ids: string[]): Promise<PolicySnapshot[]>;
   /**
    * Trash copy with provenance + hard delete of the original (mirrors
-   * trashAndDelete: best-effort on the copy, throws only if the original
-   * could not be deleted).
+   * trashAndDelete). FAIL-CLOSED: the original is deleted ONLY when the
+   * trash copy is confirmed (trashId non-null and deleted true).
+   * Otherwise the original is preserved and the item reports failure.
    */
   trashAndDelete(
     snap: PolicySnapshot,
     fromProject: string | undefined,
     provenance: PolicyProvenance
-  ): Promise<{ trashId: string | null }>;
+  ): Promise<{ trashId: string | null; deleted: boolean }>;
   /** Audit sink. May throw — a throw is recorded, never silent. */
   audit(record: PolicyAuditRecord): void;
 }
@@ -78,7 +79,7 @@ export interface PolicyAuditRecord {
   trigger: string;
   replacedById?: string;
   trashId: string | null;
-  result: 'archived' | 'deleted-trash-failed' | 'failed';
+  result: 'archived' | 'trash-failed' | 'failed';
   error?: string;
   ts: string;
 }
@@ -103,9 +104,12 @@ export interface PolicyDeleteResult {
 
 /**
  * Archive a batch of memories: snapshot → trash copy (provenance) →
- * hard delete → audit record. Per-item failures are collected, never
- * thrown; only a snapshot-layer failure aborts (nothing was touched).
- * Audit-sink throws are recorded in `auditFailed`, never silent.
+ * hard delete → audit record. FAIL-CLOSED: an item lands in `archived`
+ * only when the trash copy is confirmed. A missing/unconfirmed trash copy
+ * (or a throw) lands in `failed` and the original is preserved for retry
+ * — never silently deleted. Only a snapshot-layer failure aborts the whole
+ * batch (nothing was touched). Audit-sink throws are recorded in
+ * `auditFailed`, never silent.
  */
 export async function applyDeletionPolicy(
   input: PolicyDeleteInput,
@@ -137,15 +141,22 @@ export async function applyDeletionPolicy(
       ts: new Date().toISOString(),
     };
     try {
-      const { trashId } = await deps.trashAndDelete(
+      const { trashId, deleted } = await deps.trashAndDelete(
         snap,
         input.project,
         { reason: input.reason, trigger: input.trigger, ...(input.replacedById ? { replacedById: input.replacedById } : {}) }
       );
-      record.trashId = trashId;
-      record.result = trashId ? 'archived' : 'deleted-trash-failed';
-      result.trashIds[snap.id] = trashId;
-      result.archived.push(snap.id);
+      if (trashId && deleted) {
+        record.trashId = trashId;
+        record.result = 'archived';
+        result.trashIds[snap.id] = trashId;
+        result.archived.push(snap.id);
+      } else {
+        // Fail-closed: trash copy unconfirmed → original preserved, retry later.
+        record.result = 'trash-failed';
+        record.error = 'trash copy unconfirmed — original preserved, will retry';
+        result.failed.push({ id: snap.id, error: record.error });
+      }
     } catch (err) {
       record.result = 'failed';
       record.error = err instanceof Error ? err.message : String(err);

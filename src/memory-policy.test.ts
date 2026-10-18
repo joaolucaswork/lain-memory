@@ -18,7 +18,7 @@ function fakes(overrides: Partial<PolicyDeps> = {}): PolicyDeps & {
     snapshot: async (ids) => ids.map(id => ({ id, memory: `text of ${id}` })),
     trashAndDelete: async (snap, _from, prov) => {
       state.trashed.push({ snap, prov });
-      return { trashId: `trash-${snap.id}` };
+      return { trashId: `trash-${snap.id}`, deleted: true };
     },
     audit: (record) => { state.audited.push(record); },
     ...overrides,
@@ -49,26 +49,34 @@ describe('applyDeletionPolicy', () => {
     expect(deps.trashed[0].prov).toMatchObject({ reason: 'test', trigger: 'test-run' });
   });
 
-  test('cópia trash falha (null) mas delete prossegue — registrado, não silencioso', async () => {
+  test('cópia trash não confirmada → failed, original preservado (fail-closed)', async () => {
     const deps = fakes({
-      trashAndDelete: async () => ({ trashId: null }),
+      trashAndDelete: async () => ({ trashId: null, deleted: false }),
     });
     const report = await applyDeletionPolicy({ ids: ['a'], project: 'p', reason: 'r', trigger: 't' }, deps);
-    expect(report.archived).toEqual(['a']);
-    expect(report.trashIds).toEqual({ a: null });
-    expect(report.audit[0]).toMatchObject({ result: 'deleted-trash-failed', trashId: null });
-    expect(report.failed).toEqual([]);
+    expect(report.archived).toEqual([]);
+    expect(report.trashIds).toEqual({});
+    expect(report.failed).toEqual([{ id: 'a', error: 'trash copy unconfirmed — original preserved, will retry' }]);
+    expect(report.audit[0]).toMatchObject({ result: 'trash-failed', trashId: null });
   });
 
-  test('snapshot missing → deleta sem cópia, trashId null', async () => {
+  test('deleted:false mesmo com trashId → failed (defensivo)', async () => {
+    const deps = fakes({
+      trashAndDelete: async () => ({ trashId: 'trash-x', deleted: false }),
+    });
+    const report = await applyDeletionPolicy({ ids: ['a'], project: 'p', reason: 'r', trigger: 't' }, deps);
+    expect(report.archived).toEqual([]);
+    expect(report.failed).toHaveLength(1);
+  });
+
+  test('snapshot missing → failed sem tocar no original', async () => {
     const deps = fakes({
       snapshot: async (ids) => ids.map(id => ({ id, memory: '', missing: true as const })),
-      trashAndDelete: async () => ({ trashId: null }),
+      trashAndDelete: async () => ({ trashId: null, deleted: false }),
     });
     const report = await applyDeletionPolicy({ ids: ['gone'], project: 'p', reason: 'r', trigger: 't' }, deps);
-    expect(report.archived).toEqual(['gone']);
-    expect(report.trashIds).toEqual({ gone: null });
-    expect(report.failed).toEqual([]);
+    expect(report.archived).toEqual([]);
+    expect(report.failed).toHaveLength(1);
   });
 
   test('falha no hard delete → failed, sem sucesso silencioso', async () => {

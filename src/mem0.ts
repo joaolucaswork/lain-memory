@@ -18,6 +18,7 @@ import { withDistributedLock } from './distributed-lock.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
 import { incrementMetric } from './mem-metrics.js';
 import { BOILERPLATE_PATTERNS } from './memory-patterns.js';
+import type { PolicyAuditRecord } from './memory-policy.js';
 
 /** Budget limits for spawn-context composition (see getContextForSpawn). */
 export interface MemoryLimits {
@@ -887,13 +888,18 @@ export async function addMemoryWithConflictCheck(
     const trashIds: Record<string, string | null> = {};
     for (const snap of doomed) {
       try {
-        const { trashId } = await trashAndDelete(snap, project, {
+        const { trashId, deleted } = await trashAndDelete(snap, project, {
           reason: classification.reason,
           trigger: `conflict_check:${classification.action}`,
           replacedById: newId,
         });
         trashIds[snap.id] = trashId;
-        console.log(`[mem0] Superseded memory ${snap.id} (trash: ${trashId ?? 'copy-failed'})`);
+        if (deleted) {
+          console.log(`[mem0] Superseded memory ${snap.id} (trash: ${trashId})`);
+        } else {
+          // Fail-closed: trash copy unconfirmed → original preserved, retry later.
+          console.error(`[mem0] Supersede deferred for ${snap.id}: trash copy unconfirmed, original preserved`);
+        }
       } catch (err) {
         console.error(`[mem0] Failed to supersede ${snap.id}:`, err);
       }
@@ -1194,12 +1200,16 @@ export async function deleteMemoriesWithPolicy(input: {
   archived: string[];
   trashIds: Record<string, string | null>;
   failed: { id: string; error: string }[];
+  audit: PolicyAuditRecord[];
+  auditFailed: { memoryId: string; error: string }[];
 }> {
   if (input.project === TRASH_PROJECT) {
     return {
       archived: [],
       trashIds: {},
       failed: input.ids.map(id => ({ id, error: 'refusing to archive the trash scope itself' })),
+      audit: [],
+      auditFailed: [],
     };
   }
   const { applyDeletionPolicy } = await import('./memory-policy.js');
@@ -1215,7 +1225,7 @@ export async function deleteMemoriesWithPolicy(input: {
   try {
     await invalidateMem0Cache(input.project);
   } catch { /* non-critical */ }
-  return { archived: report.archived, trashIds: report.trashIds, failed: report.failed };
+  return { archived: report.archived, trashIds: report.trashIds, failed: report.failed, audit: report.audit, auditFailed: report.auditFailed };
 }
 
 /**
@@ -1372,16 +1382,18 @@ export interface TrashProvenance {
 /**
  * Copy a memory to the trash scope (with provenance metadata), then hard-delete
  * the original. Trash copies skip quality/conflict checks and graph ingestion.
- * Best-effort on the trash copy: if it fails, the original is still deleted
- * (and the failure is logged) so maintenance never blocks.
+ * FAIL-CLOSED: the original is deleted ONLY after the trash copy is confirmed.
+ * If the copy fails (or the snapshot is missing/empty), the original is
+ * preserved and the caller gets `{ trashId: null, deleted: false }` so the
+ * item can be retried — an "archive" never becomes silent data loss.
  */
 export async function trashAndDelete(
   snapshot: MemorySnapshot,
   fromProject: string | undefined,
   provenance: TrashProvenance,
-): Promise<{ trashId: string | null }> {
-  let trashId: string | null = null;
+): Promise<{ trashId: string | null; deleted: boolean }> {
   if (!snapshot.missing && snapshot.memory) {
+    let trashId: string | null = null;
     try {
       const saved = await addMemory(snapshot.memory, TRASH_PROJECT, {
         skipQualityCheck: true,
@@ -1399,11 +1411,18 @@ export async function trashAndDelete(
       });
       trashId = saved[0]?.id ?? null;
     } catch (err) {
-      console.error(`[mem0] trash copy failed for ${snapshot.id}:`, err instanceof Error ? err.message : err);
+      console.error(`[mem0] trash copy failed for ${snapshot.id} — original preserved:`, err instanceof Error ? err.message : err);
+      return { trashId: null, deleted: false };
     }
+    if (!trashId) {
+      console.error(`[mem0] trash copy unconfirmed for ${snapshot.id} — original preserved`);
+      return { trashId: null, deleted: false };
+    }
+    await deleteMemory(snapshot.id);
+    return { trashId, deleted: true };
   }
-  await deleteMemory(snapshot.id);
-  return { trashId };
+  console.error(`[mem0] refusing to delete ${snapshot.id} without a trash copy (missing/empty snapshot) — preserved`);
+  return { trashId: null, deleted: false };
 }
 
 // C3: Update an existing memory by ID. Uses Mem0 SDK native update.
@@ -1538,16 +1557,20 @@ Memórias:
         consolidated++;
 
         const trashIds: Record<string, string | null> = {};
-        // Delete fragments (via trash)
+        // Delete fragments (via trash — fail-closed: unconfirmed copies are preserved, not counted)
         for (const snap of doomed) {
           try {
-            const { trashId } = await trashAndDelete(snap, project, {
+            const { trashId, deleted: fragDeleted } = await trashAndDelete(snap, project, {
               reason: 'merged into consolidated memory',
               trigger: 'consolidation',
               replacedById: newId,
             });
             trashIds[snap.id] = trashId;
-            deleted++;
+            if (fragDeleted) {
+              deleted++;
+            } else {
+              console.error(`[mem0] Consolidation deferred fragment ${snap.id}: trash copy unconfirmed, original preserved`);
+            }
           } catch {}
         }
 
