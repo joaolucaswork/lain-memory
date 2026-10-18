@@ -79,7 +79,7 @@ export async function invalidateGraphCache(): Promise<void> {
 
 // ─── Types ───
 
-export type EntityType = 'Person' | 'Project' | 'Technology' | 'Company' | 'Concept' | 'Location' | 'Decision' | 'Other';
+export type EntityType = 'Person' | 'Project' | 'Technology' | 'Company' | 'Concept' | 'Location' | 'Decision' | 'Medication' | 'HealthCondition' | 'Food' | 'Other';
 
 export interface EntityAttrs {
   type: EntityType;
@@ -300,10 +300,10 @@ export function getStats(project?: string): { nodes: number; edges: number; type
 
 // ─── Entity Extraction ───
 
-const EXTRACTION_PROMPT = `Extract entities and relationships from this text about a user's work context.
+const EXTRACTION_PROMPT = `Extract entities and relationships from this text about a user's work, health and daily life context.
 Return ONLY valid JSON matching this schema:
 {
-  "entities": [{"name": "string", "type": "Person|Project|Technology|Company|Concept|Location|Other", "description": "string"}],
+  "entities": [{"name": "string", "type": "Person|Project|Technology|Company|Concept|Location|Medication|HealthCondition|Food|Other", "description": "string"}],
   "relationships": [{"subject": "string", "predicate": "string", "object": "string"}]
 }
 
@@ -313,6 +313,10 @@ RULES — INCLUDE:
 - Tools, frameworks, libraries (e.g. "React", "Prisma", "Redis")
 - High-level concepts (e.g. "Open Finance", "PIX", "GraphRAG")
 - Locations, organizations
+- Medications (e.g. "Risperidona", "Valproic Acid", "Alprazolam", "Biperideno") — use generic/canonical name when clear
+- Health conditions, symptoms and diagnoses (e.g. "ADHD", "autism", "lack of motivation", "chewing difficulty")
+- Treatments and care (e.g. "CAPS", "therapy", "occupational therapy")
+- Foods tied to health or preference (e.g. "sweet potato", "mashed dishes", "soft cheese")
 
 RULES — SKIP (do NOT extract these):
 - Function names: getElapsed(), hasActiveWork(), handleVaultRequest()
@@ -328,9 +332,10 @@ RULES — SKIP (do NOT extract these):
 - System UI elements (menu bars, notifications, window titles)
 
 Entity names must be human-readable. If unsure, skip it.
-Description must be non-empty and explain WHY this entity matters to the user's work.
+Description must be non-empty and explain WHY this entity matters to the user's work, health or wellbeing.
+Normalize medication names to a canonical form (e.g. "Risperidona", not "respiridone" typo) and prefer a single node per medication/condition/food.
 
-Predicate vocabulary: WORKS_ON, USES, OWNS, MANAGES, DEPENDS_ON, RELATED_TO, LOCATED_IN, PART_OF, CREATED, PREFERS, DECIDED_FOR, DECIDED_AGAINST
+Predicate vocabulary: WORKS_ON, USES, OWNS, MANAGES, DEPENDS_ON, RELATED_TO, LOCATED_IN, PART_OF, CREATED, PREFERS, DECIDED_FOR, DECIDED_AGAINST, TAKES, TREATS, CAUSES, AFFECTS, MANAGES_SYMPTOM
 
 Text: `;
 
@@ -547,6 +552,18 @@ export async function query(
       matchingNodes.push(nodeId);
     }
   });
+
+  // Fallback: fuzzy match for typos/spelling variants (e.g. respiridona vs risperidone).
+  // entitySimilarity is bigram Dice; >=0.65 catches single-letter variants without noise.
+  if (matchingNodes.length === 0 && queryWords.length === 1) {
+    const q = queryWords[0];
+    graph.forEachNode((nodeId) => {
+      if (!isNodeVisibleToProject(nodeId, project)) return;
+      if (entitySimilarity(q, nodeId) >= 0.65 || nodeId.split(' ').some(tok => entitySimilarity(q, tok) >= 0.65)) {
+        matchingNodes.push(nodeId);
+      }
+    });
+  }
 
   if (matchingNodes.length === 0) {
     return { entities: [], relationships: [], markdown: '' };
@@ -773,7 +790,7 @@ const DECISION_EXTRACTION_PROMPT = `Extract the decision from this text. Return 
   "chosen": "the chosen option",
   "reasoning": "why this was chosen",
   "confidence": 0.8,
-  "relatedEntities": [{"name": "entity", "type": "Person|Project|Technology|Company|Concept|Location|Other"}]
+  "relatedEntities": [{"name": "entity", "type": "Person|Project|Technology|Company|Concept|Location|Medication|HealthCondition|Food|Other"}]
 }
 
 If you cannot extract a clear decision, return {"skip": true}.
@@ -881,14 +898,26 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
           if (dAttrs.description && (!cAttrs.description || dAttrs.description.length > cAttrs.description.length)) {
             cAttrs.description = dAttrs.description;
           }
+          const mergedSources = mergeSources(cAttrs.sources, dAttrs.sources);
+          if (mergedSources) cAttrs.sources = mergedSources;
           graph.replaceNodeAttributes(canonical.key, cAttrs);
 
-          // Transfer edges from duplicate to canonical
+          // Transfer edges from duplicate to canonical (merging sources on collision)
           graph.forEachEdge(duplicate.key, (edge, attrs, source, target) => {
             const newSource = source === duplicate.key ? canonical.key : source;
             const newTarget = target === duplicate.key ? canonical.key : target;
             const edgeKey = relationshipKey(newSource, newTarget, (attrs as RelationshipAttrs).predicate);
-            if (!graph.hasEdge(edgeKey) && newSource !== newTarget) {
+            if (newSource === newTarget) return;
+            if (graph.hasEdge(edgeKey)) {
+              try {
+                const prev = graph.getEdgeAttributes(edgeKey) as RelationshipAttrs;
+                const m = mergeSources(prev.sources, (attrs as RelationshipAttrs).sources);
+                if (m) {
+                  prev.sources = m;
+                  graph.replaceEdgeAttributes(edgeKey, prev);
+                }
+              } catch { /* ignore */ }
+            } else {
               try {
                 graph.addEdgeWithKey(edgeKey, newSource, newTarget, attrs);
               } catch { /* edge already exists */ }

@@ -116,4 +116,19 @@ describe('sweepGraph', () => {
     const result = sweepGraph(graph);
     expect(graph.hasNode('fresh-thing')).toBe(true);
   });
+
+  test('preserves health orphan nodes (Medication/HealthCondition/Food)', () => {
+    const graph = new Graph({ type: 'directed', multi: false });
+    graph.addNode('risperidone', { type: 'Medication', mentions: 1, firstSeen: Date.now(), lastSeen: Date.now() });
+    graph.addNode('adhd', { type: 'HealthCondition', mentions: 1, firstSeen: Date.now(), lastSeen: Date.now() });
+    graph.addNode('sweet potato', { type: 'Food', mentions: 1, firstSeen: Date.now(), lastSeen: Date.now() });
+    graph.addNode('random-orphan', { type: 'Other', mentions: 1, firstSeen: Date.now(), lastSeen: Date.now() });
+
+    const result = sweepGraph(graph);
+    expect(graph.hasNode('risperidone')).toBe(true);
+    expect(graph.hasNode('adhd')).toBe(true);
+    expect(graph.hasNode('sweet potato')).toBe(true);
+    expect(graph.hasNode('random-orphan')).toBe(false);
+    expect(result.orphansRemoved).toBe(1);
+  });
 });

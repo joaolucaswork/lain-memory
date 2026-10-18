@@ -220,11 +220,11 @@ Return ONLY valid JSON:
   "title": "Document title or topic",
   "summary": "2-3 sentence summary",
   "facts": ["key fact 1", "key fact 2"],
-  "entities": [{"name": "string", "type": "Person|Project|Technology|Company|Concept|Location|Other", "description": "string"}],
+  "entities": [{"name": "string", "type": "Person|Project|Technology|Company|Concept|Location|Medication|HealthCondition|Food|Other", "description": "string"}],
   "relationships": [{"subject": "string", "predicate": "string", "object": "string"}]
 }
 
-Predicate vocabulary: WORKS_ON, USES, OWNS, MANAGES, DEPENDS_ON, RELATED_TO, LOCATED_IN, PART_OF, CREATED, PREFERS, DESCRIBES, MENTIONS
+Predicate vocabulary: WORKS_ON, USES, OWNS, MANAGES, DEPENDS_ON, RELATED_TO, LOCATED_IN, PART_OF, CREATED, PREFERS, DESCRIBES, MENTIONS, TAKES, TREATS, CAUSES, AFFECTS, MANAGES_SYMPTOM
 ${langInstruction}
 Text:
 `;

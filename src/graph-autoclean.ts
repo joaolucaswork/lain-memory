@@ -95,6 +95,8 @@ export interface SweepResult {
 }
 
 const STALE_THRESHOLD_DAYS = 14;
+const HEALTH_TYPES = new Set(['Medication', 'HealthCondition', 'Food']);
+const HEALTH_STALE_THRESHOLD_DAYS = 90;
 
 export function sweepGraph(graph: Graph): SweepResult {
   const result: SweepResult = { orphansRemoved: 0, patternRemoved: 0, staleRemoved: 0, total: 0 };
@@ -103,6 +105,7 @@ export function sweepGraph(graph: Graph): SweepResult {
 
   graph.forEachNode((nodeId, attrs) => {
     const a = attrs as { type: string; mentions: number; lastSeen: number };
+    const isHealth = HEALTH_TYPES.has(a.type || 'Other');
 
     // 1. Remove pattern-matched garbage (even if connected)
     if (shouldRejectEntity(nodeId, a.type || 'Other')) {
@@ -111,16 +114,18 @@ export function sweepGraph(graph: Graph): SweepResult {
       return;
     }
 
-    // 2. Remove orphans (no edges)
-    if (graph.degree(nodeId) === 0) {
+    // 2. Remove orphans (no edges) — health entities are preserved as orphans
+    // so single-mention medications/conditions/foods survive until relationships form.
+    if (graph.degree(nodeId) === 0 && !isHealth) {
       toRemove.add(nodeId);
       result.orphansRemoved++;
       return;
     }
 
-    // 3. Remove stale low-mention nodes
+    // 3. Remove stale low-mention nodes (health types get a longer window)
     const daysSinceLastSeen = (now - (a.lastSeen || 0)) / 86400000;
-    if (daysSinceLastSeen > STALE_THRESHOLD_DAYS && (a.mentions || 0) <= 2) {
+    const staleThreshold = isHealth ? HEALTH_STALE_THRESHOLD_DAYS : STALE_THRESHOLD_DAYS;
+    if (daysSinceLastSeen > staleThreshold && (a.mentions || 0) <= 2) {
       toRemove.add(nodeId);
       result.staleRemoved++;
       return;
