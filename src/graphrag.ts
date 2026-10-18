@@ -9,14 +9,15 @@
 import Graph from 'graphology';
 import { bfsFromNode } from 'graphology-traversal';
 import path from 'path';
-import { existsSync, mkdirSync } from 'fs';
-import { createHash } from 'crypto';
+import { existsSync, mkdirSync, appendFileSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
+import { createHash, randomUUID } from 'crypto';
 import { runFastLlmJson } from './llm-client.js';
 import { KNOWLEDGE_DIR, INSTANCE_ID } from './workspace.js';
 import { getConfig } from './config.js';
 import { getRedis, isRedisAvailable } from './redis.js';
 import { shouldRejectEntity, shouldRejectRelationship, sweepGraph, type SweepResult } from './graph-autoclean.js';
 import { withDistributedLock } from './distributed-lock.js';
+import { incrementMetric } from './mem-metrics.js';
 
 const GRAPH_FILENAME = INSTANCE_ID ? `graph-${INSTANCE_ID}.json` : 'graph.json';
 const GRAPH_PATH = path.join(KNOWLEDGE_DIR, GRAPH_FILENAME);
@@ -86,6 +87,12 @@ export interface EntityAttrs {
   firstSeen: number;
   lastSeen: number;
   mentions: number;
+  /**
+   * Fase 3 — proveniência: Mem0 IDs whose ingestion created/touched this
+   * entity. Undefined = legacy/pre-provenance data (never pruned for lack
+   * of sources). Defined = derived projection, safe to prune when empty.
+   */
+  sources?: string[];
 }
 
 export interface DecisionAttrs extends EntityAttrs {
@@ -113,6 +120,8 @@ export interface RelationshipAttrs {
   weight: number;
   firstSeen: number;
   lastSeen: number;
+  /** Fase 3 — proveniência: see EntityAttrs.sources. */
+  sources?: string[];
 }
 
 interface GraphFile {
@@ -347,7 +356,7 @@ async function extractEntities(text: string): Promise<ExtractionResult> {
 
 // ─── Graph Mutations ───
 
-function upsertEntity(name: string, type: EntityType, description?: string, project?: string): string {
+function upsertEntity(name: string, type: EntityType, description?: string, project?: string, sourceIds?: string[]): string {
   const id = scopedId(name, project);
   const now = Date.now();
 
@@ -358,6 +367,8 @@ function upsertEntity(name: string, type: EntityType, description?: string, proj
     if (description && (!attrs.description || description.length > attrs.description.length)) {
       attrs.description = description;
     }
+    const merged = mergeSources(attrs.sources, sourceIds);
+    if (merged) attrs.sources = merged;
     graph.replaceNodeAttributes(id, attrs);
   } else {
     graph.addNode(id, {
@@ -366,12 +377,18 @@ function upsertEntity(name: string, type: EntityType, description?: string, proj
       firstSeen: now,
       lastSeen: now,
       mentions: 1,
+      ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
     } as EntityAttrs);
   }
 
   return id;
 }
 
+function mergeSources(existing: string[] | undefined, incoming: string[] | undefined): string[] | undefined {
+  if (!existing && !incoming) return undefined;
+  const set = new Set([...(existing ?? []), ...(incoming ?? [])]);
+  return [...set];
+}
 /**
  * Identity of a relationship: source + predicate + target.
  * Same nodes with different predicates are distinct relationships
@@ -382,7 +399,7 @@ export function relationshipKey(sourceId: string, targetId: string, predicate: s
   return `${sourceId}-${predicate}-${targetId}`;
 }
 
-function upsertRelationship(sourceId: string, targetId: string, predicate: string): void {
+function upsertRelationship(sourceId: string, targetId: string, predicate: string, sourceIds?: string[]): void {
   const now = Date.now();
   const edgeKey = relationshipKey(sourceId, targetId, predicate);
 
@@ -390,6 +407,8 @@ function upsertRelationship(sourceId: string, targetId: string, predicate: strin
     const attrs = graph.getEdgeAttributes(edgeKey) as RelationshipAttrs;
     attrs.weight += 1;
     attrs.lastSeen = now;
+    const merged = mergeSources(attrs.sources, sourceIds);
+    if (merged) attrs.sources = merged;
     graph.replaceEdgeAttributes(edgeKey, attrs);
   } else {
     if (!graph.hasNode(sourceId) || !graph.hasNode(targetId)) return;
@@ -398,30 +417,37 @@ function upsertRelationship(sourceId: string, targetId: string, predicate: strin
       weight: 1,
       firstSeen: now,
       lastSeen: now,
+      ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
     } as RelationshipAttrs);
   }
 }
 
 // ─── Public API ───
 
-export async function ingest(text: string, project?: string): Promise<{ entities: number; relationships: number }> {
+export interface GraphIngestOpts {
+  /** Mem0 IDs that originated this content (Fase 3 proveniência). */
+  sourceIds?: string[];
+}
+
+export async function ingest(text: string, project?: string, opts?: GraphIngestOpts): Promise<{ entities: number; relationships: number }> {
   if (!ENABLED || !graph) return { entities: 0, relationships: 0 };
 
   try {
     const result = await extractEntities(text);
+    const sourceIds = opts?.sourceIds;
 
     for (const entity of result.entities) {
       if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-      upsertEntity(entity.name, entity.type, entity.description, project);
+      upsertEntity(entity.name, entity.type, entity.description, project, sourceIds);
     }
 
     for (const rel of result.relationships) {
       if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
       const sourceId = scopedId(rel.subject, project);
       const targetId = scopedId(rel.object, project);
-      if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project);
-      if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project);
-      upsertRelationship(sourceId, targetId, rel.predicate);
+      if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
+      if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+      upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
     }
 
     debouncedSave();
@@ -432,7 +458,7 @@ export async function ingest(text: string, project?: string): Promise<{ entities
     if (containsDecisionLanguage(text)) {
       extractDecision(text).then(decision => {
         if (decision) {
-          addDecision(decision, project).catch(err =>
+          addDecision(decision, project, sourceIds).catch(err =>
             console.error('[graphrag] Auto-decision extraction error:', err)
           );
         }
@@ -451,22 +477,24 @@ export async function ingest(text: string, project?: string): Promise<{ entities
 export async function ingestExtracted(
   entities: Array<{ name: string; type: string; description: string }>,
   relationships: Array<{ subject: string; predicate: string; object: string }>,
-  project?: string
+  project?: string,
+  opts?: GraphIngestOpts
 ): Promise<void> {
   if (!ENABLED || !graph) return;
+  const sourceIds = opts?.sourceIds;
 
   for (const entity of entities) {
     if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-    upsertEntity(entity.name, entity.type as EntityType, entity.description, project);
+    upsertEntity(entity.name, entity.type as EntityType, entity.description, project, sourceIds);
   }
 
   for (const rel of relationships) {
     if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
     const sourceId = scopedId(rel.subject, project);
     const targetId = scopedId(rel.object, project);
-    if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project);
-    if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project);
-    upsertRelationship(sourceId, targetId, rel.predicate);
+    if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
+    if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+    upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
   }
 
   debouncedSave();
@@ -609,7 +637,7 @@ function toMarkdown(ctx: GraphContext): string {
 
 // ─── Decision Framework ───
 
-export async function addDecision(decision: DecisionInput, project?: string): Promise<string> {
+export async function addDecision(decision: DecisionInput, project?: string, sourceIds?: string[]): Promise<string> {
   if (!ENABLED || !graph) return '';
 
   const id = scopedId(decision.name, project);
@@ -626,31 +654,35 @@ export async function addDecision(decision: DecisionInput, project?: string): Pr
     firstSeen: now,
     lastSeen: now,
     mentions: 1,
+    ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
   };
 
   if (graph.hasNode(id)) {
+    const prev = graph.getNodeAttributes(id) as EntityAttrs;
+    const merged = mergeSources(prev.sources, sourceIds);
+    if (merged) attrs.sources = merged;
     graph.replaceNodeAttributes(id, attrs);
   } else {
     graph.addNode(id, attrs);
   }
 
   // Create DECIDED_FOR edge to the chosen option
-  const chosenId = upsertEntity(decision.chosen, 'Concept', undefined, project);
-  upsertRelationship(id, chosenId, 'DECIDED_FOR');
+  const chosenId = upsertEntity(decision.chosen, 'Concept', undefined, project, sourceIds);
+  upsertRelationship(id, chosenId, 'DECIDED_FOR', sourceIds);
 
   // Create DECIDED_AGAINST edges to rejected options
   for (const option of decision.options) {
     if (option !== decision.chosen) {
-      const optionId = upsertEntity(option, 'Concept', undefined, project);
-      upsertRelationship(id, optionId, 'DECIDED_AGAINST');
+      const optionId = upsertEntity(option, 'Concept', undefined, project, sourceIds);
+      upsertRelationship(id, optionId, 'DECIDED_AGAINST', sourceIds);
     }
   }
 
   // Link to related entities
   if (decision.relatedEntities) {
     for (const related of decision.relatedEntities) {
-      const relatedId = upsertEntity(related.name, related.type, undefined, project);
-      upsertRelationship(id, relatedId, 'RELATED_TO');
+      const relatedId = upsertEntity(related.name, related.type, undefined, project, sourceIds);
+      upsertRelationship(id, relatedId, 'RELATED_TO', sourceIds);
     }
   }
 
@@ -813,7 +845,7 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
     const scope = nodeProject(node.key) ?? '';
     if (onlyScope && scope !== onlyScope) continue;
     const type = node.attrs.type || 'Other';
-    const groupKey = `${scope} ${type}`;
+    const groupKey = `${scope}\0${type}`;
     const group = byType.get(groupKey) || [];
     group.push(node);
     byType.set(groupKey, group);
@@ -926,6 +958,314 @@ export async function runAutoclean(): Promise<SweepResult> {
     }, duration);
   } catch { /* non-critical */ }
   return result;
+}
+
+// ─── Sync: outbox + reconciliation (Fase 3) ───
+//
+// Architectural decision: Mem0/Qdrant is the SOURCE OF TRUTH for content.
+// The graph is a DERIVED projection (rich structural cache). Any divergence
+// is recoverable by re-ingestion from Mem0; the graph never overrides vector
+// content. Provenance (`sources`) links each node/edge to the Mem0 IDs that
+// produced it; legacy entries (sources undefined) are never pruned.
+//
+// Write path: `queueGraphIngest()` appends a durable intent to the outbox
+// (fast local append, no LLM wait) and triggers a background drain. A crash
+// between Mem0 save and outbox append (~ms window) is the only uncovered
+// case; crash mid-drain is recovered via `.processing` files on next drain.
+
+export interface GraphOutboxEntry {
+  id: string;
+  ts: number;
+  attempts: number;
+  project?: string;
+  sourceIds?: string[];
+  text?: string;
+  entities?: Array<{ name: string; type: string; description: string }>;
+  relationships?: Array<{ subject: string; predicate: string; object: string }>;
+}
+
+const OUTBOX_MAX_ATTEMPTS = 5;
+
+function outboxDir(): string {
+  return process.env.LAIN_GRAPH_OUTBOX_DIR ?? KNOWLEDGE_DIR;
+}
+
+function outboxPath(): string {
+  return path.join(outboxDir(), 'graph-outbox.jsonl');
+}
+
+function readOutboxFile(file: string): GraphOutboxEntry[] {
+  try {
+    const raw = readFileSync(file, 'utf8');
+    const entries: GraphOutboxEntry[] = [];
+    for (const line of raw.split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        entries.push(JSON.parse(t) as GraphOutboxEntry);
+      } catch { /* skip corrupt line, keep draining the rest */ }
+    }
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+export function appendGraphOutbox(entry: Omit<GraphOutboxEntry, 'id' | 'ts' | 'attempts'> & { attempts?: number }): GraphOutboxEntry {
+  if (!existsSync(outboxDir())) mkdirSync(outboxDir(), { recursive: true });
+  const full: GraphOutboxEntry = {
+    id: randomUUID(),
+    ts: Date.now(),
+    attempts: entry.attempts ?? 0,
+    ...(entry.project ? { project: entry.project } : {}),
+    ...(entry.sourceIds ? { sourceIds: entry.sourceIds } : {}),
+    ...(entry.text ? { text: entry.text } : {}),
+    ...(entry.entities ? { entities: entry.entities } : {}),
+    ...(entry.relationships ? { relationships: entry.relationships } : {}),
+  };
+  appendFileSync(outboxPath(), JSON.stringify(full) + '\n', 'utf8');
+  return full;
+}
+
+let drainInFlight: Promise<void> | null = null;
+let lastSyncError: string | null = null;
+let lastReconciledAt: string | null = null;
+
+async function applyOutboxEntry(
+  entry: GraphOutboxEntry,
+  exec?: (entry: GraphOutboxEntry) => Promise<void>
+): Promise<void> {
+  if (exec) {
+    await exec(entry);
+    return;
+  }
+  if (entry.text !== undefined) {
+    await ingest(entry.text, entry.project, { sourceIds: entry.sourceIds });
+    return;
+  }
+  await ingestExtracted(entry.entities ?? [], entry.relationships ?? [], entry.project, { sourceIds: entry.sourceIds });
+}
+
+/**
+ * Drain the outbox: claim pending + orphaned processing files (atomic rename
+ * = cross-process mutex), apply entries, re-queue failures with attempts+1,
+ * dead-letter after OUTBOX_MAX_ATTEMPTS. Accepts an injected executor for
+ * tests (defaults to the real ingest paths).
+ */
+export async function drainGraphOutbox(
+  exec?: (entry: GraphOutboxEntry) => Promise<void>
+): Promise<{ processed: number; failed: number; deadLettered: number; pending: number }> {
+  if (!graph && !exec) return { processed: 0, failed: 0, deadLettered: 0, pending: 0 };
+  const dir = outboxDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  // Claim: rename pending file + any orphaned processing files (crash recovery).
+  const claimed: string[] = [];
+  const claim = (file: string) => {
+    const dest = path.join(dir, `.graph-outbox.claimed-${process.pid}-${Date.now()}-${claimed.length}`);
+    try {
+      renameSync(file, dest);
+      claimed.push(dest);
+    } catch { /* lost the race or already gone — fine */ }
+  };
+  claim(outboxPath());
+  let processing: string[] = [];
+  try {
+    processing = readdirSync(dir).filter(f => f.startsWith('.graph-outbox.processing-') || f.startsWith('.graph-outbox.claimed-'));
+  } catch { processing = []; }
+  for (const f of processing) claim(path.join(dir, f));
+
+  let entries: GraphOutboxEntry[] = [];
+  for (const f of claimed) {
+    entries.push(...readOutboxFile(f));
+    try { unlinkSync(f); } catch { /* already gone */ }
+  }
+  if (entries.length === 0) return { processed: 0, failed: 0, deadLettered: 0, pending: 0 };
+
+  let processed = 0;
+  let failed = 0;
+  let deadLettered = 0;
+  const survivors: GraphOutboxEntry[] = [];
+  for (const entry of entries) {
+    try {
+      await applyOutboxEntry(entry, exec);
+      processed++;
+      incrementMetric('graphOutboxProcessed');
+    } catch (err) {
+      failed++;
+      const attempts = (entry.attempts ?? 0) + 1;
+      lastSyncError = err instanceof Error ? err.message : String(err);
+      console.error(`[graphrag] Outbox entry ${entry.id} failed (attempt ${attempts}):`, lastSyncError);
+      if (attempts >= OUTBOX_MAX_ATTEMPTS) {
+        deadLettered++;
+        incrementMetric('graphIngestErrors');
+        try {
+          const { logMaintenance } = await import('./maintenance-log.js');
+          logMaintenance('graph_outbox_dead_letter', { entryId: entry.id, attempts, project: entry.project ?? null, error: lastSyncError });
+        } catch { /* non-critical */ }
+      } else {
+        survivors.push({ ...entry, attempts });
+      }
+    }
+  }
+  for (const entry of survivors) {
+    try {
+      appendFileSync(outboxPath(), JSON.stringify(entry) + '\n', 'utf8');
+    } catch (err) {
+      console.error('[graphrag] Failed to re-queue outbox entry:', err instanceof Error ? err.message : err);
+    }
+  }
+  return { processed, failed, deadLettered, pending: survivors.length };
+}
+
+function triggerOutboxDrain(): void {
+  if (drainInFlight) return;
+  drainInFlight = withDistributedLock('graphrag:outbox-drain', 120_000, async () => {
+    await drainGraphOutbox();
+  }).catch(err => {
+    lastSyncError = err instanceof Error ? err.message : String(err);
+    console.error('[graphrag] Outbox drain error:', lastSyncError);
+  }).finally(() => {
+    drainInFlight = null;
+  });
+}
+
+/**
+ * Durable graph ingestion for the Mem0 write path (Fase 3).
+ * Appends intent to the outbox (fast, no LLM wait) and triggers a
+ * background drain. Never throws — write-path latency is unchanged and a
+ * graph failure never fails the memory save (Mem0 is source of truth).
+ */
+export function queueGraphIngest(text: string, project?: string, sourceIds?: string[]): void {
+  if (!ENABLED || !graph) return;
+  try {
+    appendGraphOutbox({ text, project, sourceIds });
+  } catch (err) {
+    lastSyncError = err instanceof Error ? err.message : String(err);
+    incrementMetric('graphIngestErrors');
+    console.error('[graphrag] Outbox append failed:', lastSyncError);
+    return;
+  }
+  triggerOutboxDrain();
+}
+
+/** Durable variant for pre-extracted payloads (seeds, HTTP ingest). */
+export function queueGraphIngestExtracted(
+  entities: Array<{ name: string; type: string; description: string }>,
+  relationships: Array<{ subject: string; predicate: string; object: string }>,
+  project?: string,
+  sourceIds?: string[]
+): void {
+  if (!ENABLED || !graph) return;
+  try {
+    appendGraphOutbox({ entities, relationships, project, sourceIds });
+  } catch (err) {
+    lastSyncError = err instanceof Error ? err.message : String(err);
+    incrementMetric('graphIngestErrors');
+    console.error('[graphrag] Outbox append failed:', lastSyncError);
+    return;
+  }
+  triggerOutboxDrain();
+}
+
+/**
+ * Remove provenance for a deleted/updated Mem0 memory (Fase 3).
+ * Strips the id from all sources; drops ONLY edges/nodes that had
+ * provenance and are left with none. Legacy entries (sources undefined)
+ * are never pruned — no deletion without evidence.
+ */
+export async function removeGraphProvenance(memoryId: string): Promise<{ edgesPruned: number; nodesPruned: number }> {
+  if (!graph) return { edgesPruned: 0, nodesPruned: 0 };
+  let edgesPruned = 0;
+
+  // Strip from every edge; drop those left with no sources.
+  const deadEdges: string[] = [];
+  graph.forEachEdge((edge, attrs) => {
+    const a = attrs as RelationshipAttrs;
+    if (!a.sources || !a.sources.includes(memoryId)) return;
+    a.sources = a.sources.filter(s => s !== memoryId);
+    if (a.sources.length === 0) {
+      deadEdges.push(edge);
+    } else {
+      graph.replaceEdgeAttributes(edge, a);
+    }
+  });
+  for (const edge of deadEdges) {
+    try { graph.dropEdge(edge); edgesPruned++; } catch { /* already removed */ }
+  }
+
+  // Strip from every node; drop orphan nodes left with no sources.
+  // Legacy nodes (sources undefined) are never dropped.
+  let nodesPruned = 0;
+  graph.forEachNode((nodeId, attrs) => {
+    const a = attrs as EntityAttrs;
+    if (!a.sources || !a.sources.includes(memoryId)) return;
+    a.sources = a.sources.filter(s => s !== memoryId);
+    if (a.sources.length === 0 && graph.degree(nodeId) === 0) {
+      try { graph.dropNode(nodeId); nodesPruned++; } catch { /* already removed */ }
+    } else {
+      graph.replaceNodeAttributes(nodeId, a);
+    }
+  });
+
+  if (edgesPruned > 0 || nodesPruned > 0) {
+    await saveGraph();
+    await invalidateGraphCache();
+    incrementMetric('graphPrunedEdges');
+    console.log(`[graphrag] Provenance prune for ${memoryId.slice(0, 8)}: ${edgesPruned} edges, ${nodesPruned} nodes`);
+  }
+  return { edgesPruned, nodesPruned };
+}
+
+export function getGraphSyncStatus(): {
+  pending: number;
+  processing: number;
+  lastError: string | null;
+  lastReconciledAt: string | null;
+} {
+  let pending = 0;
+  let processing = 0;
+  try {
+    pending = readOutboxFile(outboxPath()).length;
+    processing = readdirSync(outboxDir()).filter(
+      f => f.startsWith('.graph-outbox.processing-') || f.startsWith('.graph-outbox.claimed-')
+    ).length;
+  } catch { /* unreadable — report zeros */ }
+  return { pending, processing, lastError: lastSyncError, lastReconciledAt };
+}
+
+/**
+ * Reconcile derived projection with source of truth (Fase 3).
+ * Drains the outbox (including crash-orphaned entries) and reports.
+ * Idempotent: re-ingestion never duplicates (Fase 1 identity).
+ */
+export async function reconcileGraph(): Promise<{
+  processed: number;
+  failed: number;
+  deadLettered: number;
+  pending: number;
+  graphNodes: number;
+  graphEdges: number;
+}> {
+  const start = Date.now();
+  let result = { processed: 0, failed: 0, deadLettered: 0, pending: 0 };
+  await withDistributedLock('graphrag:reconcile', 300_000, async () => {
+    result = await drainGraphOutbox();
+  }).catch(err => {
+    lastSyncError = err instanceof Error ? err.message : String(err);
+    console.error('[graphrag] Reconcile error:', lastSyncError);
+  });
+  lastReconciledAt = new Date().toISOString();
+  incrementMetric('graphReconciled');
+  try {
+    const { logMaintenance } = await import('./maintenance-log.js');
+    logMaintenance('graph_reconcile', {
+      ...result,
+      graphNodes: graph?.order ?? 0,
+      graphEdges: graph?.size ?? 0,
+    }, Date.now() - start);
+  } catch { /* non-critical */ }
+  return { ...result, graphNodes: graph?.order ?? 0, graphEdges: graph?.size ?? 0 };
 }
 
 /**

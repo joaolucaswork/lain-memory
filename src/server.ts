@@ -34,6 +34,8 @@ import {
   runAutoclean,
   resolveEntities,
   ingestExtracted,
+  getGraphSyncStatus,
+  reconcileGraph,
 } from './graphrag.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
 import { getMetrics } from './mem-metrics.js';
@@ -167,7 +169,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/metrics':
-      return json(getMetrics());
+      return json({ ...getMetrics(), graphOutboxPending: getGraphSyncStatus().pending });
 
     case '/api/graph/query': {
       const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
@@ -201,8 +203,31 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/graph/ingest': {
-      await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project);
-      return json({ success: true });
+      // Pre-extracted payload: applied directly (synchronous, no LLM).
+      // On failure the payload is queued durably and reported (Fase 3).
+      try {
+        await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds });
+        return json({ success: true });
+      } catch (err) {
+        try {
+          const { appendGraphOutbox } = await import('./graphrag.js');
+          appendGraphOutbox({
+            entities: data.entities ?? [],
+            relationships: data.relationships ?? [],
+            project: data.project,
+            sourceIds: data.sourceIds,
+          });
+          return json({ success: true, queued: true });
+        } catch {
+          throw err;
+        }
+      }
+    }
+
+    case '/api/graph/sync': {
+      // Fase 3: drain outbox (incl. crash recovery) and report divergence state.
+      const [report, status] = [await reconcileGraph(), getGraphSyncStatus()];
+      return json({ ...report, lastError: status.lastError, lastReconciledAt: status.lastReconciledAt });
     }
 
     case '/api/seed/extract': {

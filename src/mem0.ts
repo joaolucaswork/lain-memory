@@ -754,19 +754,23 @@ Original: ${text}`
   );
 
   incrementMetric('memoriesAdded');
-  // Fire-and-forget: async graph ingestion + cache invalidation (skipped for trash copies)
-  if (!opts?.skipGraphIngest) {
-    graphrag.ingest(enrichedText, project).catch(err =>
-      console.error('[graphrag] ingestion error:', err)
-    );
-  }
-  invalidateMem0Cache(project).catch(() => {});
-
   const items = result.results ?? [];
   const mapped = items.map((item: any) => ({
     id: item.id ?? 'unknown',
     memory: item.memory ?? text,
   }));
+
+  // Derived projection (Fase 3): Mem0 is source of truth; the graph ingest
+  // is queued durably (outbox + background drain). Never fails the save.
+  // Skipped for trash copies (maintenance must not pollute the graph).
+  if (!opts?.skipGraphIngest) {
+    graphrag.queueGraphIngest(
+      enrichedText,
+      project,
+      mapped.map(m => m.id).filter(id => id && id !== 'unknown')
+    );
+  }
+  invalidateMem0Cache(project).catch(() => {});
 
   // Fire-and-forget: score and store importance for each saved memory
   for (const item of mapped) {
@@ -1264,6 +1268,12 @@ export async function deleteMemory(memoryId: string): Promise<void> {
   const m = getClient();
   await m.delete(memoryId);
   invalidateMem0Cache().catch(() => {});
+  // Fase 3: prune derived projection (best-effort, never fails the delete).
+  try {
+    await graphrag.removeGraphProvenance(memoryId);
+  } catch (err) {
+    console.error('[mem0] graph provenance prune failed:', err instanceof Error ? err.message : err);
+  }
 }
 
 // ─── Delete audit trail (snapshot-before-delete + trash) ───
@@ -1347,6 +1357,14 @@ export async function updateMemory(memoryId: string, newText: string, project?: 
   const m = getClient();
   await m.update(memoryId, newText);
   invalidateMem0Cache(project).catch(() => {});
+  // Fase 3: re-derive projection — drop edges sourced only by the old content,
+  // then re-ingest the new text with the same memory ID as provenance.
+  try {
+    await graphrag.removeGraphProvenance(memoryId);
+    graphrag.queueGraphIngest(newText, project, [memoryId]);
+  } catch (err) {
+    console.error('[mem0] graph re-ingest after update failed:', err instanceof Error ? err.message : err);
+  }
   return { id: memoryId, memory: newText };
 }
 
@@ -1735,6 +1753,17 @@ export function startMemoryMaintenance(): void {
           }
         }
         console.log(`[mem0] Weekly auto-cleanup: ${weeklyDeleted}/${weeklyTotal} deleted across ${projects.length} projects`);
+      }
+
+      // ── Graph reconcile (Fase 3): drain outbox, heal derived projection ──
+      try {
+        const { reconcileGraph } = await import('./graphrag.js');
+        const reconciled = await reconcileGraph();
+        if (reconciled.processed > 0 || reconciled.failed > 0) {
+          console.log(`[graphrag] Maintenance reconcile: ${reconciled.processed} processed, ${reconciled.failed} failed, ${reconciled.pending} pending`);
+        }
+      } catch (err) {
+        console.error('[graphrag] Maintenance reconcile error:', err);
       }
 
       // ── Importance backfill: score memories missing importance in Redis ──

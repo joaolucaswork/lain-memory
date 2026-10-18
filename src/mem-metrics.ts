@@ -13,6 +13,10 @@ export const metrics = {
   coldDryPurged: 0,
   cacheHits: 0,
   cacheMisses: 0,
+  graphIngestErrors: 0,
+  graphOutboxProcessed: 0,
+  graphReconciled: 0,
+  graphPrunedEdges: 0,
 };
 
 export function incrementMetric(key: keyof typeof metrics): void {

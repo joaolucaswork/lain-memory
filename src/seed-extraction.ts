@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { runFastLlmJson, runHaikuFast } from './llm-client.js';
 import { addMemoryWithConflictCheck } from './mem0.js';
 import { scoreActionability, scoreFactQuality } from './memory-patterns.js';
-import { isGraphEnabled, ingestExtracted } from './graphrag.js';
+import { isGraphEnabled, ingestExtracted, appendGraphOutbox } from './graphrag.js';
 import { SEEDS_DIR } from './workspace.js';
 import { safeWriteFileSync } from './file-io-lock.js';
 const ENABLED = process.env.LAIN_SEED_ENABLED !== 'false';
@@ -353,9 +353,14 @@ async function storeSeedResults(output: SeedOutput, project?: string): Promise<s
 
   if (isGraphEnabled()) {
     try {
-      await ingestExtracted(output.entities, output.relationships, project);
+      await ingestExtracted(output.entities, output.relationships, project, { sourceIds: memoryIds });
     } catch (err) {
-      console.error('[seed] GraphRAG ingestion error:', err);
+      console.error('[seed] GraphRAG ingestion error, queued for reconcile:', err);
+      try {
+        appendGraphOutbox({ entities: output.entities, relationships: output.relationships, project, sourceIds: memoryIds });
+      } catch {
+        console.error('[seed] GraphRAG outbox append failed — seed facts Mem0-only');
+      }
     }
   }
 
