@@ -6,10 +6,10 @@ describe('PGS Defaults', () => {
     expect(PGS_DEFAULTS.maxConcurrentSweeps).toBe(5);
     expect(PGS_DEFAULTS.minCommunitySize).toBe(3);
     expect(PGS_DEFAULTS.targetPartitionMax).toBe(500);
-    expect(PGS_DEFAULTS.maxSweepPartitions).toBe(15);
+    expect(PGS_DEFAULTS.maxSweepPartitions).toBe(5);
     expect(PGS_DEFAULTS.partitionRelevanceThreshold).toBe(0.25);
-    expect(PGS_DEFAULTS.sweepMaxTokens).toBe(6000);
-    expect(PGS_DEFAULTS.synthesisMaxTokens).toBe(16000);
+    expect(PGS_DEFAULTS.sweepMaxTokens).toBe(3000);
+    expect(PGS_DEFAULTS.synthesisMaxTokens).toBe(8000);
   });
 
   test('minCommunitySize adapted for small graphs', () => {

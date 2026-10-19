@@ -2,15 +2,12 @@
  * Shared LLM client — any OpenAI-compatible chat-completions endpoint.
  * Works with OpenRouter, Vercel AI Gateway, LiteLLM, Ollama, plain OpenAI, etc.
  *
- * The `runHaiku*` export names are aliases kept for existing callers —
- * prefer the `runFastLlm*` names in new code.
- *
  * Env vars (new unified schema — LAIN_LLM_* wins, legacy keys are fallbacks):
  *   LAIN_LLM_BASE_URL    — OpenAI-compatible base URL (default: https://openrouter.ai/api/v1)
  *   LAIN_LLM_API_KEY     — API key (fallback: OPENROUTER_API_KEY, then AI_GATEWAY_API_KEY,
  *                          then LAIN_OPENAI_API_KEY / OPENAI_API_KEY)
- *   LAIN_FAST_MODEL      — model for fast calls (default: deepseek/deepseek-v4-flash)
- *   LAIN_STANDARD_MODEL  — model for standard calls (default: deepseek/deepseek-v4-flash)
+ *   LAIN_FAST_MODEL      — model for fast calls (default: z-ai/glm-5.3-flash)
+ *   LAIN_STANDARD_MODEL  — model for standard calls (default: z-ai/glm-5.3-flash)
  *
  * Used by the memory path (conflict detection, enrichment, GraphRAG, seed
  * extraction, consolidation) — no Claude Code CLI dependency anywhere here.
@@ -49,11 +46,11 @@ export function getLlmApiKey(): string {
 }
 
 export function getFastModel(): string {
-  return process.env.LAIN_FAST_MODEL || 'deepseek/deepseek-v4-flash';
+  return process.env.LAIN_FAST_MODEL || 'z-ai/glm-5.3-flash';
 }
 
 export function getStandardModel(): string {
-  return process.env.LAIN_STANDARD_MODEL || 'deepseek/deepseek-v4-flash';
+  return process.env.LAIN_STANDARD_MODEL || 'z-ai/glm-5.3-flash';
 }
 
 export interface ChatCallOpts {
@@ -212,16 +209,3 @@ export function callFastLlmSafe(prompt: string, opts?: ChatCallOpts): Promise<st
     ...opts,
   }).then(r => r || null).catch(() => null);
 }
-
-// ─── Legacy haiku.* aliases (deprecated — prefer the runFastLlm* names) ───
-
-/** @deprecated Use runFastLlm — same function, clearer name. */
-export const runHaikuFast = runFastLlm;
-/** @deprecated Use runStandardLlm. */
-export const runHaiku = runStandardLlm;
-/** @deprecated Use runStandardLlmJson. */
-export const runHaikuJson = runStandardLlmJson;
-/** @deprecated Alias of runFastLlmJson. */
-export const runHaikuFastJson = runFastLlmJson;
-/** @deprecated Use callFastLlmSafe. */
-export const callHaiku = callFastLlmSafe;

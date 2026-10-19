@@ -9,7 +9,7 @@
 import path from 'path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'fs';
 import { z } from 'zod';
-import { runFastLlmJson, runHaikuFast } from './llm-client.js';
+import { runFastLlmJson, runFastLlm } from './llm-client.js';
 import { addMemoryWithConflictCheck } from './mem0.js';
 import { scoreActionability, scoreFactQuality } from './memory-patterns.js';
 import { isGraphEnabled, ingestExtracted, appendGraphOutbox } from './graphrag.js';
@@ -263,7 +263,7 @@ async function mergeChunkResults(results: ChunkResult[]): Promise<{
   let summary = joinedSummary;
   if (results.length > 1) {
     try {
-      const condensed = await runHaikuFast(
+      const condensed = await runFastLlm(
         `Re-summarize the following multi-chunk extraction into 2-3 concise sentences. Preserve the most important facts. Output only the summary text, no preamble.\n\n${joinedSummary}`
       );
       if (condensed && condensed.trim().length > 0) {

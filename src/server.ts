@@ -41,7 +41,7 @@ import { classifyMemoryAction } from './contradiction-detector.js';
 import { getMetrics } from './mem-metrics.js';
 import { extractSeed, listSeeds } from './seed-extraction.js';
 import { PGSEngine } from './pgs/index.js';
-import { createPGSProviders } from './pgs/haiku-provider.js';
+import { createPGSProviders } from './pgs/llm-provider.js';
 import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';

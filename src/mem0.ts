@@ -73,7 +73,7 @@ export function scoreActionability(text: string): number {
 }
 
 /**
- * Decide whether pre-save Haiku enrichment may run for a memory.
+ * Decide whether pre-save LLM enrichment may run for a memory.
  *
  * Enrichment is a narrow tool: it only legitimately *completes* a memory
  * that ALREADY describes an HTTP API but is missing detail. It must NEVER:
@@ -102,7 +102,7 @@ export function shouldEnrichTechnicalMemory(
 }
 
 /**
- * Accept a Haiku rewrite ONLY when it (a) preserved the original verbatim
+ * Accept an LLM rewrite ONLY when it (a) preserved the original verbatim
  * (whitespace-normalized substring) AND (b) genuinely raised actionability.
  *
  * Length is irrelevant — the old `enriched.length > text.length` rule was
@@ -506,7 +506,7 @@ export interface AddMemoryOpts {
   skipGraphIngest?: boolean;
   /**
    * Verbatim mode (mode:raw). Passes infer:false to the Mem0 SDK (no
-   * gpt-4o-mini decomposition) AND bypasses pre-save Haiku enrichment
+   * gpt-4o-mini decomposition) AND bypasses pre-save LLM enrichment
    * entirely (see shouldEnrichTechnicalMemory). The stored text is exactly
    * the input — 0 bytes changed. Previously enrichment still ran here and
    * could rewrite/fabricate before Mem0 ever saw the text.
@@ -698,8 +698,8 @@ export async function addMemory(text: string, project?: string, opts?: AddMemory
   let enrichedText = text;
   if (shouldEnrichTechnicalMemory(text, opts)) {
     try {
-      const { runHaikuFast } = await import('./llm-client.js');
-      const enriched = await withRetry(() => runHaikuFast(
+      const { runFastLlm } = await import('./llm-client.js');
+      const enriched = await withRetry(() => runFastLlm(
         `This technical memory describes an HTTP API but is missing actionable detail.
 Fill in ONLY details that are unambiguously implied by the original.
 
@@ -1501,7 +1501,7 @@ function groupMemories(memories: { id: string; memory: string }[]): Map<string, 
 
 /**
  * Consolidate fragmented memories for a project scope.
- * Groups related memories, merges them via gpt-4o-mini (was Claude Haiku CLI pre-2026-05-09), replaces fragments.
+ * Groups related memories, merges them via the fast LLM, replaces fragments.
  * Returns { consolidated, deleted, groups }.
  */
 export interface ConsolidationDetail {

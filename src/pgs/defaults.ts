@@ -16,16 +16,27 @@ export interface PGSConfig {
   sweepFraction: number | null;
 }
 
+/**
+ * Parse a positive-int env knob. Returns `fallback` when unset, non-numeric,
+ * or <= 0 — so a bad env value can never zero-out or break the engine.
+ */
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 export const PGS_DEFAULTS: PGSConfig = {
   maxConcurrentSweeps: 5,
   minNodesForPgs: 0,
   minCommunitySize: 3,
   targetPartitionMax: 500,
-  maxSweepPartitions: 15,
+  maxSweepPartitions: envPositiveInt('LAIN_PGS_MAX_SWEEPS', 5),
   minSweepPartitions: 0,
   partitionRelevanceThreshold: 0.25,
-  sweepMaxTokens: 6000,
-  synthesisMaxTokens: 16000,
+  sweepMaxTokens: envPositiveInt('LAIN_PGS_SWEEP_MAX_TOKENS', 3000),
+  synthesisMaxTokens: envPositiveInt('LAIN_PGS_SYNTHESIS_MAX_TOKENS', 8000),
   sweepFraction: null,
 };
 

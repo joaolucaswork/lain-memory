@@ -71,8 +71,8 @@ describe('llm-client env resolution', () => {
   });
 
   it('G — model defaults and overrides', () => {
-    expect(getFastModel()).toBe('deepseek/deepseek-v4-flash');
-    expect(getStandardModel()).toBe('deepseek/deepseek-v4-flash');
+    expect(getFastModel()).toBe('z-ai/glm-5.3-flash');
+    expect(getStandardModel()).toBe('z-ai/glm-5.3-flash');
     process.env.LAIN_FAST_MODEL = 'xai/grok-4';
     process.env.LAIN_STANDARD_MODEL = 'openai/gpt-5';
     expect(getFastModel()).toBe('xai/grok-4');

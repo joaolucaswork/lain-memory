@@ -74,18 +74,15 @@ export function createPGSProviders(): { sweepProvider: LLMProvider; synthesisPro
 }
 
 /**
- * Adapter over the shared llm-client (fast model) as a PGS provider.
+ * Adapter over the shared llm-client (standard model) as a PGS provider.
  */
 export function createLlmProvider(): LLMProvider {
   return {
     async generate({ instructions, input }) {
-      const { runHaiku } = await import('../llm-client.js');
+      const { runStandardLlm } = await import('../llm-client.js');
       const prompt = `${instructions}\n\n---\n\n${input}`;
-      const content = await runHaiku(prompt);
+      const content = await runStandardLlm(prompt);
       return { content };
     },
   };
 }
-
-/** @deprecated Use createLlmProvider. */
-export const createHaikuProvider = createLlmProvider;

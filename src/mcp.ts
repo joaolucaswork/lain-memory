@@ -36,7 +36,7 @@ import {
 } from './graphrag.js';
 import { extractSeed, listSeeds } from './seed-extraction.js';
 import { PGSEngine } from './pgs/index.js';
-import { createPGSProviders } from './pgs/haiku-provider.js';
+import { createPGSProviders } from './pgs/llm-provider.js';
 import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
@@ -149,7 +149,7 @@ const TOOL_DEFINITIONS = [
   {
     name: 'pgs_query',
     description:
-      'Run Partitioned Graph Synthesis on the knowledge graph. Partitions the graph into communities, sweeps each with LLM analysis, and synthesizes cross-domain insights. Use for deep analysis, gap detection, and novelty finding.',
+      'Run Partitioned Graph Synthesis on the knowledge graph. EXPENSIVE (up to LAIN_PGS_MAX_SWEEPS parallel LLM sweeps + synthesis) — deep analysis only. Prefer recall/graph_query for everyday lookups.',
     inputSchema: {
       type: 'object' as const,
       properties: {

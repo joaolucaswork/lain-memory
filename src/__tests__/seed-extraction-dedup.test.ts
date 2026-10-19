@@ -2,14 +2,14 @@ import { describe, it, expect, mock, beforeEach, afterAll } from 'bun:test';
 
 import * as realMem0Ns from '../mem0.js';
 import * as realGraphragNs from '../graphrag.js';
-import * as realHaikuNs from '../llm-client.js';
+import * as realLlmNs from '../llm-client.js';
 import * as realMemoryPatternsNs from '../memory-patterns.js';
 import * as realWorkspaceNs from '../workspace.js';
 import * as realFileIoLockNs from '../file-io-lock.js';
 
 const realMem0 = { ...realMem0Ns };
 const realGraphrag = { ...realGraphragNs };
-const realHaiku = { ...realHaikuNs };
+const realLlm = { ...realLlmNs };
 const realMemoryPatterns = { ...realMemoryPatternsNs };
 const realWorkspace = { ...realWorkspaceNs };
 const realFileIoLock = { ...realFileIoLockNs };
@@ -45,7 +45,7 @@ mock.module('../llm-client.js', () => ({
     entities: [],
     relationships: [],
   })),
-  runHaikuFast: mock(async () => 'Test summary.'),
+  runFastLlm: mock(async () => 'Test summary.'),
 }));
 
 mock.module('../workspace.js', () => ({
@@ -100,7 +100,7 @@ describe('seed-extraction dedup via addMemoryWithConflictCheck (item #7a)', () =
 afterAll(() => {
   mock.module('../mem0.js', () => realMem0);
   mock.module('../graphrag.js', () => realGraphrag);
-  mock.module('../llm-client.js', () => realHaiku);
+  mock.module('../llm-client.js', () => realLlm);
   mock.module('../memory-patterns.js', () => realMemoryPatterns);
   mock.module('../workspace.js', () => realWorkspace);
   mock.module('../file-io-lock.js', () => realFileIoLock);

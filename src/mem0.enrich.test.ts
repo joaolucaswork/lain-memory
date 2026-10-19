@@ -3,7 +3,7 @@ import { shouldEnrichTechnicalMemory, acceptEnrichedMemory } from './mem0.js';
 
 // Regression for the verified incident: a git-hook security note saved via
 // mode:raw came back with a fabricated `POST /git/commit` + auth header +
-// curl, because pre-save Haiku enrichment ran before Mem0 and the prompt
+// curl, because pre-save LLM enrichment ran before Mem0 and the prompt
 // literally demanded a URL/method/curl.
 
 const INCIDENT_NOTE =
@@ -31,7 +31,7 @@ describe('shouldEnrichTechnicalMemory', () => {
   });
 
   it('INCIDENT: a technical note that is not API-shaped is never enriched', () => {
-    // The reported bug: this would have been Haiku-rewritten into a fake
+    // The reported bug: this would have been LLM-rewritten into a fake
     // `POST /git/commit` curl. Now it is left exactly as-is.
     expect(shouldEnrichTechnicalMemory(INCIDENT_NOTE)).toBe(false);
     expect(shouldEnrichTechnicalMemory(INCIDENT_NOTE, { inferFalse: true })).toBe(false);
