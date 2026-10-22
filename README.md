@@ -164,6 +164,7 @@ All via env (see [.env.example](./.env.example)):
 | `LAIN_INSTANCE_ID` | empty | Suffixes collection, graph file, Redis prefix |
 | `LAIN_MIN_RECALL_SCORE` | `0.356` | Recall keep threshold |
 | `LAIN_MEMORY_REAPER_ENABLED` / `_DRY_RUN` | — / `false` | Stale-memory expiry |
+| `LAIN_PENDING_MERGE_ENABLED` | `false` | Auto-merge pending-review UPDATE queue in consolidate (item 2) |
 | `LAIN_SEED_ENABLED` / `LAIN_SEED_MAX_CHUNKS` | enabled / `10` | Seed extraction |
 | `LAIN_ENABLE_PGS` | `on` | Partitioned graph search |
 
@@ -185,7 +186,9 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped whe
 | `/api/memory/consolidate` | `{ project? }` | Dedup/merge pass |
 | `/api/memory/scan` | `{ project }` | Clean stale memories |
 | `/api/memory/resolve-entities` | `{ threshold? }` (default `0.75`) | Entity resolution |
-| `/api/memory/contradiction-scan` | `{ project? }` | Classify similar pairs, auto-delete dupes |
+| `/api/memory/contradiction-scan` | `{ project?, limit? (default 20, max 100), offset? }` | Classify similar pairs, auto-delete dupes |
+| `GET /api/memory/contradictions` | `?kind=merge|contradiction&limit=` | Pending review queue (sweep UPDATE/DELETE verdicts) |
+| `/api/memory/contradictions/dismiss` | `{ id }` | Dismiss a pending review entry |
 | `GET /api/memory/metrics` | — | In-memory counters |
 
 ```bash

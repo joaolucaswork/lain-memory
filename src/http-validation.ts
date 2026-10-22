@@ -81,7 +81,18 @@ export const routeSchemas: Record<string, z.ZodType> = {
     threshold: z.coerce.number().min(0).max(1).optional(),
     project,
   }),
-  '/api/memory/contradiction-scan': z.object({ project }),
+  '/api/memory/contradiction-scan': z.object({
+    project,
+    limit: limit(100),
+    offset: z.coerce.number().int().min(0).max(5000).optional(),
+  }),
+  '/api/memory/contradictions': z.object({
+    kind: z.enum(['merge', 'contradiction']).optional(),
+    limit: limit(200),
+  }),
+  '/api/memory/contradictions/dismiss': z.object({
+    id: z.string().min(1).max(200),
+  }),
   '/api/memory/metrics': z.object({}).catchall(z.unknown()),
   '/api/graph/query': z.object({
     query: z.string().max(5000).optional().default(''),

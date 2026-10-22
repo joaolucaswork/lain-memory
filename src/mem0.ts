@@ -1513,21 +1513,155 @@ export interface ConsolidationDetail {
   newId?: string;
 }
 
+/**
+ * LLM-merge a set of fragment texts into one memory.
+ * Same prompt + retry as the group path in consolidateMemories.
+ * Returns null when the LLM returns nothing usable.
+ */
+async function llmMergeMemoryTexts(texts: string[]): Promise<string | null> {
+  const { runFastLlmJson } = await import('./llm-client.js');
+  const fragments = texts.join('\n- ');
+  const result = await withRetry(() => runFastLlmJson<{ consolidated: string }>(
+    `Consolide essas memórias fragmentadas em UMA ÚNICA memória completa e rica.
+Mantenha TODOS os fatos importantes, nomes, valores, datas e decisões.
+Retorne APENAS JSON: {"consolidated": "texto consolidado aqui"}
+
+Memórias:
+- ${fragments}`
+  ));
+  if (result?.consolidated && result.consolidated.length > 20) return result.consolidated;
+  return null;
+}
+
+/**
+ * Item 2 gate: pending-queue merges only run when explicitly enabled.
+ * Sweep queues (item 1) and contradiction visibility (item 3) work regardless —
+ * this way the queue can be observed before auto-merge is switched on.
+ */
+export function isPendingMergeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.LAIN_PENDING_MERGE_ENABLED ?? '').toLowerCase();
+  return v === 'true' || v === '1';
+}
+
+/**
+ * Consume the pending-review merge queue (UPDATE verdicts from the
+ * contradiction sweep) before lexical grouping. Exact LLM-detected pairs —
+ * no keyword guessing. Same trash + audit safety as the group path.
+ */
+async function consolidatePendingMerges(project?: string): Promise<{
+  consolidated: number;
+  deleted: number;
+  details: ConsolidationDetail[];
+}> {
+  const { claimPendingMerges, updateEntry, maxAttemptsReached } = await import('./pending-review.js');
+  const { logMaintenance } = await import('./maintenance-log.js');
+  const claimed = await claimPendingMerges(project, 5);
+  let consolidated = 0;
+  let deleted = 0;
+  const details: ConsolidationDetail[] = [];
+
+  for (const entry of claimed) {
+    try {
+      const texts = [entry.memory, ...entry.related.map(r => r.memory)].filter(t => t && t.trim());
+      if (texts.length < 2) {
+        await updateEntry(entry.id, { status: 'failed', result: { error: 'fragments gone' } });
+        continue;
+      }
+      const merged = await llmMergeMemoryTexts(texts);
+      if (!merged || scoreMemoryQuality(merged) < MIN_MEMORY_QUALITY) {
+        const terminal = maxAttemptsReached(entry);
+        await updateEntry(entry.id, {
+          status: terminal ? 'failed' : 'pending',
+          result: { error: 'merge rejected by quality gate or empty' },
+        });
+        console.log(`[mem0] Pending merge ${entry.id.slice(0, 8)} rejected by quality gate${terminal ? ' (terminal)' : ', will retry'}`);
+        continue;
+      }
+      const ids = [entry.memoryId, ...entry.related.map(r => r.id)].filter(id => id && id !== 'pending');
+      const doomed = await snapshotMemories(ids, project);
+      const existing = doomed.filter(s => !s.missing && s.memory);
+      if (existing.length < 2) {
+        await updateEntry(entry.id, { status: 'failed', result: { error: 'fragments gone' } });
+        continue;
+      }
+      const saved = await addMemory(merged, project, { skipQualityCheck: true, skipConflictCheck: true });
+      const newId = saved[0]?.id ?? 'unknown';
+      consolidated++;
+
+      const trashIds: Record<string, string | null> = {};
+      for (const snap of doomed) {
+        try {
+          const { trashId, deleted: fragDeleted } = await trashAndDelete(snap, project, {
+            reason: 'merged from pending review queue',
+            trigger: 'consolidation:pending_queue',
+            replacedById: newId,
+          });
+          trashIds[snap.id] = trashId;
+          if (fragDeleted) {
+            deleted++;
+          } else {
+            console.error(`[mem0] Pending merge deferred fragment ${snap.id}: trash copy unconfirmed, original preserved`);
+          }
+        } catch {}
+      }
+
+      await updateEntry(entry.id, { status: 'done', result: { mergedId: newId } });
+      logMaintenance('pending_merge_done', {
+        entry_id: entry.id,
+        scope: project ?? 'global',
+        new_id: newId,
+        fragments: existing.length,
+      });
+      details.push({
+        fragments: texts.map(f => f.slice(0, 120)),
+        result: merged.slice(0, 200),
+        fragmentsFull: doomed.map(s => ({ id: s.id, memory: s.memory, created_at: s.created_at ?? null, missing: s.missing ?? false, trash_id: trashIds[s.id] ?? null })),
+        resultFull: merged,
+        newId,
+      });
+    } catch (err) {
+      try {
+        await updateEntry(entry.id, {
+          status: maxAttemptsReached(entry) ? 'failed' : 'pending',
+          result: { error: err instanceof Error ? err.message : String(err) },
+        });
+      } catch {}
+      console.error(`[mem0] Pending merge ${entry.id.slice(0, 8)} failed:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  return { consolidated, deleted, details };
+}
+
 export async function consolidateMemories(project?: string): Promise<{
   consolidated: number;
   deleted: number;
   groups: number;
   details: ConsolidationDetail[];
 }> {
-  const allMems = await getMemories(project, 100);
-  if (allMems.length < 4) return { consolidated: 0, deleted: 0, groups: 0, details: [] };
-
-  const groups = groupMemories(allMems);
-  if (groups.size === 0) return { consolidated: 0, deleted: 0, groups: 0, details: [] };
-
   let consolidated = 0;
   let deleted = 0;
   const details: ConsolidationDetail[] = [];
+
+  // Item 1: exact LLM-detected UPDATE pairs first — no lexical guessing.
+  // Gated by LAIN_PENDING_MERGE_ENABLED (item 2): when off, the queue only
+  // accumulates for observation via /api/memory/contradictions.
+  if (isPendingMergeEnabled()) {
+    try {
+      const queued = await consolidatePendingMerges(project);
+      consolidated += queued.consolidated;
+      deleted += queued.deleted;
+      details.push(...queued.details);
+    } catch (err) {
+      console.error('[mem0] Pending-queue consolidation failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  const allMems = await getMemories(project, 100);
+  if (allMems.length < 4) return { consolidated, deleted, groups: 0, details };
+
+  const groups = groupMemories(allMems);
+  if (groups.size === 0) return { consolidated, deleted, groups: 0, details };
 
   for (const [_key, group] of groups) {
     const fragmentTexts = group.map(m => m.memory);
@@ -1769,6 +1903,222 @@ export async function backfillImportanceScores(maxToScore = 50): Promise<number>
 
 // ─── Automatic Memory Maintenance ───
 
+// ─── Rotating contradiction sweep (paraphrase hygiene) ───
+// Replaces the old "always the 20 most recent globals" window with a
+// round-robin cursor: each tick processes the next slice of one scope
+// (global, then each project), persisting progress in Redis.
+
+export function getContradictionFetchLimit(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LAIN_CONTRADICTION_FETCH;
+  const n = raw ? parseInt(raw, 10) : NaN;
+  return Number.isNaN(n) || n < 1 ? 200 : Math.min(n, 500);
+}
+
+export function getContradictionSliceSize(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LAIN_CONTRADICTION_SLICE;
+  const n = raw ? parseInt(raw, 10) : NaN;
+  return Number.isNaN(n) || n < 1 ? 20 : Math.min(n, 100);
+}
+
+export function getContradictionMaxLlm(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.LAIN_CONTRADICTION_MAX_LLM;
+  const n = raw ? parseInt(raw, 10) : NaN;
+  return Number.isNaN(n) || n < 1 ? 10 : Math.min(n, 100);
+}
+
+/** Pure wrap-around slice: returns `size` indices starting at `cursor` (mod total). */
+export function nextSliceIndices(total: number, cursor: number, size: number): number[] {
+  if (total <= 0 || size <= 0) return [];
+  const start = ((Math.floor(cursor) % total) + total) % total;
+  const out: number[] = [];
+  for (let k = 0; k < Math.min(size, total); k++) out.push((start + k) % total);
+  return out;
+}
+
+const contradictionCursorFallback = new Map<string, number>();
+let contradictionScopeIdxFallback = 0;
+
+function contradictionScopeKey(scope: string | undefined): string {
+  return scope ?? 'global';
+}
+
+export async function getContradictionCursor(scope: string | undefined): Promise<number> {
+  const key = `mem0:contradiction_cursor:${contradictionScopeKey(scope)}`;
+  if (isRedisAvailable()) {
+    try {
+      const raw = await getRedis().get(key);
+      const n = raw === null ? 0 : parseInt(raw, 10);
+      return Number.isNaN(n) || n < 0 ? 0 : n;
+    } catch { /* fall through to fallback */ }
+  }
+  return contradictionCursorFallback.get(contradictionScopeKey(scope)) ?? 0;
+}
+
+export async function setContradictionCursor(scope: string | undefined, cursor: number): Promise<void> {
+  const safe = Math.max(0, Math.floor(cursor));
+  contradictionCursorFallback.set(contradictionScopeKey(scope), safe);
+  if (isRedisAvailable()) {
+    try {
+      await getRedis().set(`mem0:contradiction_cursor:${contradictionScopeKey(scope)}`, String(safe));
+    } catch { /* non-critical */ }
+  }
+}
+
+async function getContradictionScopeIdx(mod: number): Promise<number> {
+  if (mod <= 0) return 0;
+  if (isRedisAvailable()) {
+    try {
+      const raw = await getRedis().get('mem0:contradiction_scope_idx');
+      const n = raw === null ? 0 : parseInt(raw, 10);
+      return Number.isNaN(n) || n < 0 ? 0 : n % mod;
+    } catch { /* fall through */ }
+  }
+  return contradictionScopeIdxFallback % mod;
+}
+
+async function setContradictionScopeIdx(idx: number): Promise<void> {
+  contradictionScopeIdxFallback = Math.max(0, Math.floor(idx));
+  if (isRedisAvailable()) {
+    try {
+      await getRedis().set('mem0:contradiction_scope_idx', String(contradictionScopeIdxFallback));
+    } catch { /* non-critical */ }
+  }
+}
+
+export interface ContradictionSweepReport {
+  scope: string | undefined;
+  total: number;
+  checked: number;
+  removed: number;
+  llmCalls: number;
+  nextCursor: number;
+  queuedMerges: number;
+  queuedContradictions: number;
+}
+
+/** Process one slice of one scope. Never throws on per-memory errors. */
+export async function runContradictionSweepForScope(
+  scope: string | undefined,
+  opts?: { fetchLimit?: number; sliceSize?: number; maxLlm?: number; cursor?: number },
+): Promise<ContradictionSweepReport> {
+  const fetchLimit = opts?.fetchLimit ?? getContradictionFetchLimit();
+  const sliceSize = opts?.sliceSize ?? getContradictionSliceSize();
+  const maxLlm = opts?.maxLlm ?? getContradictionMaxLlm();
+  const memories = await getMemories(scope, fetchLimit);
+  const total = memories.length;
+  if (total === 0) {
+    return { scope, total: 0, checked: 0, removed: 0, llmCalls: 0, nextCursor: 0, queuedMerges: 0, queuedContradictions: 0 };
+  }
+
+  const cursor = opts?.cursor ?? await getContradictionCursor(scope);
+  const indices = nextSliceIndices(total, cursor, sliceSize);
+  const slice = indices.map(i => memories[i]);
+
+  const { classifyMemoryAction } = await import('./contradiction-detector.js');
+  const { logMaintenance } = await import('./maintenance-log.js');
+  const { enqueueVerdict } = await import('./pending-review.js');
+  let removed = 0;
+  let llmCalls = 0;
+  let queuedMerges = 0;
+  let queuedContradictions = 0;
+  const queuedMergeIds: string[] = [];
+  const queuedContradictionIds: string[] = [];
+
+  for (const mem of slice) {
+    const createdMs = mem.created_at ? new Date(mem.created_at).getTime() : Date.now();
+    if (Date.now() - createdMs < 60 * 60 * 1000) continue;
+
+    let others: { id: string; memory: string; score: number }[] = [];
+    try {
+      const similar = await searchMemory(mem.memory, scope, 5);
+      others = similar
+        .filter(s => s.id !== mem.id && (s.score ?? 0) > 0.6)
+        .map(s => ({ id: s.id, memory: s.memory, score: s.score ?? 0 }));
+    } catch {
+      continue;
+    }
+    if (others.length === 0) continue;
+    if (llmCalls >= maxLlm) break;
+
+    let classification;
+    try {
+      classification = await classifyMemoryAction(mem.memory, others);
+    } catch {
+      continue;
+    }
+    llmCalls++;
+
+    if (classification.action === 'NOOP' && classification.supersedes.length === 0) {
+      try {
+        const report = await deleteMemoriesWithPolicy({
+          ids: [mem.id],
+          project: scope,
+          reason: classification.reason,
+          trigger: 'maintenance:contradiction_scan',
+        });
+        if (report.archived.includes(mem.id)) {
+          removed++;
+          console.log(`[mem0] Maintenance: archived duplicate ${mem.id} (trash: ${report.trashIds[mem.id] ?? 'copy-failed'})`);
+          logMaintenance('memory_duplicate_purge', {
+            trigger: 'maintenance:contradiction_scan',
+            reason: classification.reason,
+            deleted: [{ id: mem.id, memory: mem.memory, created_at: mem.created_at ?? null, trash_id: report.trashIds[mem.id] ?? null }],
+          });
+        }
+      } catch { /* per-memory failure never fails the sweep */ }
+    } else if (classification.action === 'UPDATE' || classification.action === 'DELETE') {
+      // Item 1+3: verdicts the auto-flow must not action alone go to the
+      // pending-review queue instead of being dropped. UPDATE → merge
+      // candidates for consolidation; DELETE → contradictions for a human.
+      try {
+        const kind = classification.action === 'UPDATE' ? 'merge' as const : 'contradiction' as const;
+        const { entry, duplicate } = await enqueueVerdict({
+          kind,
+          verdict: classification.action,
+          scope,
+          memoryId: mem.id,
+          memory: mem.memory,
+          related: others.map(o => ({ id: o.id, memory: o.memory })),
+          reason: classification.reason,
+        });
+        if (!duplicate) {
+          if (kind === 'merge') {
+            queuedMerges++;
+            queuedMergeIds.push(entry.id);
+          } else {
+            queuedContradictions++;
+            queuedContradictionIds.push(entry.id);
+          }
+          logMaintenance('pending_review_queued', {
+            kind,
+            scope: scope ?? 'global',
+            memory_id: mem.id,
+            entry_id: entry.id,
+            reason: classification.reason,
+          });
+        }
+      } catch { /* queue failure never fails the sweep */ }
+    }
+  }
+
+  const nextCursor = total > 0 ? ((((Math.floor(cursor) % total) + total) % total) + slice.length) % total : 0;
+  await setContradictionCursor(scope, nextCursor);
+  return { scope, total, checked: slice.length, removed, llmCalls, nextCursor, queuedMerges, queuedContradictions };
+}
+
+/** Round-robin over [global, ...projects]: one scope per maintenance tick. */
+export async function runRotatingContradictionSweep(): Promise<ContradictionSweepReport> {
+  let scopes: (string | undefined)[] = [undefined];
+  try {
+    for (const p of listProjects()) scopes.push(p.name);
+  } catch { /* projects unavailable — global only */ }
+  const idx = await getContradictionScopeIdx(scopes.length);
+  const scope = scopes[idx % scopes.length];
+  const report = await runContradictionSweepForScope(scope);
+  await setContradictionScopeIdx((idx + 1) % scopes.length);
+  return report;
+}
+
 let maintenanceTimer: ReturnType<typeof setInterval> | null = null;
 const MAINTENANCE_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
@@ -1858,53 +2208,22 @@ export function startMemoryMaintenance(): void {
         console.error('[mem0] Importance backfill error:', err);
       }
 
-      // ── Periodic contradiction scan: check recent global memories for conflicts ──
+      // ── Periodic contradiction scan: rotating slice (1 scope/tick, cursor-persisted) ──
       try {
-        const { classifyMemoryAction } = await import('./contradiction-detector.js');
-        const recentGlobal = await getMemories(undefined, 20);
-        let contradictionsFound = 0;
-
-        for (const mem of recentGlobal) {
-          // Skip very recent memories (< 1 hour)
-          const createdMs = mem.created_at ? new Date(mem.created_at).getTime() : Date.now();
-          if (Date.now() - createdMs < 60 * 60 * 1000) continue;
-
-          const similar = await searchMemory(mem.memory, undefined, 5);
-          const others = similar
-            .filter(s => s.id !== mem.id && (s.score ?? 0) > 0.6)
-            .map(s => ({ id: s.id, memory: s.memory, score: s.score ?? 0 }));
-
-          if (others.length === 0) continue;
-
-          const classification = await classifyMemoryAction(mem.memory, others);
-          // Fase 4: NOOP duplicates are archived through the shared policy
-          // (explicit rule: automatic hygiene archives with trash + audit).
-          if (classification.action === 'NOOP' && classification.supersedes.length === 0) {
-            try {
-              const report = await deleteMemoriesWithPolicy({
-                ids: [mem.id],
-                project: undefined,
-                reason: classification.reason,
-                trigger: 'maintenance:contradiction_scan',
-              });
-              if (report.archived.includes(mem.id)) {
-                contradictionsFound++;
-                console.log(`[mem0] Maintenance: archived duplicate ${mem.id} (trash: ${report.trashIds[mem.id] ?? 'copy-failed'})`);
-                logMaintenance('memory_duplicate_purge', {
-                  trigger: 'maintenance:contradiction_scan',
-                  reason: classification.reason,
-                  deleted: [{ id: mem.id, memory: mem.memory, created_at: mem.created_at ?? null, trash_id: report.trashIds[mem.id] ?? null }],
-                });
-              }
-            } catch {}
-          }
-        }
-
-        if (contradictionsFound > 0) {
+        const sweepStart = Date.now();
+        const sweep = await runRotatingContradictionSweep();
+        const sweepDuration = Date.now() - sweepStart;
+        if (sweep.removed > 0 || sweep.checked > 0) {
           logMaintenance('contradiction_scan', {
-            checked: recentGlobal.length,
-            removed: contradictionsFound,
-          });
+            scope: sweep.scope ?? 'global',
+            total: sweep.total,
+            checked: sweep.checked,
+            removed: sweep.removed,
+            llmCalls: sweep.llmCalls,
+            nextCursor: sweep.nextCursor,
+            queuedMerges: sweep.queuedMerges,
+            queuedContradictions: sweep.queuedContradictions,
+          }, sweepDuration);
         }
       } catch (err) {
         console.error('[mem0] Contradiction scan error:', err);

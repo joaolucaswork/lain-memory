@@ -62,6 +62,7 @@ const GET_ROUTES = new Set([
   '/health',
   '/api/health',
   '/api/memory/metrics',
+  '/api/memory/contradictions',
   '/api/graph/stats',
   '/api/graph/nodes',
 ]);
@@ -150,8 +151,13 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
       // Fase 4: diagnostic only — detects and reports, never writes.
       // NOOP means "ignore" (not "delete"); UPDATE/DELETE verdicts are
       // actioned by the maintenance/policy flows, not by this scan.
+      // Paged (limit/offset) so 100x LLM no longer times out: callers
+      // iterate offset += limit until scanned < limit.
       const project = data?.project as string | undefined;
-      const memories = await getMemories(project, 100);
+      const limit = Math.min(Math.max(Number(data?.limit ?? 20) || 20, 1), 100);
+      const offset = Math.max(Number(data?.offset ?? 0) || 0, 0);
+      const fetched = await getMemories(project, Math.min(offset + limit, 500));
+      const memories = fetched.slice(offset, offset + limit);
       const results: { id: string; action: string; domainOp: string; reason: string; memory: string }[] = [];
       for (const mem of memories) {
         const similar = await searchMemory(mem.memory, project, 5);
@@ -171,11 +177,43 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
           });
         }
       }
-      return json({ scanned: memories.length, issues: results.length, results, writes: 0 });
+      return json({ scanned: memories.length, issues: results.length, results, writes: 0, limit, offset });
     }
 
     case '/api/memory/metrics':
       return json({ ...getMetrics(), graphOutboxPending: getGraphSyncStatus().pending });
+
+    case '/api/memory/contradictions': {
+      // Item 3: visible backlog — UPDATE merge candidates + DELETE
+      // contradictions queued by the automatic sweep. Read-only.
+      const { listPending } = await import('./pending-review.js');
+      const kind = data?.kind as 'merge' | 'contradiction' | undefined;
+      const limit = Math.min(Math.max(Number(data?.limit ?? 100) || 100, 1), 200);
+      const items = listPending(kind);
+      return json({
+        total: items.length,
+        pending: items.slice(0, limit).map(e => ({
+          id: e.id,
+          kind: e.kind,
+          verdict: e.verdict,
+          scope: e.scope ?? 'global',
+          memoryId: e.memoryId,
+          memory: e.memory.slice(0, 200),
+          relatedIds: e.related.map(r => r.id),
+          reason: e.reason,
+          attempts: e.attempts,
+          detectedAt: e.detectedAt,
+        })),
+      });
+    }
+
+    case '/api/memory/contradictions/dismiss': {
+      if (!data?.id) return json({ error: 'id required' }, 400);
+      const { dismissEntry } = await import('./pending-review.js');
+      const ok = await dismissEntry(data.id);
+      if (!ok) return json({ error: 'entry not found' }, 404);
+      return json({ success: true });
+    }
 
     case '/api/graph/query': {
       const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });

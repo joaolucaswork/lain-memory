@@ -55,6 +55,7 @@ export const CHECKPOINTS_DIR = join(WORKSPACE_DIR, '.checkpoints');
 export const KNOWLEDGE_DIR = join(WORKSPACE_DIR, '.knowledge');
 export const SEEDS_DIR = join(KNOWLEDGE_DIR, 'seeds');
 export const PGS_SESSIONS_DIR = join(KNOWLEDGE_DIR, 'pgs-sessions');
+export const PENDING_REVIEW_PATH = join(KNOWLEDGE_DIR, 'pending-review.json');
 export const MCP_PROFILES_DIR = join(WORKSPACE_DIR, '.mcp-profiles');
 export const NOTES_DIR = join(WORKSPACE_DIR, 'notes');
 export const POOLS_STATE_PATH = join(WORKSPACE_DIR, 'agent-pools.json');
