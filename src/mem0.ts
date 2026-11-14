@@ -1396,6 +1396,7 @@ export async function trashAndDelete(
     let trashId: string | null = null;
     try {
       const saved = await addMemory(snapshot.memory, TRASH_PROJECT, {
+        inferFalse: true, // archive must be byte-identical (no LLM decomposition that can return empty)
         skipQualityCheck: true,
         skipConflictCheck: true,
         skipGraphIngest: true,
