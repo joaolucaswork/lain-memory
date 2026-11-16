@@ -8,6 +8,7 @@ import {
   setMemoryImportance,
   getManyMemoryFeedback,
   attachFeedback,
+  persistHeuristicState,
   FEEDBACK_DEFAULTS,
 } from './mem0.js';
 import { connectRedis, disconnectRedis, getRedis, isRedisAvailable } from './redis.js';
@@ -264,5 +265,22 @@ describe('clearImportance — rollback path', () => {
     expect((await readQdrantState([id])).get(id)).toMatchObject({ exists: true, importance: null });
     expect(await getMemoryImportance(id)).toBeNull();
     expect(await getMemoryFeedback(id)).toEqual(FEEDBACK_DEFAULTS);
+  });
+});
+
+describe('persistHeuristicState — pós-save não-chat (sem LLM)', () => {
+  it('grava importância do regex e mantém kind fact', async () => {
+    const id = await newId();
+    // base .2 + data .1 + valor .1 = .4 (sem .x5 — ponto flutuante não arredonda aqui)
+    await persistHeuristicState('o usuário pagou R$ 200 em 12/03/2026', id);
+    expect(await getMemoryImportance(id)).toBe(0.4);
+    expect((await getMemoryFeedback(id)).kind).toBe('fact');
+  });
+
+  it('marca kind state para relato transitório', async () => {
+    const id = await newId();
+    await persistHeuristicState('o usuário está com dor de cabeça', id);
+    expect(await getMemoryImportance(id)).toBe(0.2);
+    expect((await getMemoryFeedback(id)).kind).toBe('state');
   });
 });

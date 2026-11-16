@@ -702,20 +702,11 @@ Original: ${text}`
   invalidateMem0Cache(project).catch(() => {});
 
   // Fire-and-forget: score and store importance for each saved memory.
-  // chatAtom skips this entirely: the extractor owns importance/kind/
-  // sensitive for chat facts (rememberChatTurn persists them right after
-  // the save) — the regex heuristics must not overwrite extractor values.
+  // Chat atoms skip this entirely (shouldApplyHeuristicState): the extractor
+  // owns their importance/kind — the regex heuristics must not overwrite them.
   for (const item of mapped) {
-    if (item.id && item.id !== 'unknown' && !opts?.chatAtom) {
-      (async () => {
-        const score = scoreImportance(enrichedText);
-        await setMemoryImportance(item.id, score);
-        console.log(`[mem0] Importance scored: ${score.toFixed(2)} for ${item.id.slice(0, 8)}…`);
-        // Tag transient states at save time (fact is the neutral default).
-        if (heuristicKind(enrichedText) === 'state') {
-          await setMemoryFeedback(item.id, { kind: 'state' });
-        }
-      })().catch((err) => console.error(`[mem0] post-save state write failed for ${item.id}:`, err instanceof Error ? err.message : err));
+    if (item.id && item.id !== 'unknown' && shouldApplyHeuristicState(opts)) {
+      persistHeuristicState(enrichedText, item.id).catch((err) => console.error(`[mem0] post-save state write failed for ${item.id}:`, err instanceof Error ? err.message : String(err)));
     }
   }
 
@@ -1064,27 +1055,32 @@ export const IMPORTANCE_DEFAULT = STATE_IMPORTANCE_DEFAULT;
  * Score the importance/poignancy of a memory — puramente algorítmico, sem LLM.
  * Retorna valor em [0.1, 1.0] (arredondado para 1 casa decimal).
  *
+ * Serve SÓ os caminhos que não são chat (seed, add, index, bundle): memórias
+ * de chat ignoram estes regex (chatAtom) e usam a relevance do extrator.
+ * Por isso não há bônus de projeto/fornecedor, saúde ou pessoa aqui — nomes
+ * próprios e termos pessoais são papel do extrator, não desta heurística.
+ *
  * Sinais pontuados (aditivos):
  *   +0.20 base (toda memória começa aqui)
  *   +0.20 keywords críticas (urgente, crash, hotfix, incident, etc.)
  *   +0.10 keywords de bug/erro
- *   +0.15 keywords de decisão/preferência
+ *   +0.15 keywords de decisão/preferência (decidiu, vai usar, ...)
  *   +0.10 padrões de data
- *   +0.10 nomes próprios do projeto (Lucas, Lain, Stripe, Supabase, etc.)
  *   +0.10 valores monetários/numéricos grandes
  *   +0.10 URL (quando text > 80 chars)
  *   +0.05 lista de nomes próprios
  *   +0.05 texto longo (> 150 chars)
  *   -0.10 ações triviais de UI em texto curto (< 80 chars)
+ *   +0.20 saúde/médico (legado pré-extrator; só afeta não-chat)
+ *   +0.15 cargo/identidade (legado pré-extrator; só afeta não-chat)
  */
 export function scoreImportance(text: string): number {
   if (!text) return IMPORTANCE_DEFAULT;
   let score = 0.20;
   if (/\b(critical|urgente?|emerg\u00ean[c\u00e7]ia|crash|falhou|failed|caiu|bug\s+cr\u00edtico|hotfix|incident)\b/i.test(text)) score += 0.20;
-  if (/\b(bug|erro|error|problema|problem|issue)\b/i.test(text)) score += 0.10;
-  if (/\b(decided?|chose|opted?|designed|configured|implemented|resolved|fixed|deployed|prefers?|prefer\u00eancia|always\s+use|must\s+be|decidimos|escolhemos|optamos|prefere|preferem|gosta\s+de|n\u00e3o\s+gosta)\b/i.test(text)) score += 0.15;
+  if (/\b(bug|erro|error|problema|problem|issue|incidentes?)\b/i.test(text)) score += 0.10;
+  if (/\b(decided?|decidiu|chose|opted?|designed|configured|implemented|resolved|fixed|deployed|prefers?|prefer\u00eancia|always\s+use|must\s+be|decidimos|escolhemos|optamos|prefere|preferem|gosta\s+de|n\u00e3o\s+gosta|vai\s+usar)\b/i.test(text)) score += 0.15;
   if (/\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[-\/]\d{2}[-\/]\d{2}/.test(text)) score += 0.10;
-  if (/\b(Lucas|Lain)\b/i.test(text)) score += 0.10;
   if (/R\$[\s]?[\d.,]+|USD[\s]?[\d.,]+|\$[\s]?[\d.,]+|\d+[.,]\d+\s*%|\b\d{5,}\b/.test(text)) score += 0.10;
   if (/https?:\/\/[^\s]+/.test(text) && text.length > 80) score += 0.10;
   if (/[A-Z][a-z\u00e0-\u00fa]+(?:,\s*[A-Z][a-z\u00e0-\u00fa]+){1,}/.test(text)) score += 0.05;
@@ -1095,6 +1091,31 @@ export function scoreImportance(text: string): number {
   // +0.15 cargo/identidade (fatos estáveis sobre quem é a pessoa)
   if (/\b(CEO|CTO|CFO|COO|CPO|founder|co-founder|s[oó]cio|diretor|gerente|presidente|VP|head\s+of|l[ií]der\s+de|respons[aá]vel\s+por)\b/i.test(text)) score += 0.15;
   return Math.min(1.0, Math.max(0.1, Math.round(score * 10) / 10));
+}
+
+/**
+ * Chat atoms carry extractor-owned importance/kind (persisted by
+ * rememberChatTurn) — the regex heuristics must not run for them.
+ * Exported so tests pin the contract without live backends or global mocks
+ * (a spy-based test would need a second mock.module, which collides in one
+ * bun process — see mem0-audit-trail.test.ts).
+ */
+export function shouldApplyHeuristicState(opts?: AddMemoryOpts): boolean {
+  return !opts?.chatAtom;
+}
+
+/**
+ * Heuristic post-save for non-chat paths: regex importance + state tag.
+ * Exported for tests (live Qdrant, no LLM needed).
+ */
+export async function persistHeuristicState(text: string, memoryId: string): Promise<void> {
+  const score = scoreImportance(text);
+  await setMemoryImportance(memoryId, score);
+  console.log(`[mem0] Importance scored: ${score.toFixed(2)} for ${memoryId.slice(0, 8)}…`);
+  // Tag transient states at save time (fact is the neutral default).
+  if (heuristicKind(text) === 'state') {
+    await setMemoryFeedback(memoryId, { kind: 'state' });
+  }
 }
 
 /**
