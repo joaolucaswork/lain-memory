@@ -63,7 +63,7 @@ describe('extractChatFacts', () => {
       },
       async () => ({ facts: [ASSISTANT_FESTIVUS, ASSISTANT_PARKING, ASSISTANT_HINGE, PLOT_NO_SPEAKER, USER_MARKED] }),
     );
-    expect(facts).toEqual([{ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false }]);
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'Reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false }]);
   });
 
   test('aceita o formato novo {text,title} e normaliza o título', async () => {
@@ -71,7 +71,7 @@ describe('extractChatFacts', () => {
       { user: 'to revendo seinfeld', date: '2026-11-14' },
       async () => ({ facts: [{ text: USER_MARKED, title: 'O usuário curtiu a vaga do George.' }] }),
     );
-    expect(facts).toEqual([{ text: USER_MARKED, title: 'curtiu a vaga do George', relevance: 3, kind: 'fact', sensitive: false }]);
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'Curtiu a vaga do George', relevance: 3, kind: 'fact', sensitive: false }]);
   });
 
   test('lista vazia quando o modelo só falou', async () => {
@@ -128,32 +128,32 @@ describe('normalizeChatFactPairs', () => {
     expect(pairs).toHaveLength(5);
     expect(pairs[0]).toEqual({ text: USER_COMFORT, title: 'Seinfeld série conforto', relevance: 3, kind: 'fact', sensitive: false });
     // título vazio cai no fallback do corpo
-    expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false });
-    expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'dorme tarde', relevance: 3, kind: 'fact', sensitive: false });
+    expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'Reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false });
+    expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'Dorme tarde', relevance: 3, kind: 'fact', sensitive: false });
   });
 });
 
 describe('normalizeChatTitle', () => {
   const FACT = 'O usuário toma sertralina 50mg de manhã.';
   test('tira âncora, aspas e ponto final', () => {
-    expect(normalizeChatTitle('O usuário toma sertralina', FACT)).toBe('toma sertralina');
+    expect(normalizeChatTitle('O usuário toma sertralina', FACT)).toBe('Toma sertralina');
     expect(normalizeChatTitle('"Dor pulsante na têmpora."', FACT)).toBe('Dor pulsante na têmpora');
   });
   test('trunca em 6 palavras sem partir palavra', () => {
     expect(normalizeChatTitle('uma duas três quatro cinco seis sete', FACT))
-      .toBe('uma duas três quatro cinco seis');
+      .toBe('Uma duas três quatro cinco seis');
   });
   test('vazio ou não-string cai no fallback do fato', () => {
-    expect(normalizeChatTitle('', FACT)).toBe('toma sertralina 50mg de manhã');
-    expect(normalizeChatTitle(undefined, FACT)).toBe('toma sertralina 50mg de manhã');
-    expect(normalizeChatTitle(42, FACT)).toBe('toma sertralina 50mg de manhã');
+    expect(normalizeChatTitle('', FACT)).toBe('Toma sertralina 50mg de manhã');
+    expect(normalizeChatTitle(undefined, FACT)).toBe('Toma sertralina 50mg de manhã');
+    expect(normalizeChatTitle(42, FACT)).toBe('Toma sertralina 50mg de manhã');
   });
 });
 
 describe('fallbackTitleFromFact', () => {
   test('corpo com cópula: ancora + "está com" somem', () => {
     expect(fallbackTitleFromFact('O usuário está com dor pulsante na têmpora.'))
-      .toBe('dor pulsante na têmpora');
+      .toBe('Dor pulsante na têmpora');
   });
   test('"tem Seinfeld" vira substantivo na frente', () => {
     expect(fallbackTitleFromFact(USER_COMFORT)).toBe('Seinfeld como série conforto já');
@@ -161,7 +161,7 @@ describe('fallbackTitleFromFact', () => {
   test('marcador de passado sai, fato fica', () => {
     expect(fallbackTitleFromFact(
       'Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.'
-    )).toBe('vivia chapado tinha dor pulsante');
+    )).toBe('Vivia chapado tinha dor pulsante');
   });
 });
 
@@ -277,7 +277,7 @@ describe('sanitizeChatRating', () => {
 
   test('normalizeChatFactPairs preserva rating válido', () => {
     const facts = normalizeChatFactPairs([{ text: USER_COMFORT, title: 'conforto', relevance: 5, kind: 'state', sensitive: true }]);
-    expect(facts).toEqual([{ text: USER_COMFORT, title: 'conforto', relevance: 5, kind: 'state', sensitive: true }]);
+    expect(facts).toEqual([{ text: USER_COMFORT, title: 'Conforto', relevance: 5, kind: 'state', sensitive: true }]);
   });
 });
 

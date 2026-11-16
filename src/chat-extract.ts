@@ -139,6 +139,16 @@ function cleanTitleText(s: string): string {
 const stripWordPunct = (w: string) => w.replace(/^[.,;:«»“”"'()]+|[.,;:«»“”"'()]+$/g, '');
 
 /**
+ * Archive convention: titles open capitalized ("Dor pulsante…", never
+ * "dor pulsante…"). The extractor prompt shows lowercase examples and the
+ * model copies their case — deterministic fix here, not another LLM call.
+ */
+function capitalizeTitleHead(t: string): string {
+  if (!t) return t;
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+/**
  * Deterministic fallback title from the fact body: strip the past-marker
  * clause, the "o usuário" anchor and filler openers, keep the first 5 words.
  * Never empty for an accepted fact (falls back to raw head words).
@@ -154,8 +164,8 @@ export function fallbackTitleFromFact(fact: string): string {
   }
   const words = t.split(/\s+/).filter(Boolean).map(stripWordPunct).filter(Boolean);
   const kept = words.slice(0, 5);
-  if (kept.length > 0) return kept.join(' ');
-  return t.split(/\s+/).filter(Boolean).slice(0, 5).join(' ');
+  if (kept.length > 0) return capitalizeTitleHead(kept.join(' '));
+  return capitalizeTitleHead(t.split(/\s+/).filter(Boolean).slice(0, 5).join(' '));
 }
 
 /**
@@ -165,12 +175,12 @@ export function fallbackTitleFromFact(fact: string): string {
  */
 export function normalizeChatTitle(raw: unknown, factText: string): string {
   const cleaned = typeof raw === 'string' ? cleanTitleText(raw) : '';
-  if (!cleaned) return fallbackTitleFromFact(factText);
+  if (!cleaned) return capitalizeTitleHead(fallbackTitleFromFact(factText));
   const words = cleaned.split(/\s+/).filter(Boolean);
   if (words.length > TITLE_MAX_WORDS) {
-    return words.slice(0, TITLE_MAX_WORDS).map(stripWordPunct).filter(Boolean).join(' ');
+    return capitalizeTitleHead(words.slice(0, TITLE_MAX_WORDS).map(stripWordPunct).filter(Boolean).join(' '));
   }
-  return cleaned;
+  return capitalizeTitleHead(cleaned);
 }
 
 /** Drop assistant voice, plot dumps, greetings, and duplicates. Cap at 5. Accepts legacy plain-string items. */
@@ -227,18 +237,18 @@ Regras:
 - Cada fato é um objeto {"text","title","relevance","kind","sensitive"}.
 - "text": UMA frase curta, em português, sobre a pessoa, e deve conter "o usuário".
 - "text" precisa fazer sentido SOZINHO, sem ler a conversa. Teste: se o fato contiver pronome ou demonstrativo sem referente explícito ("isso", "essa mistura", "ele"), está errado — reescreva com o nome explícito.
-- "title": título curtíssimo do fato em português, ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der.
+- "title": título curtíssimo do fato em português, ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Primeira letra maiúscula. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der.
 - ${CHAT_FACT_RATING_CRITERIA}
 - No máximo ${MAX_CHAT_FACTS}. Sem "o assistente comentou", sem roteiro, sem citação de diálogo.
 - Não invente: só use nomes que aparecem no turno ou na fala do assistente.
 
 Exemplos:
-- PESSOA: "como todas as noites e nunca enjoo" + ASSISTENTE citando "banana assada com batata doce, ovo e queijo" → {"facts":[{"text":"O usuário come banana assada com batata doce, ovo e queijo no almoço e no jantar e nunca enjoa.","title":"banana assada com batata doce","relevance":3,"kind":"fact","sensitive":false}]}
+- PESSOA: "como todas as noites e nunca enjoo" + ASSISTENTE citando "banana assada com batata doce, ovo e queijo" → {"facts":[{"text":"O usuário come banana assada com batata doce, ovo e queijo no almoço e no jantar e nunca enjoa.","title":"Banana assada com batata doce","relevance":3,"kind":"fact","sensitive":false}]}
 - PESSOA: "oi" → {"facts":[]}
 - PESSOA: "sim" + ASSISTENTE: "Você gostou do filme?" → {"facts":[]}
 - PESSOA: "fechado" + ASSISTENTE: "Proponho usar o Haiku 5.5 na conversa, topa?" → {"facts":[{"text":"O usuário aceitou usar o Haiku 5.5 como modelo de conversa.","title":"Haiku 5.5 como modelo","relevance":3,"kind":"fact","sensitive":false}]}
-- PESSOA: "antes eu so vivia chapado, e com essa dor pulsante na têmpora, vivia fumando e trabalhando 24h, o que resultou no surto que tive" → {"facts":[{"text":"Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.","title":"época agitada antes do surto","relevance":5,"kind":"fact","sensitive":true}]}
-- PESSOA: "hoje estou com dor pulsante na têmpora" → {"facts":[{"text":"O usuário está com dor pulsante na têmpora.","title":"dor pulsante na têmpora","relevance":2,"kind":"state","sensitive":false}]}
+- PESSOA: "antes eu so vivia chapado, e com essa dor pulsante na têmpora, vivia fumando e trabalhando 24h, o que resultou no surto que tive" → {"facts":[{"text":"Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.","title":"Época agitada antes do surto","relevance":5,"kind":"fact","sensitive":true}]}
+- PESSOA: "hoje estou com dor pulsante na têmpora" → {"facts":[{"text":"O usuário está com dor pulsante na têmpora.","title":"Dor pulsante na têmpora","relevance":2,"kind":"state","sensitive":false}]}
 
 Data da conversa: ${date}
 
@@ -269,7 +279,7 @@ export function isTitleCandidate(item: { memory?: unknown; title?: unknown }): b
 export function buildTitlePrompt(factText: string): string {
   return `Dê um título curtíssimo em português para este fato de memória de longo prazo.
 
-Regras: ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der. Só use palavras do fato — não invente.
+Regras: ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Primeira letra maiúscula. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der. Só use palavras do fato — não invente.
 
 Fato: ${factText.trim()}
 
