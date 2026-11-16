@@ -1,0 +1,82 @@
+/**
+ * Graph routes (server split S3).
+ *
+ * All /api/graph/* handlers: query, stats, nodes, removals,
+ * autoclean, dump, ingest, sync.
+ */
+
+import {
+  appendGraphOutbox,
+  cachedGetGraphForPGS,
+  cachedGetStats,
+  getGraphSyncStatus,
+  ingestExtracted,
+  listAllNodes,
+  query as graphQuery,
+  reconcileGraph,
+  removeNodes,
+  removeRelationships,
+  runAutoclean,
+} from '../../graphrag.js';
+import { json, type Handler } from '../http.js';
+
+export const handleGraphQuery: Handler = async (data) => {
+  const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
+  return json(ctx);
+};
+
+export const handleGraphStats: Handler = async (data) => {
+  return json(await cachedGetStats(data.project));
+};
+
+export const handleGraphNodes: Handler = async (data) => {
+  return json(listAllNodes(data.project));
+};
+
+export const handleGraphRemoveNodes: Handler = async (data) => {
+  const ids = data.ids as string[];
+  if (!ids || !Array.isArray(ids)) return json({ error: 'ids array required' }, 400);
+  return json({ removed: await removeNodes(ids, data.project) });
+};
+
+export const handleGraphRemoveRelationships: Handler = async (data) => {
+  const { source, predicates, targets, project } = data;
+  if (!source) return json({ error: 'source required' }, 400);
+  return json({ removed: await removeRelationships(source, predicates, targets, project) });
+};
+
+export const handleGraphAutoclean: Handler = async (_data) => {
+  return json(await runAutoclean());
+};
+
+export const handleGraphDump: Handler = async (data) => {
+  // Full graph payload for PGS sweeps running outside this server.
+  return json(await cachedGetGraphForPGS(data.project));
+};
+
+export const handleGraphIngest: Handler = async (data) => {
+  // Pre-extracted payload: applied directly (synchronous, no LLM).
+  // On failure the payload is queued durably and reported (Fase 3).
+  try {
+    await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds });
+    return json({ success: true });
+  } catch (err) {
+    try {
+      appendGraphOutbox({
+        entities: data.entities ?? [],
+        relationships: data.relationships ?? [],
+        project: data.project,
+        sourceIds: data.sourceIds,
+      });
+      return json({ success: true, queued: true });
+    } catch {
+      throw err;
+    }
+  }
+};
+
+export const handleGraphSync: Handler = async (_data) => {
+  // Fase 3: drain outbox (incl. crash recovery) and report divergence state.
+  const [report, status] = [await reconcileGraph(), getGraphSyncStatus()];
+  return json({ ...report, lastError: status.lastError, lastReconciledAt: status.lastReconciledAt });
+};

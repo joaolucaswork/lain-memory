@@ -15,16 +15,7 @@ import {
 } from './mem0.js';
 import {
   initGraph,
-  query as graphQuery,
-  cachedGetStats,
   cachedGetGraphForPGS,
-  listAllNodes,
-  removeNodes,
-  removeRelationships,
-  runAutoclean,
-  ingestExtracted,
-  getGraphSyncStatus,
-  reconcileGraph,
 } from './graphrag.js';
 import {
   handleAdd,
@@ -47,6 +38,17 @@ import {
   handleResolveEntities,
   handleScan,
 } from './server/routes/memory-read.js';
+import {
+  handleGraphAutoclean,
+  handleGraphDump,
+  handleGraphIngest,
+  handleGraphNodes,
+  handleGraphQuery,
+  handleGraphRemoveNodes,
+  handleGraphRemoveRelationships,
+  handleGraphStats,
+  handleGraphSync,
+} from './server/routes/graph.js';
 import { json } from './server/http.js';
 import { extractSeed, listSeeds } from './seed-extraction.js';
 import { PGSEngine } from './pgs/index.js';
@@ -136,64 +138,32 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/memory/contradictions/dismiss':
       return handleContradictionsDismiss(data);
 
-    case '/api/graph/query': {
-      const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
-      return json(ctx);
-    }
+    case '/api/graph/query':
+      return handleGraphQuery(data);
 
     case '/api/graph/stats':
-      return json(await cachedGetStats(data.project));
+      return handleGraphStats(data);
 
     case '/api/graph/nodes':
-      return json(listAllNodes(data.project));
+      return handleGraphNodes(data);
 
-    case '/api/graph/remove-nodes': {
-      const ids = data.ids as string[];
-      if (!ids || !Array.isArray(ids)) return json({ error: 'ids array required' }, 400);
-      return json({ removed: await removeNodes(ids, data.project) });
-    }
+    case '/api/graph/remove-nodes':
+      return handleGraphRemoveNodes(data);
 
-    case '/api/graph/remove-relationships': {
-      const { source, predicates, targets, project } = data;
-      if (!source) return json({ error: 'source required' }, 400);
-      return json({ removed: await removeRelationships(source, predicates, targets, project) });
-    }
+    case '/api/graph/remove-relationships':
+      return handleGraphRemoveRelationships(data);
 
     case '/api/graph/autoclean':
-      return json(await runAutoclean());
+      return handleGraphAutoclean(data);
 
-    case '/api/graph/dump': {
-      // Full graph payload for PGS sweeps running outside this server.
-      return json(await cachedGetGraphForPGS(data.project));
-    }
+    case '/api/graph/dump':
+      return handleGraphDump(data);
 
-    case '/api/graph/ingest': {
-      // Pre-extracted payload: applied directly (synchronous, no LLM).
-      // On failure the payload is queued durably and reported (Fase 3).
-      try {
-        await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds });
-        return json({ success: true });
-      } catch (err) {
-        try {
-          const { appendGraphOutbox } = await import('./graphrag.js');
-          appendGraphOutbox({
-            entities: data.entities ?? [],
-            relationships: data.relationships ?? [],
-            project: data.project,
-            sourceIds: data.sourceIds,
-          });
-          return json({ success: true, queued: true });
-        } catch {
-          throw err;
-        }
-      }
-    }
+    case '/api/graph/ingest':
+      return handleGraphIngest(data);
 
-    case '/api/graph/sync': {
-      // Fase 3: drain outbox (incl. crash recovery) and report divergence state.
-      const [report, status] = [await reconcileGraph(), getGraphSyncStatus()];
-      return json({ ...report, lastError: status.lastError, lastReconciledAt: status.lastReconciledAt });
-    }
+    case '/api/graph/sync':
+      return handleGraphSync(data);
 
     case '/api/seed/extract': {
       // Chunked fact/entity extraction from raw text or PDFs into seed files.
