@@ -17,6 +17,7 @@ import {
   cachedSearchMemory,
   getMemories,
   deleteMemory,
+  deleteState,
   updateMemory,
   applyMemoryFeedback,
   snapshotMemories,
@@ -135,6 +136,10 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
         return json({ error: 'could not archive before delete — original preserved' }, 500);
       }
       await deleteMemory(data.memory_id);
+      // No snapshot existed (id already gone from this scope's listing) —
+      // still evict state leftovers (L2). Best-effort.
+      await deleteState(data.memory_id).catch((err) =>
+        console.error(`[lain-memory] forget state cleanup failed for ${data.memory_id}:`, err instanceof Error ? err.message : err));
       return json({ success: true, trashId: null, blocked: false });
     }
 

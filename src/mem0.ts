@@ -15,12 +15,16 @@ import { getRedis, isRedisAvailable } from './redis.js';
 import {
   FEEDBACK_DEFAULTS as STATE_FEEDBACK_DEFAULTS,
   IMPORTANCE_DEFAULT as STATE_IMPORTANCE_DEFAULT,
+  STATE_SNAPSHOT_KEY,
   getManyState,
   getFeedback as stateGetFeedback,
   getManyFeedback as stateGetManyFeedback,
   getImportance as stateGetImportance,
   setFeedback as stateSetFeedback,
   setImportance as stateSetImportance,
+  deleteState as stateDeleteState,
+  isDefaultState,
+  parseStateSnapshot,
   type FeedbackKind as StateFeedbackKind,
   type FeedbackStatus as StateFeedbackStatus,
   type MemoryFeedback as StateMemoryFeedback,
@@ -1200,6 +1204,15 @@ export async function attachFeedback<T extends { id: string }>(items: T[]): Prom
 }
 
 /**
+ * Remove a memory's feedback/importance (forget / trash / policy cleanup).
+ * The Qdrant payload dies with the point; this evicts leftovers (L2) and is
+ * idempotent. Swallows Not Found; throws on other Qdrant errors.
+ */
+export async function deleteState(memoryId: string): Promise<void> {
+  await stateDeleteState(memoryId);
+}
+
+/**
  * Merge patch into stored feedback (creates with defaults when absent).
  * Fail-hard: throws when Qdrant cannot persist (the route surfaces 500).
  */
@@ -1499,6 +1512,17 @@ export async function trashAndDelete(
   provenance: TrashProvenance,
 ): Promise<{ trashId: string | null; deleted: boolean }> {
   if (!snapshot.missing && snapshot.memory) {
+    // Snapshot user state BEFORE deleting — the Qdrant payload (and its
+    // lain_feedback/lain_importance) dies with the point. Stashed in the
+    // trash copy's metadata so restoreFromTrash can reapply it in full.
+    // Reads never throw; default state is simply not snapshotted.
+    let stateSnapshot: { feedback: MemoryFeedback; importance: number | null } | null = null;
+    try {
+      const cur = (await getManyState([snapshot.id])).get(snapshot.id);
+      if (cur && !isDefaultState(cur.feedback, cur.importance)) {
+        stateSnapshot = { feedback: cur.feedback, importance: cur.importance };
+      }
+    } catch { /* defensive — the trash copy still proceeds */ }
     let trashId: string | null = null;
     try {
       const saved = await addMemory(snapshot.memory, TRASH_PROJECT, {
@@ -1514,6 +1538,7 @@ export async function trashAndDelete(
           reason: provenance.reason,
           trigger: provenance.trigger,
           ...(provenance.replacedById ? { replaced_by: provenance.replacedById } : {}),
+          ...(stateSnapshot ? { [STATE_SNAPSHOT_KEY]: stateSnapshot } : {}),
           trashed_at: new Date().toISOString(),
         },
       });
@@ -1527,6 +1552,10 @@ export async function trashAndDelete(
       return { trashId: null, deleted: false };
     }
     await deleteMemory(snapshot.id);
+    // The point (and its payload state) is gone; evict leftovers (L2).
+    // Best-effort: cleanup must not fail an otherwise complete archive.
+    await stateDeleteState(snapshot.id).catch((err) =>
+      console.error(`[mem0] post-delete state cleanup failed for ${snapshot.id}:`, err instanceof Error ? err.message : err));
     return { trashId, deleted: true };
   }
   console.error(`[mem0] refusing to delete ${snapshot.id} without a trash copy (missing/empty snapshot) — preserved`);
@@ -1583,9 +1612,21 @@ export async function restoreFromTrash(trashId: string): Promise<RestoreResult> 
     console.error(`[mem0] restore re-save unconfirmed for ${trashId} — trash preserved`);
     return { id: null, restored: false, reason: 're-save unconfirmed' };
   }
-  // Preserve an explicit `state` vote from before the forget (the auto
-  // heuristic may not re-fire on the restored text).
-  if (originalId) {
+  // Reapply the state snapshot stashed in the trash copy (full fidelity:
+  // confidence, correct_count, title, importance...). Trash copies written
+  // before snapshots fall back to the old kind-only preservation.
+  const stateSnapshot = parseStateSnapshot(meta[STATE_SNAPSHOT_KEY]);
+  if (stateSnapshot) {
+    try {
+      await setMemoryFeedback(savedId, stateSnapshot.feedback);
+      if (stateSnapshot.importance !== null) await setMemoryImportance(savedId, stateSnapshot.importance);
+    } catch (err) {
+      console.error(`[mem0] restore state re-apply failed for ${trashId} — trash preserved:`, err instanceof Error ? err.message : err);
+      return { id: savedId, restored: false, reason: 'state restore failed' };
+    }
+  } else if (originalId) {
+    // Preserve an explicit `state` vote from before the forget (the auto
+    // heuristic may not re-fire on the restored text).
     try {
       const originalFeedback = await getMemoryFeedback(originalId);
       if (originalFeedback.kind === 'state') {
@@ -1594,6 +1635,9 @@ export async function restoreFromTrash(trashId: string): Promise<RestoreResult> 
     } catch { /* keep heuristic kind */ }
   }
   await deleteMemory(trashId);
+  // Evict the trash copy's leftovers (L2). Best-effort.
+  await stateDeleteState(trashId).catch((err) =>
+    console.error(`[mem0] post-restore state cleanup failed for ${trashId}:`, err instanceof Error ? err.message : err));
   await removeFromBlocklist(found.memory);
   return { id: savedId, restored: true };
 }

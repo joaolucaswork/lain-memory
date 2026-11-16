@@ -1,4 +1,4 @@
-import { describe, it, expect, mock, beforeEach, afterEach, afterAll } from 'bun:test';
+import { describe, it, expect, mock, beforeAll, beforeEach, afterEach, afterAll } from 'bun:test';
 
 import * as realMem0aiOssNs from 'mem0ai/oss';
 const realMem0aiOss = { ...realMem0aiOssNs };
@@ -9,6 +9,10 @@ const realMaintenance = { ...realMaintenanceNs };
 // Must mock mem0ai/oss (it loads sqlite3 native binary) before importing mem0.ts
 const calls: { getAll: unknown[]; add: unknown[]; delete: string[] } = { getAll: [], add: [], delete: [] };
 let cannedGetAll: { results: unknown[] } = { results: [] };
+// Controllable per-test doubles for trash/restore state tests (issue #10).
+// Defaults reproduce the original mock exactly (fixed trash id, no trash scope).
+let cannedAddId = 'trash-id-1';
+let cannedTrashList: unknown[] | null = null;
 // Fase 4 failure injection (default off — existing tests unaffected)
 let failAdd = false;
 const failDeleteFor = new Set<string>();
@@ -19,12 +23,15 @@ mock.module('mem0ai/oss', () => ({
     constructor(..._args: unknown[]) {}
     async getAll(params: unknown) {
       calls.getAll.push(params);
+      if (cannedTrashList !== null && (params as any)?.filters?.user_id === 'lucas:trash') {
+        return { results: cannedTrashList };
+      }
       return cannedGetAll;
     }
     async add(messages: unknown, config: unknown) {
       if (failAdd) throw new Error('add failed');
       calls.add.push({ messages, config });
-      return { results: [{ id: 'trash-id-1', memory: 'copied' }] };
+      return { results: [{ id: cannedAddId, memory: 'copied' }] };
     }
     async delete(id: string) {
       if (failDeleteFor.has(id)) throw new Error('delete failed');
@@ -56,6 +63,8 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     maintenanceCalls.length = 0;
     failAdd = false;
     failDeleteFor.clear();
+    cannedAddId = 'trash-id-1';
+    cannedTrashList = null;
     cannedGetAll = {
       results: [
         { id: 'aaa', memory: 'Full text of memory A with details worth keeping verbatim.', created_at: '2026-10-01T00:00:00.000Z' },
@@ -188,6 +197,145 @@ describe('delete audit trail (snapshot-before-delete + trash)', () => {
     expect(report.failed).toHaveLength(1);
     expect(report.failed[0].id).toBe('aaa');
     expect(report.failed[0].error).toContain('delete failed');
+  });
+});
+
+describe('trash state snapshot + restore (issue #10)', () => {
+  // Real Qdrant points (no LLM — direct upsert via test-points helper).
+  // Mocked Memory above handles the mem0 calls; memory-state hits Qdrant.
+  let dir: string;
+  const statePointIds: string[] = [];
+
+  beforeAll(async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    dir = mkdtempSync(join(tmpdir(), 'trash-state-test-'));
+    (mem0 as any).__setBlocklistPathForTests(join(dir, 'forget-blocklist.json'));
+    const { newTestPoint, deleteTestPoints } = await import('./test-points.js');
+    const probe = await newTestPoint('trash-state-probe');
+    await deleteTestPoints([probe]);
+  });
+
+  afterAll(async () => {
+    (mem0 as any).__setBlocklistPathForTests(null);
+    const { rmSync } = await import('node:fs');
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    const { deleteTestPoints } = await import('./test-points.js');
+    await deleteTestPoints(statePointIds).catch(() => {});
+  });
+
+  it('trashAndDelete stashes state in the trash copy and cleans the original', async () => {
+    const { trashAndDelete, setMemoryFeedback, setMemoryImportance, getMemoryFeedback, getMemoryImportance } = mem0 as any;
+    const { newTestPoint } = await import('./test-points.js');
+    const { STATE_SNAPSHOT_KEY, FEEDBACK_DEFAULTS } = await import('./memory-state.js');
+    const originalId = await newTestPoint('trash-orig');
+    statePointIds.push(originalId);
+    calls.add.length = 0;
+    calls.delete.length = 0;
+
+    const voted = await setMemoryFeedback(originalId, {
+      confidence: 1.0, correct_count: 2, title: 'titulo x', kind: 'state',
+    });
+    await setMemoryImportance(originalId, 0.9);
+
+    const result = await trashAndDelete(
+      { id: originalId, memory: 'texto original neutro para o trash' },
+      undefined,
+      { reason: 'test forget', trigger: 'test' },
+    );
+    expect(result).toEqual({ trashId: 'trash-id-1', deleted: true });
+
+    // Trash copy carried the full state snapshot in its metadata.
+    expect(calls.add).toHaveLength(1);
+    expect((calls.add[0] as any).config.metadata.original_id).toBe(originalId);
+    expect((calls.add[0] as any).config.metadata[STATE_SNAPSHOT_KEY]).toEqual({
+      feedback: voted,
+      importance: 0.9,
+    });
+
+    // Original point deleted (mock) and its state cleaned (real Qdrant+L2).
+    expect(calls.delete).toEqual([originalId]);
+    expect(await getMemoryFeedback(originalId)).toEqual(FEEDBACK_DEFAULTS);
+    expect(await getMemoryImportance(originalId)).toBeNull();
+  });
+
+  it('trashAndDelete skips the snapshot when state is default', async () => {
+    const { trashAndDelete } = mem0 as any;
+    const { newTestPoint } = await import('./test-points.js');
+    const { STATE_SNAPSHOT_KEY } = await import('./memory-state.js');
+    const originalId = await newTestPoint('trash-plain');
+    statePointIds.push(originalId);
+    calls.add.length = 0;
+
+    const result = await trashAndDelete(
+      { id: originalId, memory: 'texto sem nenhum voto' },
+      undefined,
+      { reason: 't', trigger: 't' },
+    );
+    expect(result.deleted).toBe(true);
+    expect((calls.add[0] as any).config.metadata[STATE_SNAPSHOT_KEY]).toBeUndefined();
+  });
+
+  it('restoreFromTrash reapplies feedback + importance from the snapshot', async () => {
+    const { restoreFromTrash, getMemoryFeedback, getMemoryImportance, scoreImportance, addToBlocklist, isBlocklisted } = mem0 as any;
+    const { newTestPoint } = await import('./test-points.js');
+    const { STATE_SNAPSHOT_KEY } = await import('./memory-state.js');
+    const TEXT = 'o usuario prefere bun para tooling javascript';
+    // Race-proof by construction: addMemory's fire-and-forget scoring writes
+    // scoreImportance(TEXT) to the new point concurrently — the snapshot
+    // carries exactly that value, so write order is irrelevant. Feedback is
+    // only ever written by the restore path (TEXT is not state-heuristic).
+    const importance = scoreImportance(TEXT);
+    const snapshotFeedback = {
+      confidence: 1.0, last_confirmed_at: null, status: 'active',
+      kind: 'fact', sensitive: false, correct_count: 3, title: 'titulo y',
+    };
+    const { newTestPoint: mk } = await import('./test-points.js');
+    const trashId = await mk('trash-copy');
+    const restoredId = await mk('restore-target');
+    statePointIds.push(trashId, restoredId);
+
+    cannedTrashList = [{
+      id: trashId,
+      memory: TEXT,
+      created_at: new Date().toISOString(),
+      metadata: {
+        original_id: 'original-gone',
+        deleted_from: 'global',
+        trashed_at: new Date().toISOString(),
+        [STATE_SNAPSHOT_KEY]: { feedback: snapshotFeedback, importance },
+      },
+    }];
+    cannedAddId = restoredId;
+    calls.add.length = 0;
+    calls.delete.length = 0;
+
+    await addToBlocklist(TEXT);
+    expect(await isBlocklisted(TEXT)).toBe(true);
+
+    const result = await restoreFromTrash(trashId);
+    expect(result).toEqual({ id: restoredId, restored: true });
+
+    // Full-fidelity state came back (the IIFE never writes feedback for this text).
+    expect(await getMemoryFeedback(restoredId)).toEqual(snapshotFeedback);
+    expect(await getMemoryImportance(restoredId)).toBe(importance);
+    // Trash copy gone and blocklist lifted.
+    expect(calls.delete).toContain(trashId);
+    expect(await isBlocklisted(TEXT)).toBe(false);
+  });
+
+  it('deleteState evicts feedback + importance without touching the point', async () => {
+    const { setMemoryFeedback, setMemoryImportance, getMemoryFeedback, getMemoryImportance, deleteState } = mem0 as any;
+    const { newTestPoint } = await import('./test-points.js');
+    const { FEEDBACK_DEFAULTS } = await import('./memory-state.js');
+    const id = await newTestPoint('delete-state');
+    statePointIds.push(id);
+    await setMemoryFeedback(id, { confidence: 1.0 });
+    await setMemoryImportance(id, 0.9);
+    await deleteState(id);
+    expect(await getMemoryFeedback(id)).toEqual(FEEDBACK_DEFAULTS);
+    expect(await getMemoryImportance(id)).toBeNull();
   });
 });
 

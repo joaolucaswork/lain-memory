@@ -64,6 +64,40 @@ export const IMPORTANCE_DEFAULT = 0.5;
 export const LAIN_FEEDBACK_KEY = 'lain_feedback';
 export const LAIN_IMPORTANCE_KEY = 'lain_importance';
 
+/** Trash-copy metadata key carrying the state snapshot for restore. */
+export const STATE_SNAPSHOT_KEY = 'lain_state_snapshot';
+
+/** Full user-state snapshot (stashed in trash metadata, reapplied on restore). */
+export interface StateSnapshot {
+  feedback: MemoryFeedback;
+  importance: number | null;
+}
+
+/** True when the state is neutral defaults (nothing worth snapshotting). */
+export function isDefaultState(feedback: MemoryFeedback, importance: number | null): boolean {
+  return importance === null
+    && feedback.confidence === FEEDBACK_DEFAULTS.confidence
+    && feedback.last_confirmed_at === null
+    && feedback.status === 'active'
+    && feedback.kind === 'fact'
+    && feedback.sensitive === false
+    && feedback.correct_count === 0
+    && feedback.title === null;
+}
+
+/** Validate + sanitize a snapshot read from trash metadata. Null when absent/invalid/default. */
+export function parseStateSnapshot(raw: unknown): StateSnapshot | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const s = raw as Record<string, unknown>;
+  if (!s['feedback'] || typeof s['feedback'] !== 'object') return null;
+  const feedback = sanitizeFeedback(s['feedback'] as Partial<MemoryFeedback>);
+  const importance = typeof s['importance'] === 'number' && !isNaN(s['importance'] as number)
+    ? (s['importance'] as number)
+    : null;
+  if (isDefaultState(feedback, importance)) return null;
+  return { feedback, importance };
+}
+
 // L2 cache keys/TTLs (same names as the old Redis-only store, so the
 // migration script and any lingering keys keep working as cache).
 const FEEDBACK_L2_TTL = 365 * 24 * 60 * 60; // 1 year
