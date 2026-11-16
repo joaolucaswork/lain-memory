@@ -18,6 +18,38 @@ import { getRedis, isRedisAvailable } from './redis.js';
 import { shouldRejectEntity, shouldRejectRelationship, sweepGraph, type SweepResult } from './graph-autoclean.js';
 import { withDistributedLock } from './distributed-lock.js';
 import { incrementMetric } from './mem-metrics.js';
+import {
+  debouncedSave,
+  ENABLED,
+  entitySimilarity,
+  getGraph,
+  getStats,
+  isNodeVisibleToProject,
+  MAX_CONTEXT_NODES,
+  MAX_DEPTH,
+  mergeSources,
+  nodeProject,
+  normalize,
+  normalizeProject,
+  relationshipKey,
+  resolveNodeId,
+  saveGraph,
+  scopedId,
+  upsertEntity,
+  upsertRelationship,
+} from './graphrag/store.js';
+export {
+  getStats,
+  initGraph,
+  isGraphEnabled,
+  isNodeVisibleToProject,
+  nodeProject,
+  normalizeProject,
+  relationshipKey,
+  resolveNodeId,
+  SCOPE_SEPARATOR,
+  scopedId,
+} from './graphrag/store.js';
 import type {
   DecisionAttrs,
   DecisionInput,
@@ -38,14 +70,6 @@ export type {
   GraphOutboxEntry,
   RelationshipAttrs,
 } from './graphrag/types.js';
-
-const GRAPH_FILENAME = INSTANCE_ID ? `graph-${INSTANCE_ID}.json` : 'graph.json';
-const GRAPH_PATH = path.join(KNOWLEDGE_DIR, GRAPH_FILENAME);
-const GRAPH_SCHEMA_VERSION = 1;
-const MAX_CONTEXT_NODES = getConfig().graphrag.maxContextNodes;
-const MAX_DEPTH = getConfig().graphrag.maxDepth;
-const SAVE_DEBOUNCE_MS = getConfig().graphrag.saveDebounceMs;
-const ENABLED = getConfig().graphrag.enabled;
 
 // ─── Redis Cache ───
 
@@ -99,146 +123,9 @@ export async function invalidateGraphCache(): Promise<void> {
 
 // ─── Types ───
 
-interface GraphFile {
-  version: number;
-  exportedAt: number;
-  graph: ReturnType<Graph['export']>;
-}
-
 interface ExtractionResult {
   entities: Array<{ name: string; type: EntityType; description: string }>;
   relationships: Array<{ subject: string; predicate: string; object: string }>;
-}
-
-// ─── State ───
-
-let graph: Graph;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-
-function normalize(name: string): string {
-  return name.toLowerCase().trim()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/\s+/g, ' ');
-}
-
-// ─── Project scope (Fase 2) ───
-//
-// Policy v1 (mirrors Mem0's userId scheme `lucas` vs `lucas:project`):
-// - ingest WITHOUT project → GLOBAL nodes (bare normalized ids), visible everywhere.
-// - ingest WITH project P → LOCAL nodes (`p::name`), visible only to queries
-//   with project P (plus global nodes, which are always visible).
-// - No cross-scope edges in v1: every ingest scopes all endpoints uniformly.
-// - Legacy bare ids (pre-scope data) read as GLOBAL: no rewrite, rollback-safe.
-// - Promotion local→global is explicitly out of scope for v1.
-
-export const SCOPE_SEPARATOR = '::';
-
-export function normalizeProject(project: string): string {
-  return normalize(project).replace(/\s+/g, '-');
-}
-
-/** Scoped node id. Preserves already-qualified ids (idempotent). */
-export function scopedId(name: string, project?: string): string {
-  const normalized = normalize(name);
-  if (!project) return normalized;
-  const scope = normalizeProject(project);
-  if (!scope) return normalized;
-  if (normalized.startsWith(`${scope}${SCOPE_SEPARATOR}`)) return normalized;
-  return `${scope}${SCOPE_SEPARATOR}${normalized}`;
-}
-
-/** Project prefix of a node id, or undefined for global/legacy nodes. */
-export function nodeProject(id: string): string | undefined {
-  const idx = id.indexOf(SCOPE_SEPARATOR);
-  if (idx <= 0) return undefined;
-  return id.slice(0, idx) || undefined;
-}
-
-/**
- * Visibility rule (explicit contract — Opção 2: compatibilidade documentada).
- * - Scoped read (project P): global nodes + P's local nodes. Never another
- *   project's locals.
- * - Unscoped read (no project): EVERYTHING (legacy/admin behavior, NOT
- *   global-only). Pre-scope consumers keep seeing the same data as before.
- *   Restricted to trusted consumers — do not expose unscoped reads to
- *   untrusted multi-user clients.
- * - Explicit all-projects read (project '*'): same as unscoped. Prefer this
- *   over omitting the parameter when you mean "all projects" — it declares
- *   intent and survives the future multi-user flip (unscoped reads will
- *   become global-only; '*' will keep meaning all).
- */
-export function isNodeVisibleToProject(id: string, project?: string): boolean {
-  if (!project || project === '*') return true;
-  const scope = nodeProject(id);
-  if (!scope) return true;
-  return scope === normalizeProject(project);
-}
-
-/** Resolve user input (bare or qualified) to a stored node id. */
-export function resolveNodeId(input: string, project?: string): string {
-  const normalized = normalize(input);
-  if (normalized.includes(SCOPE_SEPARATOR)) return normalized;
-  return scopedId(normalized, project);
-}
-
-// ─── Initialization & Persistence ───
-
-export async function initGraph(): Promise<void> {
-  if (!existsSync(KNOWLEDGE_DIR)) mkdirSync(KNOWLEDGE_DIR, { recursive: true });
-
-  graph = new Graph({ type: 'directed', multi: true });
-
-  if (existsSync(GRAPH_PATH)) {
-    try {
-      const file = await Bun.file(GRAPH_PATH).json() as GraphFile;
-      if (file.version !== GRAPH_SCHEMA_VERSION) {
-        console.warn(`[graphrag] Schema version mismatch: ${file.version} vs ${GRAPH_SCHEMA_VERSION}`);
-      }
-      graph.import(file.graph);
-      console.log(`[graphrag] Loaded graph: ${graph.order} nodes, ${graph.size} edges`);
-    } catch (err) {
-      console.error('[graphrag] Failed to load graph, starting fresh:', err);
-    }
-  } else {
-    console.log('[graphrag] No existing graph, starting fresh');
-  }
-
-  // Run autoclean on startup and every 6 hours
-  setTimeout(() => withDistributedLock('graphrag:autoclean', 300_000, () => runAutoclean().then(() => {})).catch(console.error), 30_000);
-  if (autocleanTimer) clearInterval(autocleanTimer);
-  autocleanTimer = setInterval(() => withDistributedLock('graphrag:autoclean', 300_000, () => runAutoclean().then(() => {})).catch(console.error), 6 * 60 * 60 * 1000);
-
-  // Graceful shutdown: flush pending saves before exit
-  const gracefulShutdown = async () => {
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-    }
-    try { await saveGraph(); } catch {}
-    process.exit(0);
-  };
-  process.on('SIGTERM', gracefulShutdown);
-  process.on('SIGINT', gracefulShutdown);
-}
-
-async function saveGraph(): Promise<void> {
-  const data: GraphFile = {
-    version: GRAPH_SCHEMA_VERSION,
-    exportedAt: Date.now(),
-    graph: graph.export(),
-  };
-  await Bun.write(GRAPH_PATH, JSON.stringify(data, null, 2));
-}
-
-function debouncedSave(): void {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveGraph().catch(err => console.error('[graphrag] Save error:', err));
-  }, SAVE_DEBOUNCE_MS);
-}
-
-export function isGraphEnabled(): boolean {
-  return ENABLED;
 }
 
 export async function cachedGetStats(project?: string): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
@@ -248,23 +135,6 @@ export async function cachedGetStats(project?: string): Promise<{ nodes: number;
   const result = getStats(project);
   await cacheSet(`stats:${scopeSuffix}`, result, CACHE_TTL_STATS);
   return result;
-}
-
-export function getStats(project?: string): { nodes: number; edges: number; types: Record<string, number> } {
-  if (!graph) return { nodes: 0, edges: 0, types: {} };
-  const types: Record<string, number> = {};
-  let nodes = 0;
-  graph.forEachNode((key, attrs) => {
-    if (!isNodeVisibleToProject(key, project)) return;
-    nodes++;
-    const t = (attrs as EntityAttrs).type || 'Other';
-    types[t] = (types[t] || 0) + 1;
-  });
-  let edges = 0;
-  graph.forEachEdge((_edge, _attrs, source, target) => {
-    if (isNodeVisibleToProject(source, project) && isNodeVisibleToProject(target, project)) edges++;
-  });
-  return { nodes, edges, types };
 }
 
 // ─── Entity Extraction ───
@@ -335,76 +205,10 @@ async function extractEntities(text: string): Promise<ExtractionResult> {
 
 // ─── Graph Mutations ───
 
-function upsertEntity(name: string, type: EntityType, description?: string, project?: string, sourceIds?: string[]): string {
-  const id = scopedId(name, project);
-  const now = Date.now();
-
-  if (graph.hasNode(id)) {
-    const attrs = graph.getNodeAttributes(id) as EntityAttrs;
-    attrs.lastSeen = now;
-    attrs.mentions += 1;
-    if (description && (!attrs.description || description.length > attrs.description.length)) {
-      attrs.description = description;
-    }
-    const merged = mergeSources(attrs.sources, sourceIds);
-    if (merged) attrs.sources = merged;
-    graph.replaceNodeAttributes(id, attrs);
-  } else {
-    graph.addNode(id, {
-      type,
-      description,
-      firstSeen: now,
-      lastSeen: now,
-      mentions: 1,
-      ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
-    } as EntityAttrs);
-  }
-
-  return id;
-}
-
-function mergeSources(existing: string[] | undefined, incoming: string[] | undefined): string[] | undefined {
-  if (!existing && !incoming) return undefined;
-  const set = new Set([...(existing ?? []), ...(incoming ?? [])]);
-  return [...set];
-}
-/**
- * Identity of a relationship: source + predicate + target.
- * Same nodes with different predicates are distinct relationships
- * and must not be merged. The key format preserves existing
- * single-predicate edges so persisted graphs remain readable.
- */
-export function relationshipKey(sourceId: string, targetId: string, predicate: string): string {
-  return `${sourceId}-${predicate}-${targetId}`;
-}
-
-function upsertRelationship(sourceId: string, targetId: string, predicate: string, sourceIds?: string[]): void {
-  const now = Date.now();
-  const edgeKey = relationshipKey(sourceId, targetId, predicate);
-
-  if (graph.hasEdge(edgeKey)) {
-    const attrs = graph.getEdgeAttributes(edgeKey) as RelationshipAttrs;
-    attrs.weight += 1;
-    attrs.lastSeen = now;
-    const merged = mergeSources(attrs.sources, sourceIds);
-    if (merged) attrs.sources = merged;
-    graph.replaceEdgeAttributes(edgeKey, attrs);
-  } else {
-    if (!graph.hasNode(sourceId) || !graph.hasNode(targetId)) return;
-    graph.addEdgeWithKey(edgeKey, sourceId, targetId, {
-      predicate,
-      weight: 1,
-      firstSeen: now,
-      lastSeen: now,
-      ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
-    } as RelationshipAttrs);
-  }
-}
-
 // ─── Public API ───
 
 export async function ingest(text: string, project?: string, opts?: GraphIngestOpts): Promise<{ entities: number; relationships: number }> {
-  if (!ENABLED || !graph) return { entities: 0, relationships: 0 };
+  if (!ENABLED || !getGraph()) return { entities: 0, relationships: 0 };
 
   try {
     const result = await extractEntities(text);
@@ -419,8 +223,8 @@ export async function ingest(text: string, project?: string, opts?: GraphIngestO
       if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
       const sourceId = scopedId(rel.subject, project);
       const targetId = scopedId(rel.object, project);
-      if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
-      if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+      if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
+      if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
       upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
     }
 
@@ -454,7 +258,7 @@ export async function ingestExtracted(
   project?: string,
   opts?: GraphIngestOpts
 ): Promise<void> {
-  if (!ENABLED || !graph) return;
+  if (!ENABLED || !getGraph()) return;
   const sourceIds = opts?.sourceIds;
 
   for (const entity of entities) {
@@ -466,8 +270,8 @@ export async function ingestExtracted(
     if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
     const sourceId = scopedId(rel.subject, project);
     const targetId = scopedId(rel.object, project);
-    if (!graph.hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
-    if (!graph.hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+    if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
+    if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
     upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
   }
 
@@ -479,7 +283,7 @@ export async function query(
   queryText: string,
   opts?: { maxDepth?: number; maxNodes?: number; project?: string }
 ): Promise<GraphContext> {
-  if (!ENABLED || !graph || graph.order === 0) {
+  if (!ENABLED || !getGraph() || getGraph().order === 0) {
     return { entities: [], relationships: [], markdown: '' };
   }
 
@@ -509,7 +313,7 @@ export async function query(
 
   const minMatches = queryWords.length > 1 ? 2 : 1;
   const matchingNodes: string[] = [];
-  graph.forEachNode((nodeId) => {
+  getGraph().forEachNode((nodeId) => {
     if (!isNodeVisibleToProject(nodeId, project)) return;
     const matchCount = queryWords.filter(w => nodeId.includes(w)).length;
     if (matchCount >= minMatches) {
@@ -521,7 +325,7 @@ export async function query(
   // entitySimilarity is bigram Dice; >=0.65 catches single-letter variants without noise.
   if (matchingNodes.length === 0 && queryWords.length === 1) {
     const q = queryWords[0];
-    graph.forEachNode((nodeId) => {
+    getGraph().forEachNode((nodeId) => {
       if (!isNodeVisibleToProject(nodeId, project)) return;
       if (entitySimilarity(q, nodeId) >= 0.65 || nodeId.split(' ').some(tok => entitySimilarity(q, tok) >= 0.65)) {
         matchingNodes.push(nodeId);
@@ -540,12 +344,12 @@ export async function query(
   for (const startNode of matchingNodes) {
     if (visited.size >= maxNodes) break;
 
-    bfsFromNode(graph, startNode, (node, _attrs, depth) => {
+    bfsFromNode(getGraph(), startNode, (node, _attrs, depth) => {
       if (depth > maxDepth || visited.size >= maxNodes) return true;
       if (!isNodeVisibleToProject(node, project)) return true;
       visited.add(node);
 
-      graph.forEachOutEdge(node, (_edge, attrs, source, target) => {
+      getGraph().forEachOutEdge(node, (_edge, attrs, source, target) => {
         if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
         const relAttrs = attrs as RelationshipAttrs;
         contextEdges.push({
@@ -562,7 +366,7 @@ export async function query(
 
   const entities = Array.from(visited).map(id => ({
     id,
-    ...(graph.getNodeAttributes(id) as EntityAttrs),
+    ...(getGraph().getNodeAttributes(id) as EntityAttrs),
   }));
 
   const markdown = toMarkdown({ entities, relationships: contextEdges, markdown: '' });
@@ -624,7 +428,7 @@ function toMarkdown(ctx: GraphContext): string {
 // ─── Decision Framework ───
 
 export async function addDecision(decision: DecisionInput, project?: string, sourceIds?: string[]): Promise<string> {
-  if (!ENABLED || !graph) return '';
+  if (!ENABLED || !getGraph()) return '';
 
   const id = scopedId(decision.name, project);
   const now = Date.now();
@@ -643,13 +447,13 @@ export async function addDecision(decision: DecisionInput, project?: string, sou
     ...(sourceIds && sourceIds.length > 0 ? { sources: [...new Set(sourceIds)] } : {}),
   };
 
-  if (graph.hasNode(id)) {
-    const prev = graph.getNodeAttributes(id) as EntityAttrs;
+  if (getGraph().hasNode(id)) {
+    const prev = getGraph().getNodeAttributes(id) as EntityAttrs;
     const merged = mergeSources(prev.sources, sourceIds);
     if (merged) attrs.sources = merged;
-    graph.replaceNodeAttributes(id, attrs);
+    getGraph().replaceNodeAttributes(id, attrs);
   } else {
-    graph.addNode(id, attrs);
+    getGraph().addNode(id, attrs);
   }
 
   // Create DECIDED_FOR edge to the chosen option
@@ -679,7 +483,7 @@ export async function addDecision(decision: DecisionInput, project?: string, sou
 }
 
 export async function queryDecisions(context: string, project?: string): Promise<Array<DecisionAttrs & { id: string }>> {
-  if (!ENABLED || !graph || graph.order === 0) return [];
+  if (!ENABLED || !getGraph() || getGraph().order === 0) return [];
 
   const cacheKey = `decisions:${hashText(context)}:${project ? normalizeProject(project) : ''}`;
   const cached = await cacheGet<Array<DecisionAttrs & { id: string }>>(cacheKey);
@@ -690,7 +494,7 @@ export async function queryDecisions(context: string, project?: string): Promise
 
   const decisions: Array<DecisionAttrs & { id: string; relevance: number }> = [];
 
-  graph.forEachNode((nodeId, attrs) => {
+  getGraph().forEachNode((nodeId, attrs) => {
     if (!isNodeVisibleToProject(nodeId, project)) return;
     const a = attrs as EntityAttrs;
     if (a.type !== 'Decision') return;
@@ -713,7 +517,7 @@ export async function queryDecisions(context: string, project?: string): Promise
     }
 
     // Also check connected entities
-    graph.forEachOutNeighbor(nodeId, (neighbor) => {
+    getGraph().forEachOutNeighbor(nodeId, (neighbor) => {
       if (!isNodeVisibleToProject(neighbor, project)) return;
       if (contextWords.some(w => neighbor.includes(w))) relevance += 0.5;
     });
@@ -789,37 +593,18 @@ async function extractDecision(text: string): Promise<DecisionInput | null> {
 // ─── Entity Resolution (Patch 3) ───
 
 /**
- * Compute similarity between two normalized entity IDs.
- * Returns 0-1 where 1 = identical.
- */
-function entitySimilarity(a: string, b: string): number {
-  if (a === b) return 1;
-  // One contains the other (e.g., "lucas" and "lucas tomaz")
-  if (a.includes(b) || b.includes(a)) return 0.8;
-  // Bigram overlap (Dice coefficient)
-  const bigramsA = new Set<string>();
-  const bigramsB = new Set<string>();
-  for (let i = 0; i < a.length - 1; i++) bigramsA.add(a.slice(i, i + 2));
-  for (let i = 0; i < b.length - 1; i++) bigramsB.add(b.slice(i, i + 2));
-  if (bigramsA.size === 0 || bigramsB.size === 0) return 0;
-  let intersection = 0;
-  for (const bg of bigramsA) { if (bigramsB.has(bg)) intersection++; }
-  return (2 * intersection) / (bigramsA.size + bigramsB.size);
-}
-
-/**
- * Resolve duplicate entities in the graph.
+ * Resolve duplicate entities in the getGraph().
  * Merges entities that likely refer to the same thing:
  * - Same type + high name similarity (>0.75)
  * - Transfers edges from duplicates to canonical entity
  * Returns number of entities merged.
  */
 export async function resolveEntities(threshold = 0.75, project?: string): Promise<{ merged: number; pairs: string[][] }> {
-  if (!ENABLED || !graph || graph.order < 2) return { merged: 0, pairs: [] };
+  if (!ENABLED || !getGraph() || getGraph().order < 2) return { merged: 0, pairs: [] };
 
   const onlyScope = project ? normalizeProject(project) : undefined;
 
-  const nodes = graph.mapNodes((key, attrs) => ({
+  const nodes = getGraph().mapNodes((key, attrs) => ({
     key,
     attrs: attrs as EntityAttrs,
   }));
@@ -854,8 +639,8 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
             : [group[j], group[i]];
 
           // Merge attributes
-          const cAttrs = graph.getNodeAttributes(canonical.key) as EntityAttrs;
-          const dAttrs = graph.getNodeAttributes(duplicate.key) as EntityAttrs;
+          const cAttrs = getGraph().getNodeAttributes(canonical.key) as EntityAttrs;
+          const dAttrs = getGraph().getNodeAttributes(duplicate.key) as EntityAttrs;
           cAttrs.mentions += dAttrs.mentions;
           cAttrs.firstSeen = Math.min(cAttrs.firstSeen, dAttrs.firstSeen);
           cAttrs.lastSeen = Math.max(cAttrs.lastSeen, dAttrs.lastSeen);
@@ -864,26 +649,26 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
           }
           const mergedSources = mergeSources(cAttrs.sources, dAttrs.sources);
           if (mergedSources) cAttrs.sources = mergedSources;
-          graph.replaceNodeAttributes(canonical.key, cAttrs);
+          getGraph().replaceNodeAttributes(canonical.key, cAttrs);
 
           // Transfer edges from duplicate to canonical (merging sources on collision)
-          graph.forEachEdge(duplicate.key, (edge, attrs, source, target) => {
+          getGraph().forEachEdge(duplicate.key, (edge, attrs, source, target) => {
             const newSource = source === duplicate.key ? canonical.key : source;
             const newTarget = target === duplicate.key ? canonical.key : target;
             const edgeKey = relationshipKey(newSource, newTarget, (attrs as RelationshipAttrs).predicate);
             if (newSource === newTarget) return;
-            if (graph.hasEdge(edgeKey)) {
+            if (getGraph().hasEdge(edgeKey)) {
               try {
-                const prev = graph.getEdgeAttributes(edgeKey) as RelationshipAttrs;
+                const prev = getGraph().getEdgeAttributes(edgeKey) as RelationshipAttrs;
                 const m = mergeSources(prev.sources, (attrs as RelationshipAttrs).sources);
                 if (m) {
                   prev.sources = m;
-                  graph.replaceEdgeAttributes(edgeKey, prev);
+                  getGraph().replaceEdgeAttributes(edgeKey, prev);
                 }
               } catch { /* ignore */ }
             } else {
               try {
-                graph.addEdgeWithKey(edgeKey, newSource, newTarget, attrs);
+                getGraph().addEdgeWithKey(edgeKey, newSource, newTarget, attrs);
               } catch { /* edge already exists */ }
             }
           });
@@ -897,7 +682,7 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
 
   // Remove duplicates
   for (const key of toRemove) {
-    try { graph.dropNode(key); } catch { /* already removed */ }
+    try { getGraph().dropNode(key); } catch { /* already removed */ }
   }
 
   if (mergedPairs.length > 0) {
@@ -912,9 +697,9 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
 // ─── Graph Maintenance ───
 
 export async function pruneGraph(maxNodes: number = 5000): Promise<number> {
-  if (!graph || graph.order <= maxNodes) return 0;
+  if (!getGraph() || getGraph().order <= maxNodes) return 0;
 
-  const nodes = graph.mapNodes((key, attrs) => {
+  const nodes = getGraph().mapNodes((key, attrs) => {
     const a = attrs as EntityAttrs;
     const daysSinceLastSeen = (Date.now() - (a.lastSeen || 0)) / 86400000;
     return {
@@ -924,8 +709,8 @@ export async function pruneGraph(maxNodes: number = 5000): Promise<number> {
   });
 
   nodes.sort((a, b) => a.score - b.score);
-  const toRemove = nodes.slice(0, graph.order - maxNodes);
-  for (const { key } of toRemove) graph.dropNode(key);
+  const toRemove = nodes.slice(0, getGraph().order - maxNodes);
+  for (const { key } of toRemove) getGraph().dropNode(key);
   await saveGraph();
   await invalidateGraphCache();
   return toRemove.length;
@@ -933,12 +718,11 @@ export async function pruneGraph(maxNodes: number = 5000): Promise<number> {
 
 // ─── Autoclean ───
 
-let autocleanTimer: ReturnType<typeof setInterval> | null = null;
 
 export async function runAutoclean(): Promise<SweepResult> {
-  if (!graph) return { orphansRemoved: 0, patternRemoved: 0, staleRemoved: 0, total: 0 };
+  if (!getGraph()) return { orphansRemoved: 0, patternRemoved: 0, staleRemoved: 0, total: 0 };
   const start = Date.now();
-  const result = sweepGraph(graph);
+  const result = sweepGraph(getGraph());
   const duration = Date.now() - start;
   if (result.total > 0) {
     await saveGraph();
@@ -952,7 +736,7 @@ export async function runAutoclean(): Promise<SweepResult> {
       patternRemoved: result.patternRemoved,
       staleRemoved: result.staleRemoved,
       total: result.total,
-      graphNodes: graph?.order ?? 0,
+      graphNodes: getGraph()?.order ?? 0,
     }, duration);
   } catch { /* non-critical */ }
   return result;
@@ -961,8 +745,8 @@ export async function runAutoclean(): Promise<SweepResult> {
 // ─── Sync: outbox + reconciliation (Fase 3) ───
 //
 // Architectural decision: Mem0/Qdrant is the SOURCE OF TRUTH for content.
-// The graph is a DERIVED projection (rich structural cache). Any divergence
-// is recoverable by re-ingestion from Mem0; the graph never overrides vector
+// The getGraph() is a DERIVED projection (rich structural cache). Any divergence
+// is recoverable by re-ingestion from Mem0; the getGraph() never overrides vector
 // content. Provenance (`sources`) links each node/edge to the Mem0 IDs that
 // produced it; legacy entries (sources undefined) are never pruned.
 //
@@ -1081,7 +865,7 @@ async function applyOutboxEntry(
 export async function drainGraphOutbox(
   exec?: (entry: GraphOutboxEntry) => Promise<void>
 ): Promise<{ processed: number; failed: number; deadLettered: number; pending: number; quarantined: number }> {
-  if (!graph && !exec) return { processed: 0, failed: 0, deadLettered: 0, pending: 0, quarantined: 0 };
+  if (!getGraph() && !exec) return { processed: 0, failed: 0, deadLettered: 0, pending: 0, quarantined: 0 };
   const dir = outboxDir();
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
@@ -1160,13 +944,13 @@ function triggerOutboxDrain(): void {
 }
 
 /**
- * Durable graph ingestion for the Mem0 write path (Fase 3).
+ * Durable getGraph() ingestion for the Mem0 write path (Fase 3).
  * Appends intent to the outbox (fast, no LLM wait) and triggers a
  * background drain. Never throws — write-path latency is unchanged and a
- * graph failure never fails the memory save (Mem0 is source of truth).
+ * getGraph() failure never fails the memory save (Mem0 is source of truth).
  */
 export function queueGraphIngest(text: string, project?: string, sourceIds?: string[]): void {
-  if (!ENABLED || !graph) return;
+  if (!ENABLED || !getGraph()) return;
   try {
     appendGraphOutbox({ text, project, sourceIds });
   } catch (err) {
@@ -1185,7 +969,7 @@ export function queueGraphIngestExtracted(
   project?: string,
   sourceIds?: string[]
 ): void {
-  if (!ENABLED || !graph) return;
+  if (!ENABLED || !getGraph()) return;
   try {
     appendGraphOutbox({ entities, relationships, project, sourceIds });
   } catch (err) {
@@ -1204,36 +988,36 @@ export function queueGraphIngestExtracted(
  * are never pruned — no deletion without evidence.
  */
 export async function removeGraphProvenance(memoryId: string): Promise<{ edgesPruned: number; nodesPruned: number }> {
-  if (!graph) return { edgesPruned: 0, nodesPruned: 0 };
+  if (!getGraph()) return { edgesPruned: 0, nodesPruned: 0 };
   let edgesPruned = 0;
 
   // Strip from every edge; drop those left with no sources.
   const deadEdges: string[] = [];
-  graph.forEachEdge((edge, attrs) => {
+  getGraph().forEachEdge((edge, attrs) => {
     const a = attrs as RelationshipAttrs;
     if (!a.sources || !a.sources.includes(memoryId)) return;
     a.sources = a.sources.filter(s => s !== memoryId);
     if (a.sources.length === 0) {
       deadEdges.push(edge);
     } else {
-      graph.replaceEdgeAttributes(edge, a);
+      getGraph().replaceEdgeAttributes(edge, a);
     }
   });
   for (const edge of deadEdges) {
-    try { graph.dropEdge(edge); edgesPruned++; } catch { /* already removed */ }
+    try { getGraph().dropEdge(edge); edgesPruned++; } catch { /* already removed */ }
   }
 
   // Strip from every node; drop orphan nodes left with no sources.
   // Legacy nodes (sources undefined) are never dropped.
   let nodesPruned = 0;
-  graph.forEachNode((nodeId, attrs) => {
+  getGraph().forEachNode((nodeId, attrs) => {
     const a = attrs as EntityAttrs;
     if (!a.sources || !a.sources.includes(memoryId)) return;
     a.sources = a.sources.filter(s => s !== memoryId);
-    if (a.sources.length === 0 && graph.degree(nodeId) === 0) {
-      try { graph.dropNode(nodeId); nodesPruned++; } catch { /* already removed */ }
+    if (a.sources.length === 0 && getGraph().degree(nodeId) === 0) {
+      try { getGraph().dropNode(nodeId); nodesPruned++; } catch { /* already removed */ }
     } else {
-      graph.replaceNodeAttributes(nodeId, a);
+      getGraph().replaceNodeAttributes(nodeId, a);
     }
   });
 
@@ -1290,24 +1074,24 @@ export async function reconcileGraph(): Promise<{
     const { logMaintenance } = await import('./maintenance-log.js');
     logMaintenance('graph_reconcile', {
       ...result,
-      graphNodes: graph?.order ?? 0,
-      graphEdges: graph?.size ?? 0,
+      graphNodes: getGraph()?.order ?? 0,
+      graphEdges: getGraph()?.size ?? 0,
     }, Date.now() - start);
   } catch { /* non-critical */ }
-  return { ...result, graphNodes: graph?.order ?? 0, graphEdges: graph?.size ?? 0 };
+  return { ...result, graphNodes: getGraph()?.order ?? 0, graphEdges: getGraph()?.size ?? 0 };
 }
 
 /**
- * Remove specific nodes (and all their edges) from the graph.
+ * Remove specific nodes (and all their edges) from the getGraph().
  * Returns the list of nodes actually removed.
  */
 export async function removeNodes(nodeIds: string[], project?: string): Promise<string[]> {
-  if (!graph) return [];
+  if (!getGraph()) return [];
   const removed: string[] = [];
   for (const id of nodeIds) {
     const key = resolveNodeId(id, project);
-    if (graph.hasNode(key)) {
-      graph.dropNode(key);
+    if (getGraph().hasNode(key)) {
+      getGraph().dropNode(key);
       removed.push(key);
     }
   }
@@ -1329,13 +1113,13 @@ export async function removeRelationships(
   targets?: string[],
   project?: string
 ): Promise<number> {
-  if (!graph) return 0;
+  if (!getGraph()) return 0;
   const srcKey = resolveNodeId(source, project);
-  if (!graph.hasNode(srcKey)) return 0;
+  if (!getGraph().hasNode(srcKey)) return 0;
 
   const scopedTargets = targets?.map(t => resolveNodeId(t, project));
   const toRemove: string[] = [];
-  graph.forEachOutEdge(srcKey, (edge, attrs, _src, tgt) => {
+  getGraph().forEachOutEdge(srcKey, (edge, attrs, _src, tgt) => {
     const relAttrs = attrs as RelationshipAttrs;
     if (predicates && !predicates.includes(relAttrs.predicate)) return;
     if (scopedTargets && !scopedTargets.includes(tgt)) return;
@@ -1343,7 +1127,7 @@ export async function removeRelationships(
   });
 
   for (const edge of toRemove) {
-    try { graph.dropEdge(edge); } catch { /* already removed */ }
+    try { getGraph().dropEdge(edge); } catch { /* already removed */ }
   }
 
   if (toRemove.length > 0) {
@@ -1355,20 +1139,20 @@ export async function removeRelationships(
 }
 
 /**
- * List all nodes in the graph with basic info.
+ * List all nodes in the getGraph() with basic info.
  * With project: only nodes visible to that project (global + its scope).
  */
 export function listAllNodes(project?: string): Array<{ id: string; type: string; mentions: number; edgeCount: number }> {
-  if (!graph) return [];
+  if (!getGraph()) return [];
   const out: Array<{ id: string; type: string; mentions: number; edgeCount: number }> = [];
-  graph.forEachNode((key, attrs) => {
+  getGraph().forEachNode((key, attrs) => {
     if (!isNodeVisibleToProject(key, project)) return;
     const a = attrs as EntityAttrs;
     out.push({
       id: key,
       type: a.type || 'Other',
       mentions: a.mentions || 0,
-      edgeCount: graph!.degree(key),
+      edgeCount: getGraph()!.degree(key),
     });
   });
   return out;
@@ -1377,7 +1161,7 @@ export function listAllNodes(project?: string): Array<{ id: string; type: string
 // ─── PGS Integration ───
 
 /**
- * Export graph data in PGS-compatible format.
+ * Export getGraph() data in PGS-compatible format.
  * Maps entity descriptions to `concept` field for PGS consumption.
  */
 export async function cachedGetGraphForPGS(project?: string): Promise<ReturnType<typeof getGraphForPGS>> {
@@ -1393,12 +1177,12 @@ export function getGraphForPGS(project?: string): {
   nodes: Array<{ id: string; concept: string; tag: string; weight: number }>;
   edges: Array<{ source: string; target: string; weight: number }>;
 } {
-  if (!graph || graph.order === 0) {
+  if (!getGraph() || getGraph().order === 0) {
     return { nodes: [], edges: [] };
   }
 
   const nodes: Array<{ id: string; concept: string; tag: string; weight: number }> = [];
-  graph.forEachNode((nodeId, attrs) => {
+  getGraph().forEachNode((nodeId, attrs) => {
     if (!isNodeVisibleToProject(nodeId, project)) return;
     const a = attrs as EntityAttrs;
     nodes.push({
@@ -1410,7 +1194,7 @@ export function getGraphForPGS(project?: string): {
   });
 
   const edges: Array<{ source: string; target: string; weight: number }> = [];
-  graph.forEachEdge((_edge, attrs, source, target) => {
+  getGraph().forEachEdge((_edge, attrs, source, target) => {
     if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
     const a = attrs as RelationshipAttrs;
     edges.push({
