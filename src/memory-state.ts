@@ -505,6 +505,31 @@ export async function setImportance(memoryId: string, score: number): Promise<vo
 }
 
 /**
+ * Clear a memory's importance score (rollback path — restores the unscored
+ * null state). Feedback is untouched. Swallows Not Found; throws on other
+ * Qdrant errors. L2 eviction is best-effort.
+ */
+export async function clearImportance(memoryId: string): Promise<void> {
+  if (isQueryableId(memoryId)) {
+    try {
+      await getQdrant().deletePayload(collectionName(), {
+        points: [memoryId],
+        keys: [LAIN_IMPORTANCE_KEY],
+      });
+    } catch (err) {
+      if (!isNotFound(err)) {
+        throw new Error(`memory-state: Qdrant deletePayload(importance) failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+  if (isRedisAvailable()) {
+    try {
+      await getRedis().del(importanceKey(memoryId));
+    } catch { /* best-effort */ }
+  }
+}
+
+/**
  * Remove a memory's state (forget / trash / policy path — issue #10 caller).
  * Swallows Not Found (idempotent delete); throws on other Qdrant errors.
  * L2 eviction is best-effort.

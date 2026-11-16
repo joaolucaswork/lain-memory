@@ -11,6 +11,7 @@ import {
   FEEDBACK_DEFAULTS,
 } from './mem0.js';
 import { connectRedis, disconnectRedis, getRedis, isRedisAvailable } from './redis.js';
+import { clearImportance, readQdrantState } from './memory-state.js';
 import { validateRoute } from './http-validation.js';
 import { newTestPoint, deleteTestPoints } from './test-points.js';
 
@@ -251,5 +252,17 @@ describe('memory-state — Qdrant authority (issue #8)', () => {
     await expect(getMemoryFeedback(ghost)).resolves.toEqual(FEEDBACK_DEFAULTS);
     await expect(getMemoryImportance(ghost)).resolves.toBeNull();
     await expect(getMemoryFeedback('not-a-point')).resolves.toEqual(FEEDBACK_DEFAULTS);
+  });
+});
+
+describe('clearImportance — rollback path', () => {
+  it('set → clear volta a null sem tocar no feedback', async () => {
+    const id = await newId();
+    await setMemoryImportance(id, 0.8);
+    expect(await getMemoryImportance(id)).toBe(0.8);
+    await clearImportance(id);
+    expect((await readQdrantState([id])).get(id)).toMatchObject({ exists: true, importance: null });
+    expect(await getMemoryImportance(id)).toBeNull();
+    expect(await getMemoryFeedback(id)).toEqual(FEEDBACK_DEFAULTS);
   });
 });
