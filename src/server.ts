@@ -13,10 +13,7 @@
 import {
   isMem0Configured,
 } from './mem0.js';
-import {
-  initGraph,
-  cachedGetGraphForPGS,
-} from './graphrag.js';
+import { initGraph } from './graphrag.js';
 import {
   handleAdd,
   handleBundle,
@@ -49,11 +46,13 @@ import {
   handleGraphStats,
   handleGraphSync,
 } from './server/routes/graph.js';
+import {
+  handlePgsExecute,
+  handlePgsStats,
+  handleSeedExtract,
+  handleSeedList,
+} from './server/routes/misc.js';
 import { json } from './server/http.js';
-import { extractSeed, listSeeds } from './seed-extraction.js';
-import { PGSEngine } from './pgs/index.js';
-import { createPGSProviders } from './pgs/llm-provider.js';
-import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
@@ -165,67 +164,17 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/graph/sync':
       return handleGraphSync(data);
 
-    case '/api/seed/extract': {
-      // Chunked fact/entity extraction from raw text or PDFs into seed files.
-      const input = {
-        type: data.type,
-        source: data.source,
-        rawText: data.rawText,
-        project: data.project,
-        phone: data.phone,
-      };
-      try {
-        const output = await extractSeed(input);
-        return json({
-          success: true,
-          id: output.id,
-          title: output.title,
-          summary: output.summary,
-          facts_count: output.facts.length,
-          entities_count: output.entities.length,
-          message: `Extracted ${output.facts.length} facts and ${output.entities.length} entities from "${output.title}"`,
-        });
-      } catch (err: unknown) {
-        console.error('[lain-memory] seed/extract handler error:', err);
-        return json({ success: false, error: err instanceof Error ? err.message : String(err) });
-      }
-    }
+    case '/api/seed/extract':
+      return handleSeedExtract(data);
 
-    case '/api/seed/list': {
-      return json(listSeeds(data.project));
-    }
+    case '/api/seed/list':
+      return handleSeedList(data);
 
-    case '/api/pgs/execute': {
-      // Partition → route → sweep → synthesize over the local GraphRAG.
-      if (!data.query) return json({ error: 'query required' });
-      const pgsGraph = await cachedGetGraphForPGS(data.project);
-      if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
-      const providers = createPGSProviders();
-      const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
-      const result = await pgsEngine.execute(data.query, pgsGraph, {
-        mode: data.mode,
-        sessionId: data.sessionId,
-      });
-      return json(result);
-    }
+    case '/api/pgs/execute':
+      return handlePgsExecute(data);
 
-    case '/api/pgs/stats': {
-      const pgsGraph = await cachedGetGraphForPGS(data.project);
-      const providers = createPGSProviders();
-      const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
-      const partitions = pgsEngine.partition(pgsGraph);
-      return json({
-        nodes: pgsGraph.nodes.length,
-        edges: pgsGraph.edges.length,
-        partitions: partitions.length,
-        partitionSummaries: partitions.map(p => ({
-          id: p.id,
-          nodeCount: p.nodeCount,
-          keywords: p.keywords.slice(0, 5),
-          summary: p.summary?.substring(0, 80),
-        })),
-      });
-    }
+    case '/api/pgs/stats':
+      return handlePgsStats(data);
 
     case '/health':
     case '/api/health':
