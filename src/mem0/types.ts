@@ -61,6 +61,10 @@ export interface AddMemoryOpts {
   chatAtom?: boolean;
 }
 
+/**
+ * A memory hit after the recall pipeline: raw cosine plus ranking signals.
+ * `status` is omitted — archived memories are filtered before this point.
+ */
 export interface RankedMemory {
   id: string;
   memory: string;
