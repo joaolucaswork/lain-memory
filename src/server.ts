@@ -110,6 +110,12 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
       const result = data.cached
         ? await cachedSearchMemory(data.query, data.project, data.limit)
         : await searchMemory(data.query, data.project, data.limit);
+      // debug:true pins the measurement contract (adjustedScore + importance
+      // on every hit). RankedMemory already carries both, so the spread is a
+      // no-op today — non-debug responses are byte-identical to before.
+      if (data.debug) {
+        return json(result.map((r) => ({ ...r, adjustedScore: r.adjustedScore, importance: r.importance ?? null })));
+      }
       return json(result);
     }
 

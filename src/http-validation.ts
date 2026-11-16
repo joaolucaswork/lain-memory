@@ -50,6 +50,8 @@ export const routeSchemas: Record<string, z.ZodType> = {
     project,
     limit: limit(200),
     cached: z.boolean().optional(),
+    /** Measurement mode: guarantees adjustedScore + importance on every hit. */
+    debug: z.boolean().optional(),
   }),
   '/api/memory/list': z.object({ project, limit: limit(500) }),
   '/api/memory/forget': z.object({ memory_id: z.string().min(1).max(200), project }),

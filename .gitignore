@@ -6,3 +6,6 @@ data/
 .DS_Store
 .firecrawl/
 repomix-output.xml
+# Eval de recall contém dados pessoais (perguntas e resultados)
+scripts/eval-recall.cases.json
+scripts/eval-results/

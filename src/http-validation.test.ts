@@ -53,6 +53,13 @@ describe('validateRoute', () => {
     if (coerced.ok) expect(coerced.data.limit).toBe(5);
   });
 
+  test('recall aceita debug:true (contrato de medição)', () => {
+    const r = validateRoute('/api/memory/recall', { query: 'x', debug: true });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.data.debug).toBe(true);
+    expect(validateRoute('/api/memory/recall', { query: 'x', debug: 'sim' }).ok).toBe(false);
+  });
+
   test('forget exige memory_id; scan exige project', () => {
     expect(validateRoute('/api/memory/forget', {}).ok).toBe(false);
     expect(validateRoute('/api/memory/forget', { memory_id: 'abc' }).ok).toBe(true);
