@@ -3,13 +3,16 @@ import {
   acceptChatFact,
   buildChatExtractPrompt,
   buildTitlePrompt,
+  CHAT_FACT_RATING_CRITERIA,
   extractChatFacts,
   fallbackTitleFromFact,
   isTitleCandidate,
   normalizeChatFacts,
   normalizeChatFactPairs,
   normalizeChatTitle,
+  relevanceToImportance,
   rememberChatTurn,
+  sanitizeChatRating,
 } from './chat-extract.js';
 
 /** Cards that recall actually stored from the 2026-11-14 Seinfeld turn. */
@@ -58,7 +61,7 @@ describe('extractChatFacts', () => {
       },
       async () => ({ facts: [ASSISTANT_FESTIVUS, ASSISTANT_PARKING, ASSISTANT_HINGE, PLOT_NO_SPEAKER, USER_MARKED] }),
     );
-    expect(facts).toEqual([{ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse' }]);
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false }]);
   });
 
   test('aceita o formato novo {text,title} e normaliza o título', async () => {
@@ -66,7 +69,7 @@ describe('extractChatFacts', () => {
       { user: 'to revendo seinfeld', date: '2026-11-14' },
       async () => ({ facts: [{ text: USER_MARKED, title: 'O usuário curtiu a vaga do George.' }] }),
     );
-    expect(facts).toEqual([{ text: USER_MARKED, title: 'curtiu a vaga do George' }]);
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'curtiu a vaga do George', relevance: 3, kind: 'fact', sensitive: false }]);
   });
 
   test('lista vazia quando o modelo só falou', async () => {
@@ -99,12 +102,12 @@ describe('extractChatFacts', () => {
     expect(prompt).not.toContain('mode: bundle');
   });
 
-  test('o prompt pede {text,title} com teto de 6 palavras', () => {
+  test('o prompt pede {text,title,relevance,kind,sensitive} com teto de 6 palavras', () => {
     const prompt = buildChatExtractPrompt({ user: 'tomo sertralina', date: '2026-11-14' });
     expect(prompt).toContain('"title"');
     expect(prompt).toContain('máximo 6');
     expect(prompt).toContain('Sem "o usuário"');
-    expect(prompt).toContain('{"facts":[{"text":"...","title":"..."}]}');
+    expect(prompt).toContain('{"facts":[{"text":"...","title":"...","relevance":3,"kind":"fact","sensitive":false}]}');
   });
 });
 
@@ -121,10 +124,10 @@ describe('normalizeChatFactPairs', () => {
       'O usuário guarda a janta para o café.',
     ]);
     expect(pairs).toHaveLength(5);
-    expect(pairs[0]).toEqual({ text: USER_COMFORT, title: 'Seinfeld série conforto' });
+    expect(pairs[0]).toEqual({ text: USER_COMFORT, title: 'Seinfeld série conforto', relevance: 3, kind: 'fact', sensitive: false });
     // título vazio cai no fallback do corpo
-    expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse' });
-    expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'dorme tarde' });
+    expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false });
+    expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'dorme tarde', relevance: 3, kind: 'fact', sensitive: false });
   });
 });
 
@@ -180,6 +183,7 @@ describe('backfill helpers', () => {
 describe('rememberChatTurn', () => {
   test('não salva o bloco do Seinfeld; salva só o fato do usuário, sem bundle, e repassa o título', async () => {
     const saved: Array<{ fact: string; project: string | undefined; title?: string }> = [];
+    const states: Array<{ id: string; importance: number; kind: string; sensitive: boolean }> = [];
     const result = await rememberChatTurn(
       { user: 'seinfeld é comfy', assistant: ASSISTANT_FESTIVUS, project: 'diario', date: '2026-11-14' },
       {
@@ -188,10 +192,13 @@ describe('rememberChatTurn', () => {
           saved.push({ fact, project, title });
           return [{ id: 'atom-1', memory: fact, action: 'ADD' }];
         },
+        writeState: async (id, s) => { states.push({ id, ...s }); },
       },
     );
     expect(saved).toEqual([{ fact: USER_COMFORT, project: 'diario', title: 'Seinfeld série conforto' }]);
     expect(result[0]).toMatchObject({ id: 'atom-1', title: 'Seinfeld série conforto' });
+    // Sem rating no fato → padrões 3/fact/false → importância neutra 0.5.
+    expect(states).toEqual([{ id: 'atom-1', importance: 0.5, kind: 'fact', sensitive: false }]);
   });
 
   test('extração vazia não chama o save', async () => {
@@ -216,6 +223,7 @@ describe('rememberChatTurn', () => {
       {
         extract: async () => [{ text: USER_COMFORT, title: 'Seinfeld série conforto' }],
         save: async (fact) => [{ id: 'duplicate', memory: fact, action: 'NOOP', superseded: [] }],
+        writeState: async () => {},
       },
     );
     expect(result[0]).toMatchObject({ id: 'duplicate' });
@@ -235,5 +243,101 @@ describe('rememberChatTurn', () => {
       },
     )).rejects.toThrow('llm down');
     expect(saves).toBe(0);
+  });
+});
+
+describe('sanitizeChatRating', () => {
+  test('válido passa direto', () => {
+    expect(sanitizeChatRating({ relevance: 5, kind: 'state', sensitive: true }))
+      .toEqual({ relevance: 5, kind: 'state', sensitive: true });
+  });
+
+  test('ausente vira padrão 3/fact/false', () => {
+    expect(sanitizeChatRating({})).toEqual({ relevance: 3, kind: 'fact', sensitive: false });
+    expect(sanitizeChatRating(undefined)).toEqual({ relevance: 3, kind: 'fact', sensitive: false });
+    expect(sanitizeChatRating('lixo')).toEqual({ relevance: 3, kind: 'fact', sensitive: false });
+  });
+
+  test('fora da faixa, não-inteiro e tipo errado caem no padrão sem descartar o fato', () => {
+    for (const relevance of [0, 6, 2.5, '4', null, NaN]) {
+      expect(sanitizeChatRating({ relevance }).relevance).toBe(3);
+    }
+    expect(sanitizeChatRating({ kind: 'mood' }).kind).toBe('fact');
+    expect(sanitizeChatRating({ kind: 42 }).kind).toBe('fact');
+    expect(sanitizeChatRating({ sensitive: 1 }).sensitive).toBe(false);
+    expect(sanitizeChatRating({ sensitive: 'sim' }).sensitive).toBe(false);
+  });
+
+  test('normalizeChatFactPairs nunca descarta fato por rating ruim', () => {
+    const facts = normalizeChatFactPairs([{ text: USER_COMFORT, relevance: 99, kind: 'x', sensitive: 'sim' }]);
+    expect(facts).toEqual([{ text: USER_COMFORT, title: 'Seinfeld como série conforto já', relevance: 3, kind: 'fact', sensitive: false }]);
+  });
+
+  test('normalizeChatFactPairs preserva rating válido', () => {
+    const facts = normalizeChatFactPairs([{ text: USER_COMFORT, title: 'conforto', relevance: 5, kind: 'state', sensitive: true }]);
+    expect(facts).toEqual([{ text: USER_COMFORT, title: 'conforto', relevance: 5, kind: 'state', sensitive: true }]);
+  });
+});
+
+describe('relevanceToImportance', () => {
+  test('mapeamento 1→0.2, 2→0.35, 3→0.5, 4→0.7, 5→0.85; resto → 0.5', () => {
+    expect([1, 2, 3, 4, 5].map(relevanceToImportance)).toEqual([0.2, 0.35, 0.5, 0.7, 0.85]);
+    expect(relevanceToImportance(0)).toBe(0.5);
+    expect(relevanceToImportance(9)).toBe(0.5);
+  });
+});
+
+describe('buildChatExtractPrompt rating', () => {
+  test('prompt cobra relevance/kind/sensitive com os critérios exportados', () => {
+    const p = buildChatExtractPrompt({ user: 'oi', date: '2026-11-14' });
+    expect(p).toContain(CHAT_FACT_RATING_CRITERIA);
+    expect(p).toContain('1 = detalhe passageiro');
+    expect(p).toContain('"relevance":3,"kind":"fact","sensitive":false');
+  });
+});
+
+describe('rememberChatTurn estado do extrator', () => {
+  // Textos adversariais: os regex dariam valores DIFERENTES — se o caminho de
+  // chat chamasse scoreImportance/heuristicKind, estes testes quebrariam.
+  const DECISION = 'O usuário decidiu usar o Haiku 5.5 como modelo de conversa.'; // regex: ≥0.35 ("decidiu" + número)
+  const PAIN = 'O usuário está com dor pulsante na têmpora.'; // heuristicKind: 'state' ("está com")
+
+  test('writeState recebe importância/kind/sensitive do extrator, não dos regex', async () => {
+    const seen: Array<{ id: string; s: { importance: number; kind: string; sensitive: boolean } }> = [];
+    const ratings: unknown[] = [];
+    await rememberChatTurn(
+      { user: 'x', project: 'diario' },
+      {
+        extract: async () => [
+          { text: DECISION, title: 'Haiku 5.5 como modelo', relevance: 1, kind: 'fact', sensitive: true },
+          { text: PAIN, title: 'dor pulsante na têmpora', relevance: 5, kind: 'fact', sensitive: false },
+        ],
+        save: async (fact, project, title, rating) => {
+          ratings.push(rating);
+          return [{ id: `id-${ratings.length}`, memory: fact, action: 'ADD' }];
+        },
+        writeState: async (id, s) => { seen.push({ id, s }); },
+      },
+    );
+    expect(ratings).toEqual([
+      { relevance: 1, kind: 'fact', sensitive: true },
+      { relevance: 5, kind: 'fact', sensitive: false },
+    ]);
+    expect(seen).toEqual([
+      { id: 'id-1', s: { importance: 0.2, kind: 'fact', sensitive: true } },
+      { id: 'id-2', s: { importance: 0.85, kind: 'fact', sensitive: false } },
+    ]);
+  });
+
+  test('falha no writeState loga o id e não derruba o turno', async () => {
+    const result = await rememberChatTurn(
+      { user: 'x', project: 'diario' },
+      {
+        extract: async () => [{ text: PAIN, title: 'dor', relevance: 5, kind: 'state', sensitive: false }],
+        save: async (fact) => [{ id: 'atom-9', memory: fact, action: 'ADD' }],
+        writeState: async () => { throw new Error('qdrant down'); },
+      },
+    );
+    expect(result[0]).toMatchObject({ id: 'atom-9' });
   });
 });

@@ -13,7 +13,8 @@
  * Fail closed: if extraction throws, the transcript is not saved.
  */
 
-import { addMemoryWithConflictCheck, setMemoryFeedback } from './mem0.js';
+import { addMemoryWithConflictCheck, setMemoryFeedback, type FeedbackKind } from './mem0.js';
+import { setImportance as stateSetImportance } from './memory-state.js';
 import { runFastLlmJson } from './llm-client.js';
 
 export const MAX_CHAT_FACTS = 5;
@@ -47,6 +48,52 @@ export interface ChatFact {
   text: string;
   /** Short display title: ideal 3 words, max 6, no "o usuário". */
   title: string;
+  /** Extractor relevance 1-5. Always set after normalizeChatFactPairs. */
+  relevance?: number;
+  /** Extractor kind. Always set after normalizeChatFactPairs. */
+  kind?: FeedbackKind;
+  /** True for mental health, crisis, grief, substance use. Set after normalization. */
+  sensitive?: boolean;
+}
+
+/** Rating carried alongside a fact (extractor origin record + state write). */
+export interface ChatFactRating {
+  relevance: number;
+  kind: FeedbackKind;
+  sensitive: boolean;
+}
+
+/**
+ * Rating criteria for extractor-rated chat facts. Exported because Tarefa C
+ * reuses the same scale when backfilling old memories. Kept short — it ships
+ * inside every extraction prompt.
+ */
+export const CHAT_FACT_RATING_CRITERIA =
+  `Relevância (1-5): 1 = detalhe passageiro do dia; 2 = episódio pontual mas digno de registro; 3 = hábito ou preferência estável; 4 = fato importante e duradouro; 5 = central na vida da pessoa (saúde, remédios, diagnóstico, pessoas próximas, moradia, trabalho). ` +
+  `Kind: "state" é estado transitório ("está com dor na têmpora hoje", "dormiu mal ontem"); "fact" é o resto ("tem psiquiatra pelo SUS", "mora com a mãe"). ` +
+  `Sensitive: true para saúde mental, crise, luto e uso de substâncias; false para o resto.`;
+
+/** Normalize an extractor rating. Invalid → defaults; the fact is never dropped for this. */
+export function sanitizeChatRating(raw: unknown): ChatFactRating {
+  const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const r = o['relevance'];
+  return {
+    relevance: Number.isInteger(r) && (r as number) >= 1 && (r as number) <= 5 ? (r as number) : 3,
+    kind: o['kind'] === 'state' ? 'state' : 'fact',
+    sensitive: o['sensitive'] === true,
+  };
+}
+
+/** Extractor relevance (1-5) → stored importance. Off-scale input → neutral 0.5. */
+export function relevanceToImportance(relevance: number): number {
+  switch (relevance) {
+    case 1: return 0.2;
+    case 2: return 0.35;
+    case 3: return 0.5;
+    case 4: return 0.7;
+    case 5: return 0.85;
+    default: return 0.5;
+  }
 }
 
 export interface ChatMemoryResult {
@@ -150,7 +197,8 @@ export function normalizeChatFactPairs(facts: unknown): ChatFact[] {
     const key = t.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ text: t, title: normalizeChatTitle(rawTitle, t) });
+    const rating = sanitizeChatRating(raw);
+    out.push({ text: t, title: normalizeChatTitle(rawTitle, t), ...rating });
     if (out.length >= MAX_CHAT_FACTS) break;
   }
   return out;
@@ -176,20 +224,21 @@ Regras:
 - Preservar o tempo verbal: nunca converta passado em presente. Se a pessoa marcou passado ("antes", "antigamente", "vivia", "sentia", "tinha", "na época", "quando", "resultou em"), o fato tem que carregar o marcador explícito no início ("Antes...", "Na época...") e usar pretérito. Sem marcador de presente ("hoje", "agora", "ainda", "continuo"), sintoma, rotina ou estado relatado no passado fica no passado.
 - Passado e presente misturados viram fatos separados, cada um com seu tempo.
 - A data da conversa é quando foi dito, não quando aconteceu. Não use a data da conversa como data do evento sem indicação explícita da pessoa.
-- Cada fato é um objeto {"text","title"}.
+- Cada fato é um objeto {"text","title","relevance","kind","sensitive"}.
 - "text": UMA frase curta, em português, sobre a pessoa, e deve conter "o usuário".
 - "text" precisa fazer sentido SOZINHO, sem ler a conversa. Teste: se o fato contiver pronome ou demonstrativo sem referente explícito ("isso", "essa mistura", "ele"), está errado — reescreva com o nome explícito.
 - "title": título curtíssimo do fato em português, ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der.
+- ${CHAT_FACT_RATING_CRITERIA}
 - No máximo ${MAX_CHAT_FACTS}. Sem "o assistente comentou", sem roteiro, sem citação de diálogo.
 - Não invente: só use nomes que aparecem no turno ou na fala do assistente.
 
 Exemplos:
-- PESSOA: "como todas as noites e nunca enjoo" + ASSISTENTE citando "banana assada com batata doce, ovo e queijo" → {"facts":[{"text":"O usuário come banana assada com batata doce, ovo e queijo no almoço e no jantar e nunca enjoa.","title":"banana assada com batata doce"}]}
+- PESSOA: "como todas as noites e nunca enjoo" + ASSISTENTE citando "banana assada com batata doce, ovo e queijo" → {"facts":[{"text":"O usuário come banana assada com batata doce, ovo e queijo no almoço e no jantar e nunca enjoa.","title":"banana assada com batata doce","relevance":3,"kind":"fact","sensitive":false}]}
 - PESSOA: "oi" → {"facts":[]}
 - PESSOA: "sim" + ASSISTENTE: "Você gostou do filme?" → {"facts":[]}
-- PESSOA: "fechado" + ASSISTENTE: "Proponho usar o Haiku 5.5 na conversa, topa?" → {"facts":[{"text":"O usuário aceitou usar o Haiku 5.5 como modelo de conversa.","title":"Haiku 5.5 como modelo"}]}
-- PESSOA: "antes eu so vivia chapado, e com essa dor pulsante na têmpora, vivia fumando e trabalhando 24h, o que resultou no surto que tive" → {"facts":[{"text":"Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.","title":"época agitada antes do surto"}]}
-- PESSOA: "hoje estou com dor pulsante na têmpora" → {"facts":[{"text":"O usuário está com dor pulsante na têmpora.","title":"dor pulsante na têmpora"}]}
+- PESSOA: "fechado" + ASSISTENTE: "Proponho usar o Haiku 5.5 na conversa, topa?" → {"facts":[{"text":"O usuário aceitou usar o Haiku 5.5 como modelo de conversa.","title":"Haiku 5.5 como modelo","relevance":3,"kind":"fact","sensitive":false}]}
+- PESSOA: "antes eu so vivia chapado, e com essa dor pulsante na têmpora, vivia fumando e trabalhando 24h, o que resultou no surto que tive" → {"facts":[{"text":"Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.","title":"época agitada antes do surto","relevance":5,"kind":"fact","sensitive":true}]}
+- PESSOA: "hoje estou com dor pulsante na têmpora" → {"facts":[{"text":"O usuário está com dor pulsante na têmpora.","title":"dor pulsante na têmpora","relevance":2,"kind":"state","sensitive":false}]}
 
 Data da conversa: ${date}
 
@@ -199,7 +248,7 @@ ${input.user.trim()}
 ASSISTENTE:
 ${assistant}
 
-Responda só JSON: {"facts":[{"text":"...","title":"..."}]}`;
+Responda só JSON: {"facts":[{"text":"...","title":"...","relevance":3,"kind":"fact","sensitive":false}]}`;
 }
 
 /** Prefixo dos digests semanais — nunca entra no backfill de títulos. */
@@ -234,7 +283,7 @@ export async function extractChatFacts(
   const user = input.user.trim();
   if (!user) return [];
   const result = await runJson<{ facts?: unknown }>(buildChatExtractPrompt(input), {
-    maxTokens: 1024,
+    maxTokens: 1536, // facts now carry title + relevance/kind/sensitive
     temperature: 0,
   });
   return normalizeChatFactPairs(result?.facts);
@@ -246,24 +295,30 @@ const NON_STORED_IDS = new Set(['noop', 'duplicate', 'blocked', 'rejected', 'unk
 /**
  * Extract, then save each fact alone (conflict check, no Mem0 split, no bundle).
  * The title is stored as feedback metadata after the save (merge — never
- * touches the verbatim body). Empty extraction is a NOOP. Extractor failure
- * throws — the transcript is not stored.
+ * touches the verbatim body). Importance/kind/sensitive come from the
+ * extractor rating and are persisted via memory-state right after each save.
+ * Empty extraction is a NOOP. Extractor failure throws — the transcript is
+ * not stored.
  */
 export async function rememberChatTurn(
   input: ChatTurnInput,
   deps?: {
     extract?: (input: ChatTurnInput) => Promise<ChatFact[]>;
-    save?: (fact: string, project: string | undefined, title?: string) => Promise<ChatMemoryResult[]>;
+    save?: (fact: string, project: string | undefined, title?: string, rating?: ChatFactRating) => Promise<ChatMemoryResult[]>;
+    /** State persistence seam (default: memory-state). Injected in tests. */
+    writeState?: (id: string, state: { importance: number; kind: FeedbackKind; sensitive: boolean }) => Promise<void>;
   },
 ): Promise<ChatMemoryResult[]> {
   const extract = deps?.extract ?? extractChatFacts;
-  const save = deps?.save ?? (async (fact, project, title) => {
+  const save = deps?.save ?? (async (fact, project, title, rating) => {
     const rows = await addMemoryWithConflictCheck(fact, project, {
       inferFalse: true,
       chatAtom: true,
       metadata: {
         source: 'chat',
         chat_date: input.date ?? new Date().toISOString().slice(0, 10),
+        // Origin record: how the extractor rated this fact.
+        ...(rating ? { chat_relevance: rating.relevance, chat_kind: rating.kind, chat_sensitive: rating.sensitive } : {}),
       },
     });
     // Persist the title as feedback metadata (merge — never touches the
@@ -278,6 +333,10 @@ export async function rememberChatTurn(
       }
     }
     return rows;
+  });
+  const writeState = deps?.writeState ?? (async (id, s) => {
+    await stateSetImportance(id, s.importance);
+    await setMemoryFeedback(id, { kind: s.kind, sensitive: s.sensitive });
   });
 
   let facts: ChatFact[];
@@ -294,7 +353,8 @@ export async function rememberChatTurn(
 
   const saved: ChatMemoryResult[] = [];
   for (const fact of facts) {
-    const rows = await save(fact.text, input.project, fact.title);
+    const rating = sanitizeChatRating(fact);
+    const rows = await save(fact.text, input.project, fact.title, rating);
     for (const row of rows) {
       // Surface the stored title on the result (a custom save may already set it).
       const existing = (row as Partial<ChatMemoryResult>).title;
@@ -302,6 +362,19 @@ export async function rememberChatTurn(
         saved.push({ ...row, title: fact.title });
       } else {
         saved.push({ ...row });
+      }
+      // Extractor-owned state. Best-effort: the memory is already saved, so a
+      // state failure logs the id and lets the turn succeed — Tarefa C
+      // reprocesses memories left without a note.
+      if (row.id && !NON_STORED_IDS.has(row.id)) {
+        await writeState(row.id, {
+          importance: relevanceToImportance(rating.relevance),
+          kind: rating.kind,
+          sensitive: rating.sensitive,
+        }).catch((err) => console.error(
+          `[chat-extract] state write failed for ${row.id}, reprocess later:`,
+          err instanceof Error ? err.message : String(err),
+        ));
       }
     }
   }

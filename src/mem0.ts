@@ -701,9 +701,12 @@ Original: ${text}`
   }
   invalidateMem0Cache(project).catch(() => {});
 
-  // Fire-and-forget: score and store importance for each saved memory
+  // Fire-and-forget: score and store importance for each saved memory.
+  // chatAtom skips this entirely: the extractor owns importance/kind/
+  // sensitive for chat facts (rememberChatTurn persists them right after
+  // the save) — the regex heuristics must not overwrite extractor values.
   for (const item of mapped) {
-    if (item.id && item.id !== 'unknown') {
+    if (item.id && item.id !== 'unknown' && !opts?.chatAtom) {
       (async () => {
         const score = scoreImportance(enrichedText);
         await setMemoryImportance(item.id, score);
