@@ -23,7 +23,12 @@ const EXPECTED = [
 ];
 
 const LIVE_PROJECT = 'smoke-live-test';
-const LIVE_TEXT = `Smoke-test marker ${new Date().toISOString()}: the Zephyr probe prefers violet over amber for dashboard accents.`;
+const LIVE_TEXT = 'Session 12/03/2026: the user decided to migrate the session cache to Redis after the login page crashed twice on Safari. The fix landed in v2.4.1 and the deploy is scheduled for Friday. The user prefers bun over npm for running scripts.';
+// NOTE: atomic mode decomposes this into ~3 atoms (verified). Keep it a
+// multi-fact session note: one-liner trivia makes the extractor return zero
+// atoms, and short sentences without specifics die in the quality gate — both
+// fail honestly, but they test the wrong thing. Raw is NOT used here on
+// purpose: this is the only end-to-end proof of Mem0 decomposition.
 
 const child = Bun.spawn(['bun', 'run', 'src/mcp.ts'], {
   cwd: import.meta.dir + '/..',
@@ -116,7 +121,7 @@ try {
       markerIds = [...remembered.matchAll(/\(id: ([0-9a-f-]{36})\)/g)].map(m => m[1]);
       check(markerIds.length > 0 && !remembered.includes('skipped') && !remembered.includes('rejected'),
         `live remember stores the marker (${markerIds.length} atom(s))`, remembered);
-      const found = await callTool('recall', { query: 'Zephyr probe dashboard accents violet amber', project: LIVE_PROJECT, limit: 5 });
+      const found = await callTool('recall', { query: 'migrate session cache Redis login crash Safari deploy Friday bun npm', project: LIVE_PROJECT, limit: 5 });
       check(markerIds.every(id => found.includes(id)),
         'live recall retrieves the marker atom(s)', found);
       const stats = await callTool('graph_stats', {});
@@ -127,7 +132,7 @@ try {
         catch (e) { check(false, `live cleanup (forget ${id})`, e instanceof Error ? e.message : String(e)); }
       }
       if (markerIds.length > 0) {
-        const gone = await callTool('recall', { query: 'Zephyr probe dashboard accents', project: LIVE_PROJECT, limit: 5 });
+        const gone = await callTool('recall', { query: 'migrate session cache Redis login crash', project: LIVE_PROJECT, limit: 5 });
         check(gone.includes('No memories found'), 'live forget removes all marker atoms', gone);
       }
       // remember also ingests entities into graph.json — remove nodes created

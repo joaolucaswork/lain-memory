@@ -549,7 +549,14 @@ export function buildMem0Config() {
   // chat client in llm-client.ts and may name a non-OpenAI model).
   const embedModel  = process.env.LAIN_EMBED_MODEL
     ?? (useGateway ? 'openai/text-embedding-3-small' : 'text-embedding-3-small');
-  const llmModel    = process.env.LAIN_LLM_MODEL
+  // Provider is openai_structured (not openai): it forwards Mem0's
+  // response_format:json_object untouched. The plain openai path goes through
+  // installGatewayPatch, which rewrites the request as an empty-properties
+  // json_schema — gpt-4o-mini tolerates it, Haiku does not, and Mem0's zod
+  // parse then silently yields zero atoms. Verified matrix (Nov 2026):
+  // openai_structured + Haiku via OpenRouter extracts normally, so the model
+  // follows LAIN_LLM_MODEL again — no separate pin needed.
+  const llmModel = process.env.LAIN_LLM_MODEL
     ?? (useGateway ? 'openai/gpt-4o-mini' : 'gpt-4o-mini');
   if (useGateway) {
     installGatewayPatch();
@@ -574,7 +581,9 @@ export function buildMem0Config() {
       // can't be latency-pinned from here; bound it via LAIN_LLM_MODEL choice.
       // Deliberately no `timeout`: a slow extraction should delay, not fail,
       // the save (fail-fast here would lose the memory).
-      provider: 'openai' as const,
+      // Provider openai_structured forwards response_format:json_object
+      // untouched (see above) — required for non-OpenAI models.
+      provider: 'openai_structured' as const,
       config: { apiKey, model: llmModel, ...(useGateway ? { baseURL: gatewayBase } : {}) },
     },
   };

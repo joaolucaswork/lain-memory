@@ -100,14 +100,25 @@ describe('buildMem0Config — AI Gateway routing', () => {
     expect(cfg.llm.config.apiKey).toBe('new-key');
   });
 
-  it('I — LAIN_LLM_MODEL / LAIN_EMBED_MODEL override Mem0 models', () => {
+  it('I — LAIN_LLM_MODEL drives the extractor model; provider is openai_structured', () => {
     if (!buildMem0Config) throw new TypeError('buildMem0Config is not exported from mem0.ts');
     process.env.AI_GATEWAY_API_KEY = GATEWAY_KEY;
-    process.env.LAIN_LLM_MODEL = 'custom/llm';
+    process.env.LAIN_LLM_MODEL = 'custom/chat-model';
     process.env.LAIN_EMBED_MODEL = 'custom/embed';
     const cfg = buildMem0Config();
-    expect(cfg.llm.config.model).toBe('custom/llm');
+    // openai_structured forwards Mem0's json_object untouched so non-OpenAI
+    // models honor the extraction format (plain openai + gateway patch does not).
+    expect(cfg.llm.provider).toBe('openai_structured');
+    expect(cfg.llm.config.model).toBe('custom/chat-model');
     expect(cfg.embedder.config.model).toBe('custom/embed');
+  });
+
+  it('J — default extractor model stays gateway-prefixed', () => {
+    if (!buildMem0Config) throw new TypeError('buildMem0Config is not exported from mem0.ts');
+    process.env.AI_GATEWAY_API_KEY = GATEWAY_KEY;
+    const cfg = buildMem0Config();
+    expect(cfg.llm.provider).toBe('openai_structured');
+    expect(cfg.llm.config.model).toBe('openai/gpt-4o-mini');
   });
 });
 

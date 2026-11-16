@@ -201,7 +201,7 @@ All via env (see [.env.example](./.env.example)):
 | `LAIN_API_KEY` | empty (open localhost) | Bearer auth |
 | `LAIN_WORKSPACE_DIR` | `~/lain-memory-workspace` | Own workspace (graph, seeds, PGS sessions; `~` expanded, dir must exist) |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Vector backend |
-| `LAIN_LLM_BASE_URL` / `LAIN_LLM_API_KEY` / `LAIN_LLM_MODEL` / `LAIN_EMBED_MODEL` | gateway defaults | Unified LLM contract (`LAIN_LLM_*` → `AI_GATEWAY_*` → OpenAI) |
+| `LAIN_LLM_BASE_URL` / `LAIN_LLM_API_KEY` / `LAIN_LLM_MODEL` / `LAIN_EMBED_MODEL` | gateway defaults | Unified LLM contract (`LAIN_LLM_*` → `AI_GATEWAY_*` → OpenAI). `LAIN_LLM_MODEL` drives chat and Mem0 extraction (Mem0 uses the `openai_structured` provider so non-OpenAI models honor the extraction format) |
 | `LAIN_REDIS_ENABLED` / `LAIN_REDIS_HOST` / `LAIN_REDIS_PORT` | `true` / `127.0.0.1` / `6379` | Cache (all paths degrade without it) |
 | `LAIN_GRAPHRAG_ENABLED` / `_MAX_CONTEXT_NODES` / `_MAX_DEPTH` | `false` / `10` / `3` | GraphRAG tuning |
 | `LAIN_INSTANCE_ID` | empty | Suffixes collection, graph file, Redis prefix |
