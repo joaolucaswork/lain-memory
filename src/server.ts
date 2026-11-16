@@ -11,12 +11,6 @@
  */
 
 import {
-  searchMemory,
-  cachedSearchMemory,
-  getMemories,
-  consolidateMemories,
-  scanAndCleanProjectMemories,
-  getContextForSpawn,
   isMem0Configured,
 } from './mem0.js';
 import {
@@ -28,12 +22,10 @@ import {
   removeNodes,
   removeRelationships,
   runAutoclean,
-  resolveEntities,
   ingestExtracted,
   getGraphSyncStatus,
   reconcileGraph,
 } from './graphrag.js';
-import { classifyMemoryAction } from './contradiction-detector.js';
 import {
   handleAdd,
   handleBundle,
@@ -43,8 +35,19 @@ import {
   handleRestore,
   handleUpdate,
 } from './server/routes/memory-write.js';
+import {
+  handleConsolidate,
+  handleContext,
+  handleContradictions,
+  handleContradictionsDismiss,
+  handleContradictionScan,
+  handleList,
+  handleMetrics,
+  handleRecall,
+  handleResolveEntities,
+  handleScan,
+} from './server/routes/memory-read.js';
 import { json } from './server/http.js';
-import { getMetrics } from './mem-metrics.js';
 import { extractSeed, listSeeds } from './seed-extraction.js';
 import { PGSEngine } from './pgs/index.js';
 import { createPGSProviders } from './pgs/llm-provider.js';
@@ -85,23 +88,11 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/memory/remember':
       return handleRemember(data);
 
-    case '/api/memory/recall': {
-      const result = data.cached
-        ? await cachedSearchMemory(data.query, data.project, data.limit)
-        : await searchMemory(data.query, data.project, data.limit);
-      // debug:true pins the measurement contract (adjustedScore + importance
-      // on every hit). RankedMemory already carries both, so the spread is a
-      // no-op today — non-debug responses are byte-identical to before.
-      if (data.debug) {
-        return json(result.map((r) => ({ ...r, adjustedScore: r.adjustedScore, importance: r.importance ?? null })));
-      }
-      return json(result);
-    }
+    case '/api/memory/recall':
+      return handleRecall(data);
 
-    case '/api/memory/list': {
-      const result = await getMemories(data.project, data.limit);
-      return json(result);
-    }
+    case '/api/memory/list':
+      return handleList(data);
 
     case '/api/memory/forget':
       return handleForget(data);
@@ -115,109 +106,35 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/memory/add':
       return handleAdd(data);
 
-    case '/api/memory/context': {
-      // Spawn-context composition. Keeps the
-      // query-building + budget logic server-side with the ranker.
-      const result = await getContextForSpawn(data.message, data.project, data.charBudget, data.limits);
-      return json({ context: result });
-    }
+    case '/api/memory/context':
+      return handleContext(data);
 
     case '/api/memory/update':
       return handleUpdate(data);
 
-    case '/api/memory/consolidate': {
-      const result = await consolidateMemories(data.project);
-      return json(result);
-    }
+    case '/api/memory/consolidate':
+      return handleConsolidate(data);
 
     case '/api/memory/bundle':
       return handleBundle(data);
 
-    case '/api/memory/scan': {
-      if (!data.project) return json({ error: 'project is required for memory scan' }, 400);
-      const report = await scanAndCleanProjectMemories(data.project);
-      return json({
-        total: report.total,
-        deleted: report.deleted,
-        message: report.deleted === 0
-          ? `No stale memories to clean for project "${data.project}".`
-          : `Cleaned ${report.deleted} stale memories from "${data.project}".`,
-        deletedItems: report.deletedItems,
-      });
-    }
+    case '/api/memory/scan':
+      return handleScan(data);
 
-    case '/api/memory/resolve-entities': {
-      const result = await resolveEntities(data.threshold ?? 0.75, data.project);
-      return json(result);
-    }
+    case '/api/memory/resolve-entities':
+      return handleResolveEntities(data);
 
-    case '/api/memory/contradiction-scan': {
-      // Fase 4: diagnostic only — detects and reports, never writes.
-      // NOOP means "ignore" (not "delete"); UPDATE/DELETE verdicts are
-      // actioned by the maintenance/policy flows, not by this scan.
-      // Paged (limit/offset) so 100x LLM no longer times out: callers
-      // iterate offset += limit until scanned < limit.
-      const project = data?.project as string | undefined;
-      const limit = Math.min(Math.max(Number(data?.limit ?? 20) || 20, 1), 100);
-      const offset = Math.max(Number(data?.offset ?? 0) || 0, 0);
-      const fetched = await getMemories(project, Math.min(offset + limit, 500));
-      const memories = fetched.slice(offset, offset + limit);
-      const results: { id: string; action: string; domainOp: string; reason: string; memory: string }[] = [];
-      for (const mem of memories) {
-        const similar = await searchMemory(mem.memory, project, 5);
-        const others = similar
-          .filter(s => s.id !== mem.id && (s.score ?? 0) > 0.6)
-          .map(s => ({ id: s.id, memory: s.memory, score: s.score ?? 0 }));
-        if (others.length === 0) continue;
-        const classification = await classifyMemoryAction(mem.memory, others);
-        if (classification.action !== 'ADD') {
-          const { domainOpForClassification } = await import('./memory-policy.js');
-          results.push({
-            id: mem.id,
-            action: classification.action,
-            domainOp: domainOpForClassification(classification.action),
-            reason: classification.reason,
-            memory: mem.memory.slice(0, 100),
-          });
-        }
-      }
-      return json({ scanned: memories.length, issues: results.length, results, writes: 0, limit, offset });
-    }
+    case '/api/memory/contradiction-scan':
+      return handleContradictionScan(data);
 
     case '/api/memory/metrics':
-      return json({ ...getMetrics(), graphOutboxPending: getGraphSyncStatus().pending });
+      return handleMetrics(data);
 
-    case '/api/memory/contradictions': {
-      // Item 3: visible backlog — UPDATE merge candidates + DELETE
-      // contradictions queued by the automatic sweep. Read-only.
-      const { listPending } = await import('./pending-review.js');
-      const kind = data?.kind as 'merge' | 'contradiction' | undefined;
-      const limit = Math.min(Math.max(Number(data?.limit ?? 100) || 100, 1), 200);
-      const items = listPending(kind);
-      return json({
-        total: items.length,
-        pending: items.slice(0, limit).map(e => ({
-          id: e.id,
-          kind: e.kind,
-          verdict: e.verdict,
-          scope: e.scope ?? 'global',
-          memoryId: e.memoryId,
-          memory: e.memory.slice(0, 200),
-          relatedIds: e.related.map(r => r.id),
-          reason: e.reason,
-          attempts: e.attempts,
-          detectedAt: e.detectedAt,
-        })),
-      });
-    }
+    case '/api/memory/contradictions':
+      return handleContradictions(data);
 
-    case '/api/memory/contradictions/dismiss': {
-      if (!data?.id) return json({ error: 'id required' }, 400);
-      const { dismissEntry } = await import('./pending-review.js');
-      const ok = await dismissEntry(data.id);
-      if (!ok) return json({ error: 'entry not found' }, 404);
-      return json({ success: true });
-    }
+    case '/api/memory/contradictions/dismiss':
+      return handleContradictionsDismiss(data);
 
     case '/api/graph/query': {
       const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
