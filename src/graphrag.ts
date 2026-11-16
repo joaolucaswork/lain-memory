@@ -10,9 +10,9 @@ import Graph from 'graphology';
 import { bfsFromNode } from 'graphology-traversal';
 import path from 'path';
 import { existsSync, mkdirSync, appendFileSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { runFastLlmJson } from './llm-client.js';
-import { KNOWLEDGE_DIR, INSTANCE_ID } from './workspace.js';
+import { KNOWLEDGE_DIR } from './workspace.js';
 import { getConfig } from './config.js';
 import { getRedis, isRedisAvailable } from './redis.js';
 import { shouldRejectEntity, shouldRejectRelationship, sweepGraph, type SweepResult } from './graph-autoclean.js';
@@ -38,6 +38,21 @@ import {
   upsertEntity,
   upsertRelationship,
 } from './graphrag/store.js';
+import {
+  CACHE_TTL_DECISIONS,
+  CACHE_TTL_EXTRACTION,
+  CACHE_TTL_PGS,
+  CACHE_TTL_QUERY,
+  cacheGet,
+  cacheSet,
+  cachedGetStats,
+  hashText,
+  invalidateGraphCache,
+} from './graphrag/cache.js';
+export {
+  cachedGetStats,
+  invalidateGraphCache,
+} from './graphrag/cache.js';
 export {
   getStats,
   initGraph,
@@ -71,70 +86,11 @@ export type {
   RelationshipAttrs,
 } from './graphrag/types.js';
 
-// ─── Redis Cache ───
-
-const CACHE_PREFIX = 'cache:graphrag:';
-const CACHE_TTL_QUERY = 300;       // 5 min for query results
-const CACHE_TTL_DECISIONS = 300;   // 5 min for decision queries
-const CACHE_TTL_STATS = 60;        // 1 min for stats (changes often)
-const CACHE_TTL_PGS = 300;         // 5 min for PGS export
-const CACHE_TTL_EXTRACTION = 3600; // 1 hour for entity extraction (LLM calls — gpt-4o-mini)
-
-function hashText(text: string): string {
-  return createHash('sha256').update(text).digest('hex').slice(0, 16);
-}
-
-async function cacheGet<T>(key: string): Promise<T | null> {
-  if (!isRedisAvailable()) return null;
-  try {
-    const cached = await getRedis().get(`${CACHE_PREFIX}${key}`);
-    if (cached !== null) return JSON.parse(cached);
-  } catch {}
-  return null;
-}
-
-async function cacheSet(key: string, value: unknown, ttl: number): Promise<void> {
-  if (!isRedisAvailable()) return;
-  getRedis().set(`${CACHE_PREFIX}${key}`, JSON.stringify(value), 'EX', ttl).catch(() => {});
-}
-
-export async function invalidateGraphCache(): Promise<void> {
-  if (!isRedisAvailable()) return;
-  try {
-    const redis = getRedis();
-    const p = INSTANCE_ID ? `lain:${INSTANCE_ID}:` : 'lain:';
-    const stream = redis.scanStream({ match: `${p}${CACHE_PREFIX}*`, count: 100 });
-    const keysToDelete: string[] = [];
-    for await (const keys of stream) {
-      keysToDelete.push(...(keys as string[]));
-    }
-    if (keysToDelete.length > 0) {
-      const pipeline = redis.pipeline();
-      for (const k of keysToDelete) {
-        pipeline.del(k.slice(p.length));
-      }
-      await pipeline.exec();
-    }
-    console.log(`[graphrag] Cache invalidated (${keysToDelete.length} keys)`);
-  } catch (err) {
-    console.error('[graphrag] Cache invalidation error:', err);
-  }
-}
-
 // ─── Types ───
 
 interface ExtractionResult {
   entities: Array<{ name: string; type: EntityType; description: string }>;
   relationships: Array<{ subject: string; predicate: string; object: string }>;
-}
-
-export async function cachedGetStats(project?: string): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
-  const scopeSuffix = project ? normalizeProject(project) : '';
-  const cached = await cacheGet<{ nodes: number; edges: number; types: Record<string, number> }>(`stats:${scopeSuffix}`);
-  if (cached) return cached;
-  const result = getStats(project);
-  await cacheSet(`stats:${scopeSuffix}`, result, CACHE_TTL_STATS);
-  return result;
 }
 
 // ─── Entity Extraction ───
