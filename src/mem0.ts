@@ -140,17 +140,22 @@ function extractAbsoluteUrls(s: string): string[] {
 
 /**
  * Calculate a recency decay factor for a memory.
- * Score halves every 30 days since last update (or creation).
+ * Score halves every halfLifeDays since last update (or creation).
  * Returns 1.0 for missing dates (neutral — no penalty for undated memories).
  * Returns 1.0 for future dates (clock skew tolerance).
  *
- * Formula: 2^(-daysOld / 30)
- * Day 0 → 1.00, Day 30 → 0.50, Day 60 → 0.25, Day 90 → 0.125
+ * Half-life by kind (Fase 0 feedback):
+ *   importance >= 0.8 → 180d (confirmed-important, protected from decay)
+ *   kind = state       → 7d  (transient: reading, feeling, doing — fades fast)
+ *   kind = fact        → 90d (stable: lives-near, has-psychiatrist — persists)
+ *
+ * Formula: 2^(-daysOld / halfLifeDays)
  */
 export function ageDecayScore(
   createdAt: string | undefined,
   updatedAt?: string | undefined,
-  importance?: number
+  importance?: number,
+  kind?: FeedbackKind | null,
 ): number {
   const reference = updatedAt ?? createdAt;
   if (!reference) return 1.0;
@@ -159,7 +164,8 @@ export function ageDecayScore(
   const daysOld = (Date.now() - refMs) / (1000 * 60 * 60 * 24);
   if (daysOld <= 0) return 1.0;
   // High-importance memories use longer halfLife to protect them from premature decay
-  const halfLifeDays = (importance !== undefined && importance >= 0.8) ? 180 : 30;
+  const halfLifeDays = (importance !== undefined && importance >= 0.8) ? 180
+    : kind === 'state' ? 7 : 90;
   return Math.pow(2, -daysOld / halfLifeDays);
 }
 
@@ -179,10 +185,11 @@ function termPresenceBoost(memoryText: string, queryTerms: string[]): number {
  * Results without timestamps are treated as neutral (decay factor = 1.0).
  * Returns the same results with an extra `adjustedScore` field, sorted descending.
  *
- * Formula: 0.5·cosine + 0.3·ageDecay + 0.2·importance + termBoost (capped at 1.0)
+ * Formula: (0.5·cosine + 0.3·ageDecay_kind + 0.2·importance) · (0.5 + 0.5·confidence) + termBoost (capped at 1.0)
  * Importance defaults to 0.5 (neutral) when not yet scored.
+ * Confidence defaults to 0.5 (neutral, ×0.75) — confirmed memories (1.0) keep full score.
  */
-export function applyAgeDecayToResults<T extends { id?: string; score?: number; created_at?: string; updated_at?: string; importance?: number | null }>(
+export function applyAgeDecayToResults<T extends { id?: string; score?: number; created_at?: string; updated_at?: string; importance?: number | null; confidence?: number | null; kind?: FeedbackKind | null }>(
   results: T[],
   queryTerms?: string[]
 ): (T & { adjustedScore: number })[] {
@@ -192,12 +199,13 @@ export function applyAgeDecayToResults<T extends { id?: string; score?: number; 
   }
   const withAdjusted = results.map(r => {
     const cosine = r.score ?? 0.5;
-    const decay = ageDecayScore(r.created_at, r.updated_at, r.importance ?? undefined);
+    const decay = ageDecayScore(r.created_at, r.updated_at, r.importance ?? undefined, r.kind ?? undefined);
     const importance = r.importance ?? IMPORTANCE_DEFAULT; // null → 0.5 neutral
+    const confidence = r.confidence ?? FEEDBACK_DEFAULTS.confidence; // null → 0.5 neutral (×0.75)
     const termBoost = queryTerms ? termPresenceBoost((r as any).memory ?? (r as any).content ?? '', queryTerms) : 0;
     return {
       ...r,
-      adjustedScore: Math.min(1.0, 0.5 * cosine + 0.3 * decay + 0.2 * importance + termBoost),
+      adjustedScore: Math.min(1.0, (0.5 * cosine + 0.3 * decay + 0.2 * importance) * (0.5 + 0.5 * confidence) + termBoost),
     };
   });
   return withAdjusted.sort((a, b) => b.adjustedScore - a.adjustedScore);
@@ -810,6 +818,10 @@ Original: ${text}`
         const score = scoreImportance(enrichedText);
         await setMemoryImportance(item.id, score);
         console.log(`[mem0] Importance scored: ${score.toFixed(2)} for ${item.id.slice(0, 8)}…`);
+        // Tag transient states at save time (fact is the neutral default).
+        if (heuristicKind(enrichedText) === 'state') {
+          await setMemoryFeedback(item.id, { kind: 'state' });
+        }
       })().catch(() => {});
     }
   }
@@ -988,7 +1000,7 @@ export function resolveMinRecallScore(env: NodeJS.ProcessEnv = process.env): num
   return parseFloat(env.LAIN_MIN_RECALL_SCORE ?? String(DEFAULT_MIN_RECALL_SCORE)) || 0;
 }
 
-export async function searchMemory(query: string, project?: string, limit: number = 10): Promise<{ id: string; memory: string; score?: number; created_at?: string; updated_at?: string }[]> {
+export async function searchMemory(query: string, project?: string, limit: number = 10): Promise<RankedMemory[]> {
   const m = getClient();
   const result = await m.search(query, {
     // v3 requires snake_case entity keys in filters (camelCase throws).
@@ -1003,48 +1015,36 @@ export async function searchMemory(query: string, project?: string, limit: numbe
     created_at: item.created_at ?? item.createdAt,
     updated_at: item.updated_at ?? item.updatedAt,
   }));
-  return applyMinScoreFilter(mapped, resolveMinRecallScore());
-}
-
-// ─── Redis-backed Mem0 Cache ───
-
-const MEM0_CACHE_TTL = 300; // 5 minutes
-
-function mem0CacheKey(query: string, project?: string): string {
-  const normalized = `${query}:${project || ''}`.toLowerCase().trim();
-  let hash = 0;
-  for (let i = 0; i < normalized.length; i++) {
-    hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
-  }
-  return `cache:mem0:${hash}`;
+  const filtered = applyMinScoreFilter(mapped, resolveMinRecallScore());
+  return rankRecallResults(filtered, query);
 }
 
 /**
- * Search memory with Redis cache. Falls back to direct API call if Redis unavailable.
- * Cache hit: ~0.5ms vs API call: ~200-500ms.
+ * A memory hit after the recall pipeline: raw cosine plus ranking signals.
+ * `status` is omitted — archived memories are filtered before this point.
  */
-export async function cachedSearchMemory(query: string, project?: string, limit: number = 10): Promise<{ id: string; memory: string; score?: number; created_at?: string; updated_at?: string }[]> {
-  const key = mem0CacheKey(query, project);
+export interface RankedMemory {
+  id: string;
+  memory: string;
+  score?: number;
+  created_at?: string;
+  updated_at?: string;
+  adjustedScore: number;
+  importance?: number | null;
+  confidence?: number;
+  kind?: FeedbackKind;
+}
 
-  // Try cache first
-  if (isRedisAvailable()) {
-    try {
-      const cached = await getRedis().get(key);
-      if (cached) {
-        incrementMetric('cacheHits');
-        return JSON.parse(cached);
-      }
-    } catch (err) {
-      // Cache read failed — fall through to API
-    }
-  }
-  incrementMetric('cacheMisses');
-
-  // Cache miss — call Mem0 API
-  const results = await searchMemory(query, project, limit);
-
+/**
+ * Shared recall pipeline (Fase 0 feedback): touch-boost recency, attach
+ * importance + feedback, drop archived, rank by adjusted score.
+ * Used by both cached and direct search so every recall path agrees.
+ */
+export async function rankRecallResults<
+  T extends { id: string; memory: string; score?: number; created_at?: string; updated_at?: string },
+>(results: T[], query: string): Promise<RankedMemory[]> {
   // Boost recently-accessed memories by using touch timestamp as virtual updated_at
-  let boostedResults = results;
+  let boostedResults: T[] = results;
   if (isRedisAvailable()) {
     try {
       boostedResults = await Promise.all(
@@ -1066,23 +1066,69 @@ export async function cachedSearchMemory(query: string, project?: string, limit:
     }
   }
 
-  // Fetch importance scores from Redis for composite ranking
-  let withImportance = boostedResults;
+  // Fetch importance + feedback from Redis for composite ranking.
+  // Archived memories are dropped here — every recall path excludes them.
+  type Enriched<U> = U & { importance: number | null; confidence: number; kind: FeedbackKind };
+  let withSignals: Array<Enriched<T>> =
+    boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, kind: 'fact' as FeedbackKind }));
   if (isRedisAvailable()) {
     try {
-      withImportance = await Promise.all(
+      const maybe: Array<Enriched<T> | null> = await Promise.all(
         boostedResults.map(async (r) => {
-          const importance = await getMemoryImportance(r.id);
-          return { ...r, importance };
+          const [importance, feedback] = await Promise.all([
+            getMemoryImportance(r.id),
+            getMemoryFeedback(r.id),
+          ]);
+          if (feedback.status === 'archived') return null;
+          return { ...r, importance, confidence: feedback.confidence, kind: feedback.kind };
         })
       );
+      withSignals = maybe.filter((r): r is Enriched<T> => r !== null);
     } catch {
-      // Importance fetch failed — use defaults (0.5 neutral)
+      // Signal fetch failed — rank on raw scores with neutral defaults
     }
   }
 
   const queryTerms = query.split(/\s+/).filter(t => t.length >= 3);
-  const withDecay = applyAgeDecayToResults(withImportance, queryTerms);
+  return applyAgeDecayToResults(withSignals, queryTerms);
+}
+
+// ─── Redis-backed Mem0 Cache ───
+
+const MEM0_CACHE_TTL = 300; // 5 minutes
+
+function mem0CacheKey(query: string, project?: string): string {
+  const normalized = `${query}:${project || ''}`.toLowerCase().trim();
+  let hash = 0;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
+  }
+  return `cache:mem0:${hash}`;
+}
+
+/**
+ * Search memory with Redis cache. Falls back to direct API call if Redis unavailable.
+ * Cache hit: ~0.5ms vs API call: ~200-500ms.
+ */
+export async function cachedSearchMemory(query: string, project?: string, limit: number = 10): Promise<RankedMemory[]> {
+  const key = mem0CacheKey(query, project);
+
+  // Try cache first
+  if (isRedisAvailable()) {
+    try {
+      const cached = await getRedis().get(key);
+      if (cached) {
+        incrementMetric('cacheHits');
+        return JSON.parse(cached);
+      }
+    } catch (err) {
+      // Cache read failed — fall through to API
+    }
+  }
+  incrementMetric('cacheMisses');
+
+  // Cache miss — full pipeline (touch-boost, signals, archived filter, rank)
+  const withDecay = await searchMemory(query, project, limit);
 
   // Touch top-3 results to boost their relevance (fire-and-forget)
   // touchMemoryTimestamp also reinforces importance score
@@ -1300,7 +1346,8 @@ export async function applyMemoryFeedback(
 ): Promise<MemoryFeedback> {
   const now = new Date().toISOString();
   const kindPatch = opts?.kind ? { kind: opts.kind } : {};
-  if (action === 'confirm') {
+  // Votes change ranking immediately — don't serve stale cached recalls.
+  invalidateMem0Cache().catch(() => {});  if (action === 'confirm') {
     const current = await getMemoryFeedback(memoryId);
     const next = await setMemoryFeedback(memoryId, {
       confidence: 1.0,
@@ -1362,6 +1409,24 @@ export async function removeFromBlocklist(text: string): Promise<void> {
   try {
     await getRedis().srem(FORGET_BLOCKLIST_KEY, blocklistHash(text));
   } catch { /* non-critical */ }
+}
+
+// ─── Kind Heuristic (fact vs state) ───
+// Fase 0: coarse text signals, no LLM. Errs toward `fact` (safe default —
+// facts decay slowly). Only `state` is ever persisted here; `fact` is the
+// neutral default and needs no key.
+
+const STATE_HINTS = [
+  /\b(hoje|agora|ainda|ontem|no momento|atualmente|essa semana|ultimamente|por enquanto)\b/i,
+  /\b\d{1,2}[h:]\d{2}\b/, // time of day ("14h30", "às 8:00")
+  /\b(estou|esta|está|to|tô|tá|continuo|sigo)\s+\w*(ando|endo|indo)\b/i, // progressive ("estou lendo")
+  /\b(lendo|tomando|usando|sentindo|fazendo|trabalhando|estudando|jogando|assistindo|vendo|ouvindo|comendo|bebendo|dormindo|acordando|saindo|voltando|passando)\b/i,
+  /\b(estou|está|esta|to|tô|ta|tá)\s+(com|me sentindo|sentindo)\b/i, // state report ("estou com dor")
+];
+
+/** Classify saved text as stable fact vs transient state. Pure, unit-tested. */
+export function heuristicKind(text: string): FeedbackKind {
+  return STATE_HINTS.some((re) => re.test(text)) ? 'state' : 'fact';
 }
 
 // ─── Memory Cleanup (memoryScan) ───
@@ -1642,6 +1707,7 @@ export async function restoreFromTrash(trashId: string): Promise<RestoreResult> 
   const fromProject = typeof meta.deleted_from === 'string' && meta.deleted_from !== 'global'
     ? meta.deleted_from
     : undefined;
+  const originalId = typeof meta.original_id === 'string' ? meta.original_id : undefined;
   let savedId: string | null = null;
   try {
     const saved = await addMemory(found.memory, fromProject, {
@@ -1658,6 +1724,16 @@ export async function restoreFromTrash(trashId: string): Promise<RestoreResult> 
   if (!savedId) {
     console.error(`[mem0] restore re-save unconfirmed for ${trashId} — trash preserved`);
     return { id: null, restored: false, reason: 're-save unconfirmed' };
+  }
+  // Preserve an explicit `state` vote from before the forget (the auto
+  // heuristic may not re-fire on the restored text).
+  if (originalId) {
+    try {
+      const originalFeedback = await getMemoryFeedback(originalId);
+      if (originalFeedback.kind === 'state') {
+        await setMemoryFeedback(savedId, { kind: 'state' });
+      }
+    } catch { /* keep heuristic kind */ }
   }
   await deleteMemory(trashId);
   await removeFromBlocklist(found.memory);

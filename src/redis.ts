@@ -53,12 +53,15 @@ export async function connectRedis(): Promise<boolean> {
     console.log('[redis] disabled via LAIN_REDIS_ENABLED=false');
     return false;
   }
+  const redis = getRedis();
+  if (redis.status === 'ready') return true; // idempotent — shared across callers
   try {
-    const redis = getRedis();
     await redis.connect();
     console.log('[redis] connected');
     return true;
   } catch (err: unknown) {
+    const status: string = getRedis().status;
+    if (status === 'ready' || status === 'connect') return true;
     console.warn('[redis] not available, using fallback:', errMsg(err));
     return false;
   }

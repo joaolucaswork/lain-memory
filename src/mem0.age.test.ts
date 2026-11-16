@@ -7,16 +7,38 @@ describe('ageDecayScore', () => {
     expect(ageDecayScore(now)).toBeCloseTo(1.0, 2);
   });
 
-  it('returns ~0.5 for a memory created 30 days ago', () => {
+  it('facts decay with 90d half-life (~0.79 at 30d)', () => {
     const d = new Date();
     d.setDate(d.getDate() - 30);
-    expect(ageDecayScore(d.toISOString())).toBeCloseTo(0.5, 1);
+    expect(ageDecayScore(d.toISOString())).toBeCloseTo(0.79, 1);
   });
 
-  it('returns ~0.25 for a memory created 60 days ago', () => {
+  it('facts decay with 90d half-life (~0.63 at 60d)', () => {
     const d = new Date();
     d.setDate(d.getDate() - 60);
-    expect(ageDecayScore(d.toISOString())).toBeCloseTo(0.25, 1);
+    expect(ageDecayScore(d.toISOString())).toBeCloseTo(0.63, 1);
+  });
+
+  it('states decay with 7d half-life (~0.5 at 7d)', () => {
+    const d = new Date();
+    d.setDate(d.getDate() - 7);
+    expect(ageDecayScore(d.toISOString(), undefined, undefined, 'state')).toBeCloseTo(0.5, 1);
+  });
+
+  it('a 20d-old state has faded (~0.14) while a fact persists (~0.86)', () => {
+    const d = new Date();
+    d.setDate(d.getDate() - 20);
+    const iso = d.toISOString();
+    expect(ageDecayScore(iso, undefined, undefined, 'state')).toBeLessThan(0.2);
+    expect(ageDecayScore(iso, undefined, undefined, 'fact')).toBeGreaterThan(0.8);
+  });
+
+  it('importance >= 0.8 still protects with 180d half-life regardless of kind', () => {
+    const d = new Date();
+    d.setDate(d.getDate() - 90);
+    const iso = d.toISOString();
+    expect(ageDecayScore(iso, undefined, 0.85, 'state')).toBeCloseTo(0.71, 1);
+    expect(ageDecayScore(iso, undefined, 0.5, 'state')).toBeLessThan(0.01);
   });
 
   it('uses updated_at over created_at when provided', () => {
@@ -49,7 +71,7 @@ describe('applyAgeDecayToResults', () => {
     ];
 
     const adjusted = applyAgeDecayToResults(results);
-    // Recent (0.7 * ~1.0 = 0.7) should beat old (0.9 * ~0.25 = 0.225)
+    // Neutral confidence (×0.75) both sides; recency still decides.
     expect(adjusted[0].id).toBe('2');
     expect(adjusted[1].id).toBe('1');
   });
@@ -71,6 +93,28 @@ describe('applyAgeDecayToResults', () => {
     ];
     const adjusted = applyAgeDecayToResults(results);
     expect(adjusted[0].adjustedScore).toBeGreaterThan(0.45);
+  });
+
+  it('confirmed memories keep full score, neutral ones are scaled ×0.75', () => {
+    const now = new Date().toISOString();
+    const results = [
+      { id: '1', memory: 'confirmed', score: 0.8, created_at: now, confidence: 1.0 },
+      { id: '2', memory: 'neutral', score: 0.8, created_at: now },
+    ];
+    const adjusted = applyAgeDecayToResults(results);
+    expect(adjusted[0].id).toBe('1');
+    expect(adjusted[0].adjustedScore).toBeGreaterThan(adjusted[1].adjustedScore * 1.2);
+  });
+
+  it('stale states lose to confirmed facts with lower cosine', () => {
+    const twentyDaysAgo = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+    const results = [
+      { id: 'state', memory: 'lendo cioran', score: 0.9, created_at: twentyDaysAgo, kind: 'state' as const },
+      { id: 'fact', memory: 'mora perto do bar', score: 0.6, created_at: twentyDaysAgo, kind: 'fact' as const, confidence: 1.0 },
+    ];
+    const adjusted = applyAgeDecayToResults(results);
+    expect(adjusted[0].id).toBe('fact');
+    expect(adjusted[1].id).toBe('state');
   });
 });
 
