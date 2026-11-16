@@ -1,29 +1,33 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   normalizeForBlocklist,
   blocklistHash,
   isBlocklisted,
   addToBlocklist,
   removeFromBlocklist,
-  addMemory,
+  __setBlocklistPathForTests,
+  getBlocklistPath,
 } from './mem0.js';
-import { connectRedis, getRedis, isRedisAvailable } from './redis.js';
+import { addMemory } from './mem0.js';
 import { validateRoute } from './http-validation.js';
 
+let dir: string;
+let file: string;
 const texts: string[] = [];
 const mark = (t: string) => { texts.push(t); return t; };
 
-beforeAll(async () => {
-  await connectRedis();
-  if (!isRedisAvailable()) throw new Error('Redis required for memory-blocklist tests');
+beforeAll(() => {
+  dir = mkdtempSync(join(tmpdir(), 'forget-blocklist-test-'));
+  file = join(dir, 'forget-blocklist.json');
+  __setBlocklistPathForTests(file);
 });
 
-afterAll(async () => {
-  if (!isRedisAvailable()) return;
-  const r = getRedis();
-  for (const t of texts) {
-    await r.srem('mem0:forget-blocklist', blocklistHash(t)).catch(() => {});
-  }
+afterAll(() => {
+  __setBlocklistPathForTests(null);
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
 describe('normalizeForBlocklist', () => {
@@ -41,7 +45,7 @@ describe('normalizeForBlocklist', () => {
   });
 });
 
-describe('blocklist roundtrip', () => {
+describe('blocklist roundtrip (file)', () => {
   it('add → member (incl. variants) → remove', async () => {
     const t = mark(`Esquecer isto ${Date.now()}`);
     expect(await isBlocklisted(t)).toBe(false);
@@ -55,7 +59,54 @@ describe('blocklist roundtrip', () => {
   it('empty text never matches and is a no-op', async () => {
     expect(await isBlocklisted('   ')).toBe(false);
     await addToBlocklist('   ');
+    await removeFromBlocklist('   ');
     expect(await isBlocklisted('   ')).toBe(false);
+  });
+
+  it('persists on disk (no in-memory cache — restart equivalent)', async () => {
+    const t = mark(`Persistência ${Date.now()}: o usuário rega cactos`);
+    await addToBlocklist(t);
+    const raw = readFileSync(getBlocklistPath(), 'utf8');
+    expect(JSON.parse(raw)).toContain(blocklistHash(t));
+    // A fresh read (as after a restart — there is no cache) sees it.
+    expect(await isBlocklisted(t)).toBe(true);
+  });
+});
+
+describe('blocklist fail-closed / fail-hard (issue #9)', () => {
+  it('corrupt file blocks reads (never resurrects)', async () => {
+    const t = mark(`Corrompido ${Date.now()}`);
+    writeFileSync(file, '{invalid json');
+    try {
+      expect(await isBlocklisted(t)).toBe(true);
+      expect(await isBlocklisted('qualquer coisa')).toBe(true);
+    } finally {
+      rmSync(file, { force: true });
+    }
+    expect(await isBlocklisted(t)).toBe(false);
+  });
+
+  it('writes on a corrupt file throw (no silent reset)', async () => {
+    writeFileSync(file, '[1,2,3]');
+    try {
+      await expect(addToBlocklist(mark('x'))).rejects.toThrow();
+      await expect(removeFromBlocklist(mark('x'))).rejects.toThrow();
+    } finally {
+      rmSync(file, { force: true });
+    }
+  });
+
+  it('unwritable path throws on write', async () => {
+    // A regular file as parent dir: mkdirSync(dirname) fails with ENOTDIR.
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'x');
+    __setBlocklistPathForTests(join(blocker, 'forget-blocklist.json'));
+    try {
+      await expect(addToBlocklist(mark('y'))).rejects.toThrow();
+    } finally {
+      __setBlocklistPathForTests(file);
+      rmSync(blocker, { force: true });
+    }
   });
 });
 

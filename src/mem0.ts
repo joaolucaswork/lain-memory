@@ -11,7 +11,6 @@
 
 import { Memory, OpenAILLM, OpenAIEmbedder } from 'mem0ai/oss';
 import * as graphrag from './graphrag.js';
-import { createHash } from 'node:crypto';
 import { getRedis, isRedisAvailable } from './redis.js';
 import {
   FEEDBACK_DEFAULTS as STATE_FEEDBACK_DEFAULTS,
@@ -1255,43 +1254,18 @@ export async function applyMemoryFeedback(
 // Fase 0 of per-memory quick actions. `forget` hard-deletes AND records a
 // hash of the text here; every save path checks it first (see addMemory).
 // Without this, the next chat turn re-extracts the same fact.
-
-const FORGET_BLOCKLIST_KEY = 'mem0:forget-blocklist';
-
-/**
- * Canonical form for blocklist matching: lowercase, no accents, no
- * punctuation, single spaces. Paraphrases still pass — exact and
- * near-exact repeats are caught, which is the re-extraction case.
- */
-export function normalizeForBlocklist(text: string): string {
-  return text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-export function blocklistHash(text: string): string {
-  return createHash('sha256').update(normalizeForBlocklist(text)).digest('hex');
-}
-
-export async function isBlocklisted(text: string): Promise<boolean> {
-  if (!text.trim() || !isRedisAvailable()) return false;
-  try {
-    return (await getRedis().sismember(FORGET_BLOCKLIST_KEY, blocklistHash(text))) === 1;
-  } catch { return false; }
-}
-
-export async function addToBlocklist(text: string): Promise<void> {
-  if (!text.trim() || !isRedisAvailable()) return;
-  try {
-    await getRedis().sadd(FORGET_BLOCKLIST_KEY, blocklistHash(text));
-  } catch { /* non-critical */ }
-}
-
-export async function removeFromBlocklist(text: string): Promise<void> {
-  if (!text.trim() || !isRedisAvailable()) return;
-  try {
-    await getRedis().srem(FORGET_BLOCKLIST_KEY, blocklistHash(text));
-  } catch { /* non-critical */ }
-}
+// Authority: src/forget-blocklist.ts (workspace JSON file, Redis-free).
+// Re-exported here so existing import sites keep working.
+import {
+  normalizeForBlocklist,
+  blocklistHash,
+  isBlocklisted,
+  addToBlocklist,
+  removeFromBlocklist,
+  getBlocklistPath,
+  __setBlocklistPathForTests,
+} from './forget-blocklist.js';
+export { normalizeForBlocklist, blocklistHash, isBlocklisted, addToBlocklist, removeFromBlocklist, getBlocklistPath, __setBlocklistPathForTests };
 
 // ─── Kind Heuristic (fact vs state) ───
 // Fase 0: coarse text signals, no LLM. Errs toward `fact` (safe default —
