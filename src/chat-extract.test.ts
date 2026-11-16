@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   acceptChatFact,
   buildChatExtractPrompt,
+  buildFactRatingPrompt,
   buildTitlePrompt,
   CHAT_FACT_RATING_CRITERIA,
   extractChatFacts,
@@ -10,6 +11,7 @@ import {
   normalizeChatFacts,
   normalizeChatFactPairs,
   normalizeChatTitle,
+  rateChatFact,
   relevanceToImportance,
   rememberChatTurn,
   sanitizeChatRating,
@@ -198,7 +200,7 @@ describe('rememberChatTurn', () => {
     expect(saved).toEqual([{ fact: USER_COMFORT, project: 'diario', title: 'Seinfeld série conforto' }]);
     expect(result[0]).toMatchObject({ id: 'atom-1', title: 'Seinfeld série conforto' });
     // Sem rating no fato → padrões 3/fact/false → importância neutra 0.5.
-    expect(states).toEqual([{ id: 'atom-1', importance: 0.5, kind: 'fact', sensitive: false }]);
+    expect(states).toEqual([{ id: 'atom-1', importance: 0.5, kind: 'fact', sensitive: false, relevance: 3 }]);
   });
 
   test('extração vazia não chama o save', async () => {
@@ -285,6 +287,21 @@ describe('relevanceToImportance', () => {
     expect(relevanceToImportance(0)).toBe(0.5);
     expect(relevanceToImportance(9)).toBe(0.5);
   });
+
+  test('buildFactRatingPrompt reusa os critérios sem duplicar o texto', () => {
+    const p = buildFactRatingPrompt('O usuário toma sertralina 50mg de manhã.');
+    expect(p).toContain(CHAT_FACT_RATING_CRITERIA);
+    expect(p).toContain('O usuário toma sertralina 50mg de manhã.');
+    expect(p).toContain('{"relevance":3,"kind":"fact","sensitive":false}');
+    expect(p).not.toContain('o usuário",');
+  });
+
+  test('rateChatFact valida e normaliza; resposta inútil vira erro', async () => {
+    const ok = await rateChatFact('O usuário dorme tarde.', async () => ({ relevance: 2, kind: 'state' }));
+    expect(ok).toEqual({ relevance: 2, kind: 'state', sensitive: false });
+    await expect(rateChatFact('x', async () => ({}))).rejects.toThrow('unusable rating');
+    await expect(rateChatFact('x', async () => null as unknown as undefined)).rejects.toThrow('unusable rating');
+  });
 });
 
 describe('buildChatExtractPrompt rating', () => {
@@ -324,8 +341,8 @@ describe('rememberChatTurn estado do extrator', () => {
       { relevance: 5, kind: 'fact', sensitive: false },
     ]);
     expect(seen).toEqual([
-      { id: 'id-1', s: { importance: 0.2, kind: 'fact', sensitive: true } },
-      { id: 'id-2', s: { importance: 0.85, kind: 'fact', sensitive: false } },
+      { id: 'id-1', s: { importance: 0.2, kind: 'fact', sensitive: true, relevance: 1 } },
+      { id: 'id-2', s: { importance: 0.85, kind: 'fact', sensitive: false, relevance: 5 } },
     ]);
   });
 

@@ -14,7 +14,7 @@
  */
 
 import { addMemoryWithConflictCheck, setMemoryFeedback, type FeedbackKind } from './mem0.js';
-import { setImportance as stateSetImportance } from './memory-state.js';
+import { setImportance as stateSetImportance, setRelevance as stateSetRelevance } from './memory-state.js';
 import { runFastLlmJson } from './llm-client.js';
 
 export const MAX_CHAT_FACTS = 5;
@@ -276,6 +276,42 @@ Fato: ${factText.trim()}
 Responda só JSON: {"title":"..."}`;
 }
 
+/**
+ * Rate a lone fact body (no original turn — used by the backfill). Same
+ * criteria as the extractor, no duplicated text. Throws on an unusable
+ * model response so the caller can log-and-skip instead of writing defaults.
+ */
+export function buildFactRatingPrompt(factText: string): string {
+  return `Avalie este fato de memória de longo prazo de uma pessoa.
+
+${CHAT_FACT_RATING_CRITERIA}
+
+Fato: ${factText.trim()}
+
+Responda só JSON: {"relevance":3,"kind":"fact","sensitive":false}`;
+}
+
+/** True when the model response carries at least one usable rating field. */
+export function hasAnyRatingField(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  const o = raw as Record<string, unknown>;
+  return o['relevance'] !== undefined || o['kind'] !== undefined || o['sensitive'] !== undefined;
+}
+
+export async function rateChatFact(
+  factText: string,
+  runJson: JsonRunner = runFastLlmJson,
+): Promise<ChatFactRating> {
+  const res = await runJson<unknown>(buildFactRatingPrompt(factText), {
+    maxTokens: 512, // JSON minúsculo, mas o modelo às vezes divaga antes dele
+    temperature: 0,
+  });
+  if (!hasAnyRatingField(res)) {
+    throw new Error(`rateChatFact: unusable rating response for: ${factText.slice(0, 80)}`);
+  }
+  return sanitizeChatRating(res);
+}
+
 export async function extractChatFacts(
   input: ChatTurnInput,
   runJson: JsonRunner = runFastLlmJson,
@@ -306,7 +342,7 @@ export async function rememberChatTurn(
     extract?: (input: ChatTurnInput) => Promise<ChatFact[]>;
     save?: (fact: string, project: string | undefined, title?: string, rating?: ChatFactRating) => Promise<ChatMemoryResult[]>;
     /** State persistence seam (default: memory-state). Injected in tests. */
-    writeState?: (id: string, state: { importance: number; kind: FeedbackKind; sensitive: boolean }) => Promise<void>;
+    writeState?: (id: string, state: { importance: number; kind: FeedbackKind; sensitive: boolean; relevance: number }) => Promise<void>;
   },
 ): Promise<ChatMemoryResult[]> {
   const extract = deps?.extract ?? extractChatFacts;
@@ -337,6 +373,8 @@ export async function rememberChatTurn(
   const writeState = deps?.writeState ?? (async (id, s) => {
     await stateSetImportance(id, s.importance);
     await setMemoryFeedback(id, { kind: s.kind, sensitive: s.sensitive });
+    // Rated marker: lets the backfill skip memories the extractor already rated.
+    await stateSetRelevance(id, s.relevance);
   });
 
   let facts: ChatFact[];
@@ -371,6 +409,7 @@ export async function rememberChatTurn(
           importance: relevanceToImportance(rating.relevance),
           kind: rating.kind,
           sensitive: rating.sensitive,
+          relevance: rating.relevance,
         }).catch((err) => console.error(
           `[chat-extract] state write failed for ${row.id}, reprocess later:`,
           err instanceof Error ? err.message : String(err),

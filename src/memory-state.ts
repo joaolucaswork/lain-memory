@@ -63,6 +63,8 @@ export const IMPORTANCE_DEFAULT = 0.5;
 /** Top-level Qdrant payload keys (namespaced — never collide with mem0 internals). */
 export const LAIN_FEEDBACK_KEY = 'lain_feedback';
 export const LAIN_IMPORTANCE_KEY = 'lain_importance';
+/** Extractor relevance 1-5 (Tarefa B/C). Marks a memory as rated — the backfill skips ids that have it. */
+export const LAIN_RELEVANCE_KEY = 'lain_relevance';
 
 /** Trash-copy metadata key carrying the state snapshot for restore. */
 export const STATE_SNAPSHOT_KEY = 'lain_state_snapshot';
@@ -164,11 +166,18 @@ export function isQueryableId(id: string): boolean {
 export interface ExtractedState {
   feedback: MemoryFeedback | null;
   importance: number | null;
+  /** Extractor relevance 1-5. Null when never rated. */
+  relevance: number | null;
+}
+
+/** Valid stored relevance: integer 1-5. Anything else reads as unrated. */
+export function sanitizeRelevance(raw: unknown): number | null {
+  return Number.isInteger(raw) && (raw as number) >= 1 && (raw as number) <= 5 ? (raw as number) : null;
 }
 
 /** Pull state out of a mem0 `metadata` object without any I/O. Nulls when absent/invalid. */
 export function extractStateFromMetadata(metadata: unknown): ExtractedState {
-  const out: ExtractedState = { feedback: null, importance: null };
+  const out: ExtractedState = { feedback: null, importance: null, relevance: null };
   if (!metadata || typeof metadata !== 'object') return out;
   const m = metadata as Record<string, unknown>;
   // New flat keys.
@@ -180,6 +189,7 @@ export function extractStateFromMetadata(metadata: unknown): ExtractedState {
   if (typeof m[LAIN_IMPORTANCE_KEY] === 'number' && !isNaN(m[LAIN_IMPORTANCE_KEY] as number)) {
     out.importance = m[LAIN_IMPORTANCE_KEY] as number;
   }
+  out.relevance = sanitizeRelevance(m[LAIN_RELEVANCE_KEY]);
   // Legacy nested shape: lain_state: { feedback, importance }.
   const nested = m['lain_state'];
   if ((!out.feedback || out.importance === null) && nested && typeof nested === 'object') {
@@ -191,6 +201,9 @@ export function extractStateFromMetadata(metadata: unknown): ExtractedState {
     }
     if (out.importance === null && typeof n['importance'] === 'number' && !isNaN(n['importance'] as number)) {
       out.importance = n['importance'] as number;
+    }
+    if (out.relevance === null) {
+      out.relevance = sanitizeRelevance(n['relevance']);
     }
   }
   return out;
@@ -236,6 +249,7 @@ async function l2SetImportance(id: string, score: number): Promise<void> {
 interface QdrantState {
   feedback: MemoryFeedback | null;
   importance: number | null;
+  relevance: number | null;
   /** True when Qdrant answered (point found or confirmed missing). False on transport error. */
   answered: boolean;
   /** True when the point was actually returned by retrieve. */
@@ -248,14 +262,14 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
   if (queryable.length === 0) return out;
   const applyPoint = (p: { id: unknown; payload?: unknown }) => {
     const st = extractStateFromMetadata(p.payload ?? null);
-    out.set(String(p.id), { feedback: st.feedback, importance: st.importance, answered: true, found: true });
+    out.set(String(p.id), { feedback: st.feedback, importance: st.importance, relevance: st.relevance, answered: true, found: true });
   };
   try {
     const points = await getQdrant().retrieve(collectionName(), { ids: queryable, with_payload: true });
     for (const p of points) applyPoint(p as { id: unknown; payload?: unknown });
     // Ids not returned do not exist → answered with nulls.
     for (const id of queryable) {
-      if (!out.has(id)) out.set(id, { feedback: null, importance: null, answered: true, found: false });
+      if (!out.has(id)) out.set(id, { feedback: null, importance: null, relevance: null, answered: true, found: false });
     }
   } catch {
     // Batch failed — retry per-id so one poison id cannot blank the batch.
@@ -263,7 +277,7 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
       try {
         const one = await getQdrant().retrieve(collectionName(), { ids: [id], with_payload: true });
         if (one.length > 0) applyPoint(one[0] as { id: unknown; payload?: unknown });
-        else out.set(id, { feedback: null, importance: null, answered: true, found: false });
+        else out.set(id, { feedback: null, importance: null, relevance: null, answered: true, found: false });
       } catch {
         // Per-id failure — stays absent (unanswered), caller degrades.
       }
@@ -275,6 +289,8 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
 export interface QdrantStateRead {
   feedback: MemoryFeedback | null;
   importance: number | null;
+  /** Extractor relevance 1-5. Null when never rated. */
+  relevance: number | null;
   /** True when the point was found. False when missing OR id not queryable. */
   exists: boolean;
   /** False when Qdrant could not be reached for this id (transport error). */
@@ -289,13 +305,13 @@ export interface QdrantStateRead {
 export async function readQdrantState(ids: string[]): Promise<Map<string, QdrantStateRead>> {
   const out = new Map<string, QdrantStateRead>();
   const uniq = [...new Set(ids.filter(Boolean))];
-  for (const id of uniq) out.set(id, { feedback: null, importance: null, exists: false, answered: false });
+  for (const id of uniq) out.set(id, { feedback: null, importance: null, relevance: null, exists: false, answered: false });
   if (uniq.length === 0) return out;
   const qmap = await qdrantRetrieve(uniq);
   for (const id of uniq) {
     const q = qmap.get(id);
     if (!q || !q.answered) continue; // transport error — answered stays false
-    out.set(id, { feedback: q.feedback, importance: q.importance, exists: q.found, answered: true });
+    out.set(id, { feedback: q.feedback, importance: q.importance, relevance: q.relevance, exists: q.found, answered: true });
   }
   return out;
 }
@@ -502,6 +518,26 @@ export async function setImportance(memoryId: string, score: number): Promise<vo
     throw new Error(`memory-state: Qdrant setPayload(importance) failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
   }
   await l2SetImportance(memoryId, score);
+}
+
+/**
+ * Persist extractor relevance 1-5 (the "already rated" marker the backfill
+ * uses to skip). Qdrant-only on purpose: the single reader is the backfill
+ * skip-check via readQdrantState, no L2 involved. Throws on invalid input
+ * or Qdrant failure (fail-hard).
+ */
+export async function setRelevance(memoryId: string, relevance: number): Promise<void> {
+  if (sanitizeRelevance(relevance) === null) {
+    throw new Error(`memory-state: invalid relevance ${JSON.stringify(relevance)} (want integer 1-5) for ${memoryId}`);
+  }
+  try {
+    await getQdrant().setPayload(collectionName(), {
+      payload: { [LAIN_RELEVANCE_KEY]: relevance },
+      points: [memoryId],
+    });
+  } catch (err) {
+    throw new Error(`memory-state: Qdrant setPayload(relevance) failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /**
