@@ -40,7 +40,7 @@ mock.module('../llm-client.js', () => ({
     summary: 'A test document about lain architecture and memory system.',
     facts: [
       'Lucas implemented lain-core memory system using TypeScript and Qdrant in 2026',
-      'The lain server uses Bun runtime with PM2 for process management',
+      'The lain server uses Bun runtime with Docker for process management',
     ],
     entities: [],
     relationships: [],

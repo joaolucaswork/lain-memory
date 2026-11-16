@@ -35,7 +35,7 @@ if (WORKSPACE_DIR_ENV && !existsSync(WORKSPACE_DIR)) {
     `  - Diretório foi renomeado e este processo tem env stale do shell parent.\n` +
     `  - Path errado no .env do projeto.\n` +
     `Fix:\n` +
-    `  - Para PM2: \`lain-restart\` (alias zsh) ou \`pm2 delete lain && pm2 start ecosystem.config.cjs --only lain\`\n` +
+    `  - Reinicie o serviço pelo process manager ou recrie a partir do ecosystem.config.cjs\n` +
     `  - Para MCP stdio (Claude Code): fechar e reabrir o terminal, ou /mcp reload no Claude Code.\n`
   );
 }

@@ -17,7 +17,7 @@
 #   7. prints ready-to-paste configs for OpenCode / Claude Code / any MCP client
 #
 # What it does NOT do: set your LLM keys (edit .env afterwards), touch git,
-# start pm2 services, or migrate data (see README for Qdrant snapshots).
+# start process-manager services, or migrate data (see README for Qdrant snapshots).
 set -u
 REPO="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO"

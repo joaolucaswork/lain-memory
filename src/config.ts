@@ -22,7 +22,7 @@ const configSchema = z.object({
     forumChatId: optionalString,
   }).prefault({}),
 
-  // WhatsApp (Kapso)
+  // WhatsApp
   whatsapp: z.object({
     apiKey: optionalString,
     phoneNumberId: optionalString,
@@ -124,8 +124,8 @@ export function loadConfig(): LainConfig {
       forumChatId: process.env.LAIN_TELEGRAM_FORUM_CHAT_ID,
     },
     whatsapp: {
-      apiKey: process.env.LAIN_KAPSO_API_KEY,
-      phoneNumberId: process.env.LAIN_KAPSO_PHONE_NUMBER_ID,
+      apiKey: process.env.LAIN_WHATSAPP_API_KEY,
+      phoneNumberId: process.env.LAIN_WHATSAPP_PHONE_NUMBER_ID,
       userNumber: process.env.LAIN_USER_WHATSAPP_NUMBER,
       allowlist: process.env.LAIN_WHATSAPP_ALLOWLIST,
     },

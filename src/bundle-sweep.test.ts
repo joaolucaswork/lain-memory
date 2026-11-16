@@ -94,7 +94,7 @@ describe('bundle-sweep pure helpers', () => {
     expect(
       bundle.bundleAlreadyExists('ela veio na casa dele passaram a noite juntos', existing as any),
     ).toBe(true);
-    expect(bundle.bundleAlreadyExists('projeto percurso usa OTP com Resend configurado', existing as any)).toBe(
+    expect(bundle.bundleAlreadyExists('projeto interno usa OTP com Resend configurado', existing as any)).toBe(
       false,
     );
   });

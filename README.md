@@ -32,7 +32,7 @@ It fetches global + project memories and builds text. It does not touch the grap
 **2. The graph is a map of connections.**
 
 It does not store sentences. It stores nodes and edges:
-`lucas -USES-> bun`, `reino-capital -DEPENDS_ON-> supabase`.
+`lucas -USES-> bun`.
 
 Code in `src/graphrag.ts:343` (`ingest`) and `src/graphrag.ts:411` (`query`).
 
@@ -91,7 +91,7 @@ curl localhost:3341/health
 bun run smoke                 # stdio MCP self-check (12 tools)
 ```
 
-Supervised: `pm2 start ecosystem.config.cjs --only lain-memory`.
+Supervised: `bun run start` (ou via seu process manager a partir de `ecosystem.config.cjs`).
 
 > `LAIN_INSTANCE_ID` suffixes the Qdrant collection, graph file and Redis prefix — instances sharing a workspace must use the same one.
 

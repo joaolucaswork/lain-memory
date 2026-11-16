@@ -114,14 +114,10 @@ function generateId(): string {
   return crypto.randomUUID().slice(0, 8);
 }
 
-/** Auto-detect language from project name. Brazilian projects default to PT-BR. */
+/** Default language from project context (workspace is PT-BR). */
 function detectLanguage(project?: string): string | undefined {
   if (!project) return undefined;
-  const name = project.toLowerCase();
-  // Known Brazilian projects
-  const brProjects = ['reino', 'kapso', 'lain', 'call-me', 'relatorio', 'dashboard', 'crm'];
-  if (brProjects.some(p => name.includes(p))) return 'pt-br';
-  return undefined;
+  return 'pt-br';
 }
 
 function detectType(source: string): SeedInput['type'] {

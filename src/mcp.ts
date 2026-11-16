@@ -53,7 +53,7 @@ const TOOL_DEFINITIONS = [
       type: 'object' as const,
       properties: {
         text: { type: 'string', description: 'The fact or memory to save. Be specific and concise.' },
-        project: { type: 'string', description: 'Project name (e.g. "lain", "kapso"). Omit for global memories.' },
+        project: { type: 'string', description: 'Project name (e.g. "my-project"). Omit for global memories.' },
         assistant: {
           type: 'string',
           description: 'Model reply for mode=chat. Context only — never stored as a fact.',
@@ -129,7 +129,7 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        project: { type: 'string', description: 'Project name to scan (e.g. "lain", "reino-capital-pay")' },
+        project: { type: 'string', description: 'Project name to scan (e.g. "lain-app")' },
       },
       required: ['project'],
     },

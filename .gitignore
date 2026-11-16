@@ -5,3 +5,4 @@ dist/
 data/
 .DS_Store
 .firecrawl/
+repomix-output.xml

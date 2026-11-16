@@ -50,7 +50,7 @@ describe('shouldRejectEntity', () => {
 
   test('accepts valid entities', () => {
     expect(shouldRejectEntity('lucas', 'Person')).toBe(false);
-    expect(shouldRejectEntity('reino capital', 'Company')).toBe(false);
+    expect(shouldRejectEntity('acme corp', 'Company')).toBe(false);
     expect(shouldRejectEntity('typescript', 'Technology')).toBe(false);
     expect(shouldRejectEntity('supabase', 'Technology')).toBe(false);
     expect(shouldRejectEntity('recife', 'Location')).toBe(false);

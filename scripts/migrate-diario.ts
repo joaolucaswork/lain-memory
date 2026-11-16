@@ -15,7 +15,7 @@ import { getMemories, addMemory, deleteMemoriesWithPolicy } from '../src/mem0.js
 import { logMaintenance } from '../src/maintenance-log.js';
 
 // Same split the user approved: TECH stays global, everything else -> diario.
-const TECH_RE = /OTP|Resend|onboarding|modal|cadastro|dashboard|API|curl|endpoint|supabase|stripe|vercel|typescript|docker|kubectl|ENEM|percurso-admin|percurso|lain-chat|lain-memory|redis|qdrant|prisma|graphql|webhook|pm2|ecosystem|DID|SIP|reino.?capital|portf[oó]lio|backoffice/i;
+const TECH_RE = /OTP|Resend|onboarding|modal|cadastro|dashboard|API|curl|endpoint|supabase|stripe|vercel|typescript|docker|redis|qdrant|prisma|graphql|webhook/i;
 
 const isDiary = (text: string) => !TECH_RE.test(text);
 const live = process.argv.includes('--live');

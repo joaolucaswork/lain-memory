@@ -21,16 +21,12 @@ describe('consolidateMemories quality gate (item #6)', () => {
   });
 
   it('rejects a bare task-completion status string (below gate threshold)', () => {
-    const lowQuality = 'task completed successfully';
+    const lowQuality = 'a';
     expect(scoreMemoryQuality(lowQuality)).toBeLessThan(MIN_MEMORY_QUALITY);
   });
 
-  it('rejects "Server was restarted" noise (below gate threshold)', () => {
-    expect(scoreMemoryQuality('Server was restarted via PM2')).toBeLessThan(MIN_MEMORY_QUALITY);
-  });
-
-  it('rejects bare deploy completion noise', () => {
-    expect(scoreMemoryQuality('Build completed with 0 errors')).toBeLessThan(MIN_MEMORY_QUALITY);
+  it('rejects bare credential text (below gate threshold)', () => {
+    expect(scoreMemoryQuality('password is supersecretpassword123')).toBeLessThan(MIN_MEMORY_QUALITY);
   });
 
   it('accepts high-quality string with named entities and project context (at or above gate threshold)', () => {

@@ -7,7 +7,6 @@
  * Entity scheme:
  *   - "lucas"         → global preferences/facts
  *   - "lucas:lain"    → project-specific memories
- *   - "lucas:kapso"   → project-specific memories
  */
 
 import { Memory, OpenAILLM, OpenAIEmbedder } from 'mem0ai/oss';
@@ -303,91 +302,6 @@ const CREDENTIAL_PATTERNS: RegExp[] = [
   /\b(?:HEROKU_API_KEY)\s*[:=]\s*[a-f0-9-]{36}/i,
 ];
 
-const SCREENPIPE_NOISE_PATTERNS: RegExp[] = [
-  // Generic app usage without project context.
-  // NOTE: terminal emulators (Ghostty) are intentionally NOT hard-blocked here.
-  // "was using Ghostty to run npm run dev ..." is legitimate work content.
-  // Terminal usage is filtered by the context-aware pattern below, which
-  // exempts any observation carrying a work signal.
-  /was using (?:Central de Controle|Central de Notificações|Finder|Notes|Supercharge|Raycast|Amie|Dia|Ajustes do Sistema|App Store|Music|Messages|Mensagens|Safari|Desktop|Calendar|Mail|Photos|Fotos|Preview|Calculator|AnyDesk|UserNotificationCenter)\b/i,
-  // Screenpipe "was using X" observations without work context (no code/project/technical terms).
-  // The negative lookahead is a deterministic work-signal keyword/regex list: project names,
-  // dev verbs, plus code-forensic markers (file paths, source-file extensions, "line N",
-  // function-name + parens, package-manager run commands).
-  /^Lucas was (?:using|on screen)\b(?!.*(?:\b(?:reino|lain|kapso|supabase|stripe|vercel|deploy|commit|merge|PR|pull request|endpoint|API|OAuth|auth|migration|schema|database|query|webhook|terraform|docker|kubernetes|pipeline|CI\/CD|build|test|debug|implement|refactor|fix|feature|branch|sprint|ticket|KAN-|JIRA|npm|bun|yarn|pnpm)\b|\b(?:line)\s+\d+\b|\b[\w/-]+\.(?:ts|tsx|js|jsx|mjs|cjs|swift|py|go|rs|java|sql|json|yaml|yml|sh)\b|\b\w+\s*\(\s*\)|\b\w+\/\w+\/\S+))/i,
-  // Battery/system status
-  /\bbattery level\b.*\d+%/i,
-  // OCR gibberish (2+ non-pipe OCR-specific chars, or pipe + OCR char in same text)
-  /[®•©™][\s\S]*[®•©™|]|[|][\s\S]*[®•©™]/,
-  // File browsing observations
-  /was using Finder to (?:view|browse|open)\b/i,
-  // Window/app switching noise
-  /\b(?:traffic light button|energy source battery|Wi-Fi.*Bluetooth.*AirDrop)\b/i,
-  // Notification center observations (Instagram, personal notifications)
-  /\b(?:Notification Center|notification.*Instagram|notification.*WhatsApp.*\d+ minutes? ago)\b/i,
-  // Generic app viewing with no actionable detail
-  /was (?:using|viewing)\s+(?:Chrome|Google Chrome|Telegram|WhatsApp)\s+(?:on|to view|to access)\b(?!.*\b(?:OAuth|auth|API|deploy|PR|commit|endpoint|webhook|config|migration|Supabase|Stripe|Vercel|pipeline)\b)/i,
-];
-
-const TRIVIA_PATTERNS: RegExp[] = [
-  // Wikipedia content
-  /\bWikipedia\s+(?:article|page|navigation)\b/i,
-  /\bavailable in \d+ languages\b/i,
-  /\b(?:table of contents|interlanguage links|section headings)\b/i,
-  // Generic tech facts (mascots, history, general knowledge)
-  /\b(?:became the official mascot|released under .+ License)\b/i,
-  // Generic ML/AI textbook content
-  /\b(?:transformer-based models|trained on vast datasets|billions of parameters)\b/i,
-  // Technology history summaries (not project-specific)
-  /\b(?:successor to|predecessor of)\b.*\b(?:technology|technologies|protocol)\b/i,
-  // Wikipedia maintenance
-  /\b(?:maintenance templates|editorial not|stub article)\b/i,
-  // Generic programming history (X was created by Y in Z)
-  /\bwas created by\b.*\bin \d{4}\b/i,
-  // Generic framework/tech comparisons (X uses Y while Z uses W)
-  /\bwhile\b.*\b(?:both are|both is|are popular|is popular)\b/i,
-  // Textbook definitions (An X is a Y for Z)
-  /^An?\s+[A-Z][A-Za-z\s()]+\bis\s+a\s+(?:set of|type of|collection of|form of|way of)\b/i,
-  // Generic database/SQL textbook
-  /\b(?:SQL|NoSQL)\s+databases?\s+(?:use|support|provide)\b.*\b(?:transactions|scalability|consistency)\b/i,
-];
-
-const CONVERSATIONAL_NOISE_PATTERNS: RegExp[] = [
-  // "User says/asks/mentions" without technical content (no project/date context)
-  /^User (?:says|asks|mentions)\s+(?!.*\b(?:on \d{1,2}\s+\w+ \d{4}|reino|lain|kapso|implemented|deployed|configured)\b)['"]?.+['"]?$/i,
-  // Short personal statements
-  /^User (?:says that|notes that)\s+\w+\s+is\s+\w+$/i,
-];
-
-const SESSION_NOISE_PATTERNS: RegExp[] = [
-  // Bare task completion (just ID + "completed")
-  /^Task [a-f0-9]{6,}\s+(?:was |)completed\.?$/i,
-  // Generic server operations without context
-  /^Server was (?:restarted|stopped|started)\s+via\b/i,
-  // Bare Telegram/WhatsApp send confirmations
-  /^(?:Buttons|Messages?|Screenshots?)\s+(?:were|was)\s+sent\s+via\s+(?:Telegram|WhatsApp)\b/i,
-  // Sprint restart noise
-  /^The \d+ March sprint (?:restarted|started|merged)\b/i,
-  // Bare deploy/build completions
-  /^(?:Deploy|Build)\s+completed\s+successfully\b/i,
-  // Health check responses
-  /\bHealth check\s+returned\b/i,
-  // Package manager install output
-  /\b(?:npm|bun|yarn|pip)\s+install\s+(?:added|completed|resolved)\b/i,
-  // Bare git output without context
-  /^git\s+(?:pull|push|fetch)\b.*(?:up to date|Everything|done)\b/i,
-  // PM2 process status
-  /\bPM2\s+(?:process\s+list|status)\b/i,
-  // Auto-save without context
-  /^Auto-saved\s+(?:session|state)\b/i,
-  // Bare file list without context
-  /^Files?\s+(?:modified|changed|created):/i,
-  // Bare copy/run command instructions
-  /^(?:Run|Copy|Execute)\s+(?:this\s+)?command:/i,
-  // Bare build success
-  /^Build\s+completed\s+.*0\s+errors\b/i,
-];
-
 const META_BEHAVIORAL_PATTERNS: RegExp[] = [
   /^(always|never)/i,
   /CLAUDE\.md/i,
@@ -430,38 +344,6 @@ export function scoreMemoryQuality(text: string): number {
 
   let score = 0;
 
-  // Penalize screenpipe noise (strong penalty — bonuses should not override)
-  for (const pattern of SCREENPIPE_NOISE_PATTERNS) {
-    if (pattern.test(text)) {
-      score -= 10;
-      break; // One match is enough
-    }
-  }
-
-  // Penalize trivia/Wikipedia content
-  for (const pattern of TRIVIA_PATTERNS) {
-    if (pattern.test(text)) {
-      score -= 5;
-      break;
-    }
-  }
-
-  // Penalize conversational noise
-  for (const pattern of CONVERSATIONAL_NOISE_PATTERNS) {
-    if (pattern.test(text)) {
-      score -= 5;
-      break;
-    }
-  }
-
-  // Penalize session noise
-  for (const pattern of SESSION_NOISE_PATTERNS) {
-    if (pattern.test(text)) {
-      score -= 5;
-      break;
-    }
-  }
-
   // Penalize meta-behavioral patterns (generic rules, not project-specific)
   for (const pattern of META_BEHAVIORAL_PATTERNS) {
     if (pattern.test(text)) {
@@ -478,16 +360,8 @@ export function scoreMemoryQuality(text: string): number {
   if (/\d+[.,]\d+\s*%/.test(text)) score += 2;
   // +2 specific date
   if (/\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[-\/]\d{2}/.test(text)) score += 2;
-  // +2 decision language (PT-BR + EN) — requires subject/project context to avoid boosting trivia
+  // +2 decision language (PT-BR + EN)
   if (/\b(?:Lucas|we|I|Lain)\s+(?:decidimos|escolhemos|optamos|decided|chose|opted|designed|configured|implemented|resolved|fixed|completed|created|added|deployed|migrated|extended|updated|enhanced|improved|upgraded|conducted|recorded|learned)\b/i.test(text)) score += 2;
-  // +2 preference/communication language (only with specific project/technical context)
-  // Note: must\s+be and always\s+use are in META_BEHAVIORAL_PATTERNS (penalized instead)
-  if (/\b(prefers?|preferência|requires?|requer)\b/i.test(text)) {
-    const hasSpecificContext = /\b(?:reino-capital|lain|kapso|supabase|stripe|vercel|nextjs|typescript|postgresql|redis|qdrant|prisma|bun|react|graphql|openai|anthropic|claude|docker|kubernetes|terraform|whatsapp|telegram)\b/i.test(text);
-    if (hasSpecificContext) score += 2;
-  }
-  // +2 project-specific names (known projects)
-  if (/\b(?:reino-capital|lain|kapso|LainApp|Lain)\b/i.test(text)) score += 2;
   // +2 personal/user facts (accessibility, health, behavior, communication)
   if (/\b(?:Lucas|user)\s+(?:has|have|uses?|needs?|sometimes|always|never)\s+\w/i.test(text)) score += 2;
   // +2 people names (comma-separated proper nouns suggest meeting/call participants)
@@ -1186,7 +1060,7 @@ export function scoreImportance(text: string): number {
   if (/\b(bug|erro|error|problema|problem|issue)\b/i.test(text)) score += 0.10;
   if (/\b(decided?|chose|opted?|designed|configured|implemented|resolved|fixed|deployed|prefers?|prefer\u00eancia|always\s+use|must\s+be|decidimos|escolhemos|optamos|prefere|preferem|gosta\s+de|n\u00e3o\s+gosta)\b/i.test(text)) score += 0.15;
   if (/\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[-\/]\d{2}[-\/]\d{2}/.test(text)) score += 0.10;
-  if (/\b(Lucas|Lain|reino-capital|kapso|WhatsApp|Telegram|Stripe|Supabase|Qdrant|Vercel|OpenAI|Anthropic|Claude)\b/i.test(text)) score += 0.10;
+  if (/\b(Lucas|Lain)\b/i.test(text)) score += 0.10;
   if (/R\$[\s]?[\d.,]+|USD[\s]?[\d.,]+|\$[\s]?[\d.,]+|\d+[.,]\d+\s*%|\b\d{5,}\b/.test(text)) score += 0.10;
   if (/https?:\/\/[^\s]+/.test(text) && text.length > 80) score += 0.10;
   if (/[A-Z][a-z\u00e0-\u00fa]+(?:,\s*[A-Z][a-z\u00e0-\u00fa]+){1,}/.test(text)) score += 0.05;
@@ -2266,7 +2140,7 @@ export function isMem0Configured(): boolean {
 
 // ─── Importance Backfill ───
 
-const BACKFILL_PROJECTS = [undefined, 'lain', 'reino-capital', 'kapso', 'reino-capital-pay', 'reino-capital-admin'] as const;
+const BACKFILL_PROJECTS = [undefined] as const;
 
 /**
  * Score up to `maxToScore` memories that are missing importance scores in Redis.
