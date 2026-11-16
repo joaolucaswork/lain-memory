@@ -11,6 +11,7 @@
  */
 
 import { Memory, OpenAILLM, OpenAIEmbedder } from 'mem0ai/oss';
+import { createHash } from 'node:crypto';
 import * as graphrag from './graphrag.js';
 import { getRedis, isRedisAvailable } from './redis.js';
 import { INSTANCE_ID, listProjects } from './workspace.js';
@@ -516,6 +517,13 @@ export interface AddMemoryOpts {
   /** Skip graph ingestion (trash copies must not pollute the knowledge graph). */
   skipGraphIngest?: boolean;
   /**
+   * Skip the forget-blocklist check. Trash copies carry forgotten text by
+   * design — blocking them would turn every forget into silent data loss.
+   * Everything else (including index-mode re-ingests) stays checked so a
+   * forgotten memory cannot be resurrected through another path.
+   */
+  skipBlocklistCheck?: boolean;
+  /**
    * Verbatim mode (mode:raw). Passes infer:false to the Mem0 SDK (no
    * gpt-4o-mini decomposition) AND bypasses pre-save LLM enrichment
    * entirely (see shouldEnrichTechnicalMemory). The stored text is exactly
@@ -710,6 +718,13 @@ function userId(project?: string): string {
 }
 
 export async function addMemory(text: string, project?: string, opts?: AddMemoryOpts): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; reason?: string; score?: number }[]> {
+  // Forget-blocklist: a forgotten memory must not be re-extracted through
+  // any save path (chat, index, bundle). First check — before Mem0 is touched.
+  if (!opts?.skipBlocklistCheck && await isBlocklisted(text)) {
+    console.log(`[mem0] Blocked re-save of forgotten memory: ${text.slice(0, 80)}...`);
+    incrementMetric('memoriesBlocked');
+    return [{ id: 'blocked', memory: text, action: 'NOOP', superseded: [], reason: 'forgotten memory (blocklist)', score: 0 }];
+  }
   // Pre-save enrichment BEFORE quality gate, for API memories missing detail.
   // Gated by shouldEnrichTechnicalMemory: never for verbatim (inferFalse) or
   // non-API notes. Acceptance is value-based (acceptEnrichedMemory), NOT
@@ -1307,6 +1322,48 @@ export async function applyMemoryFeedback(
   return setMemoryFeedback(memoryId, { status: 'active', last_confirmed_at: now, ...kindPatch });
 }
 
+// ─── Forget Blocklist (✕ must not resurrect) ───
+// Fase 0 of per-memory quick actions. `forget` hard-deletes AND records a
+// hash of the text here; every save path checks it first (see addMemory).
+// Without this, the next chat turn re-extracts the same fact.
+
+const FORGET_BLOCKLIST_KEY = 'mem0:forget-blocklist';
+
+/**
+ * Canonical form for blocklist matching: lowercase, no accents, no
+ * punctuation, single spaces. Paraphrases still pass — exact and
+ * near-exact repeats are caught, which is the re-extraction case.
+ */
+export function normalizeForBlocklist(text: string): string {
+  return text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+export function blocklistHash(text: string): string {
+  return createHash('sha256').update(normalizeForBlocklist(text)).digest('hex');
+}
+
+export async function isBlocklisted(text: string): Promise<boolean> {
+  if (!text.trim() || !isRedisAvailable()) return false;
+  try {
+    return (await getRedis().sismember(FORGET_BLOCKLIST_KEY, blocklistHash(text))) === 1;
+  } catch { return false; }
+}
+
+export async function addToBlocklist(text: string): Promise<void> {
+  if (!text.trim() || !isRedisAvailable()) return;
+  try {
+    await getRedis().sadd(FORGET_BLOCKLIST_KEY, blocklistHash(text));
+  } catch { /* non-critical */ }
+}
+
+export async function removeFromBlocklist(text: string): Promise<void> {
+  if (!text.trim() || !isRedisAvailable()) return;
+  try {
+    await getRedis().srem(FORGET_BLOCKLIST_KEY, blocklistHash(text));
+  } catch { /* non-critical */ }
+}
+
 // ─── Memory Cleanup (memoryScan) ───
 // Fase 4: automatic deletions go through the shared domain policy
 // (archive to trash + audit). The trash scope itself is never scanned.
@@ -1484,9 +1541,9 @@ export interface MemorySnapshot {
 
 /** Fetch full texts for ids BEFORE deleting. Never throws — returns
  * `{id, missing:true}` entries for anything unfetchable. */
-export async function snapshotMemories(ids: string[], project?: string): Promise<MemorySnapshot[]> {
+export async function snapshotMemories(ids: string[], project?: string, limit = 100): Promise<MemorySnapshot[]> {
   try {
-    const all = await getMemories(project, 100);
+    const all = await getMemories(project, limit);
     const byId = new Map(all.map(m => [m.id, m]));
     return ids.map(id => {
       const found = byId.get(id);
@@ -1526,6 +1583,7 @@ export async function trashAndDelete(
         skipQualityCheck: true,
         skipConflictCheck: true,
         skipGraphIngest: true,
+        skipBlocklistCheck: true, // trash carries forgotten text by design — see blocklist section
         metadata: {
           original_id: snapshot.id,
           deleted_from: fromProject ?? 'global',
@@ -1550,6 +1608,60 @@ export async function trashAndDelete(
   }
   console.error(`[mem0] refusing to delete ${snapshot.id} without a trash copy (missing/empty snapshot) — preserved`);
   return { trashId: null, deleted: false };
+}
+
+/** Undo window for ✕ (forget). Trash copies older than this cannot be restored. */
+export const RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface RestoreResult {
+  id: string | null;
+  restored: boolean;
+  reason?: string;
+}
+
+/**
+ * Undo a forget: re-save the trash copy into its original scope, delete the
+ * trash copy, and lift the blocklist entry. FAIL-CLOSED: the trash copy is
+ * deleted only after the re-save is confirmed.
+ */
+export async function restoreFromTrash(trashId: string): Promise<RestoreResult> {
+  let found;
+  try {
+    const all = await getMemories(TRASH_PROJECT, 500);
+    found = all.find(m => m.id === trashId);
+  } catch (err) {
+    console.error('[mem0] restore failed (trash unreadable):', err instanceof Error ? err.message : err);
+    return { id: null, restored: false, reason: 'trash unreadable' };
+  }
+  if (!found?.memory) return { id: null, restored: false, reason: 'not found in trash' };
+  const meta = (found.metadata ?? {}) as Record<string, unknown>;
+  const trashedAt = typeof meta.trashed_at === 'string' ? Date.parse(meta.trashed_at) : NaN;
+  if (!Number.isNaN(trashedAt) && Date.now() - trashedAt > RESTORE_WINDOW_MS) {
+    return { id: null, restored: false, reason: 'restore window expired (7d)' };
+  }
+  const fromProject = typeof meta.deleted_from === 'string' && meta.deleted_from !== 'global'
+    ? meta.deleted_from
+    : undefined;
+  let savedId: string | null = null;
+  try {
+    const saved = await addMemory(found.memory, fromProject, {
+      inferFalse: true,
+      skipQualityCheck: true,
+      skipConflictCheck: true,
+      skipBlocklistCheck: true, // restoring a forget — text is blocklisted until lifted below
+    });
+    savedId = saved[0]?.id ?? null;
+  } catch (err) {
+    console.error(`[mem0] restore re-save failed for ${trashId} — trash preserved:`, err instanceof Error ? err.message : err);
+    return { id: null, restored: false, reason: 're-save failed' };
+  }
+  if (!savedId) {
+    console.error(`[mem0] restore re-save unconfirmed for ${trashId} — trash preserved`);
+    return { id: null, restored: false, reason: 're-save unconfirmed' };
+  }
+  await deleteMemory(trashId);
+  await removeFromBlocklist(found.memory);
+  return { id: savedId, restored: true };
 }
 
 // C3: Update an existing memory by ID. Uses Mem0 SDK native update.

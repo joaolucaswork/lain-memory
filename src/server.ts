@@ -2,7 +2,7 @@
  * lain-memory HTTP server.
  *
  * Serves the full `/api/...` memory/graph/seed/pgs surface:
- * remember, recall, list, forget, feedback, add, context, update, consolidate,
+ * remember, recall, list, forget, restore, feedback, add, context, update, consolidate,
  * scan, resolve-entities, contradiction-scan, metrics, graph query/stats/
  * nodes/remove/autoclean/dump/ingest, seed extract/list, pgs execute/stats.
  *
@@ -19,6 +19,10 @@ import {
   deleteMemory,
   updateMemory,
   applyMemoryFeedback,
+  snapshotMemories,
+  trashAndDelete,
+  restoreFromTrash,
+  addToBlocklist,
   consolidateMemories,
   scanAndCleanProjectMemories,
   getContextForSpawn,
@@ -114,8 +118,33 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     }
 
     case '/api/memory/forget': {
+      // ✕ Esquecer: trash copy (7d undo) → hard delete → blocklist.
+      // Delete always succeeds when the id exists; trash+blocklist are
+      // best-effort (snapshot may miss project-scoped ids without `project`).
+      const snapshots = await snapshotMemories([data.memory_id], data.project, 500);
+      const snap = snapshots[0];
+      if (snap && !snap.missing && snap.memory) {
+        const { trashId, deleted } = await trashAndDelete(snap, data.project, {
+          reason: 'user forget vote',
+          trigger: 'api/memory/forget',
+        });
+        if (deleted) {
+          await addToBlocklist(snap.memory);
+          return json({ success: true, trashId, blocked: true });
+        }
+        return json({ error: 'could not archive before delete — original preserved' }, 500);
+      }
       await deleteMemory(data.memory_id);
-      return json({ success: true });
+      return json({ success: true, trashId: null, blocked: false });
+    }
+
+    case '/api/memory/restore': {
+      const result = await restoreFromTrash(data.memory_id);
+      if (!result.restored) {
+        const gone = result.reason === 'restore window expired (7d)';
+        return json({ error: result.reason ?? 'restore failed' }, gone ? 410 : 404);
+      }
+      return json({ success: true, id: result.id });
     }
 
     case '/api/memory/feedback': {

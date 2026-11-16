@@ -8,6 +8,7 @@
 export const metrics = {
   memoriesAdded: 0,
   memoriesRejected: 0,
+  memoriesBlocked: 0,
   deduplicationsRun: 0,
   coldPurged: 0,
   coldDryPurged: 0,
