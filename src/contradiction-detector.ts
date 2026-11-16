@@ -115,6 +115,8 @@ Examples:
 - Existing: "Project uses PostgreSQL" → New: "Project migrated to MySQL" → DELETE (outdated), supersedes
 - Existing: "Deploy process requires PR" → New: "Deploy process requires PR and manual trigger" → UPDATE (extends), supersedes
 
+SPECIFICITY GUARD: never UPDATE or DELETE a more specific existing memory with a vaguer new one. If the NEW memory contains pronouns or demonstratives without an explicit referent ("isso", "essa mistura", "ele", "lá") while the EXISTING states the referent explicitly, the new memory adds no information — return NOOP (the existing already covers it). Only supersede when the new memory is at least as specific and self-contained as the one it replaces.
+
 NEW MEMORY:
 ${newMemory}
 

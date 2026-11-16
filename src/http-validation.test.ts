@@ -37,6 +37,13 @@ describe('validateRoute', () => {
     if (!missing.ok) expect(missing.issues[0].path).toBe('text');
     const badMode = validateRoute('/api/memory/remember', { text: 'oi', mode: 'yolo' });
     expect(badMode.ok).toBe(false);
+    const chat = validateRoute('/api/memory/remember', {
+      text: 'to revendo seinfeld',
+      assistant: 'resumo de episódio',
+      mode: 'chat',
+      date: '2026-11-14',
+    });
+    expect(chat.ok).toBe(true);
   });
 
   test('limit fora do intervalo rejeita; coage string de query', () => {

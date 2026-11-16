@@ -393,6 +393,17 @@ const META_BEHAVIORAL_PATTERNS: RegExp[] = [
 
 export const MIN_MEMORY_QUALITY = 2;
 
+/** Credentials and boilerplate only. Chat atoms use this instead of the score rubric. */
+export function disqualifyMemory(text: string): string | null {
+  for (const pattern of BOILERPLATE_PATTERNS) {
+    if (pattern.test(text)) return `matched boilerplate pattern: ${pattern.source}`;
+  }
+  for (const pattern of CREDENTIAL_PATTERNS) {
+    if (pattern.test(text)) return 'matched credential pattern';
+  }
+  return null;
+}
+
 /**
  * Score a memory text for quality before saving.
  * Blocks boilerplate and trivially short/generic content.
@@ -512,6 +523,12 @@ export interface AddMemoryOpts {
    * could rewrite/fabricate before Mem0 ever saw the text.
    */
   inferFalse?: boolean;
+  /**
+   * Fact already extracted from a chat turn. Still hard-rejects credentials
+   * and boilerplate, but skips the technical quality score — a diary sentence
+   * ("o usuário tem Seinfeld como série conforto") would lose that rubric.
+   */
+  chatAtom?: boolean;
 }
 
 // Symbol used to guard against double-patching the OpenAILLM prototype
@@ -687,7 +704,9 @@ function getClient(): Memory {
 }
 
 function userId(project?: string): string {
-  return project ? `lucas:${project}` : 'lucas';
+  // mem0 rejeita user_id com whitespace — sanitiza para projetos com espaço (ex "lain::latency fixes").
+  const clean = project?.trim().replace(/\s+/g, '_');
+  return clean ? `lucas:${clean}` : 'lucas';
 }
 
 export async function addMemory(text: string, project?: string, opts?: AddMemoryOpts): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; reason?: string; score?: number }[]> {
@@ -725,26 +744,22 @@ Original: ${text}`
     }
   }
 
-  // Quality gate: reject low-quality saves before hitting Mem0 API (scored on enriched text)
+  // Quality gate: reject low-quality saves before hitting Mem0 API (scored on enriched text).
+  // Chat atoms already passed extraction; only credentials/boilerplate still block them.
   if (!opts?.skipQualityCheck) {
-    // C4: check boilerplate first so we can surface the specific pattern in reason
-    let boilerplateReason: string | undefined;
-    for (const pattern of BOILERPLATE_PATTERNS) {
-      if (pattern.test(enrichedText)) {
-        boilerplateReason = `matched boilerplate pattern: ${pattern.source}`;
-        break;
+    const hard = disqualifyMemory(enrichedText);
+    if (hard) {
+      console.log(`[mem0] Rejected disqualified memory: ${enrichedText.slice(0, 80)}...`);
+      incrementMetric('memoriesRejected');
+      return [{ id: 'rejected', memory: text, action: 'NOOP', superseded: [], reason: hard, score: 0 }];
+    }
+    if (!opts?.chatAtom) {
+      const quality = scoreMemoryQuality(enrichedText);
+      if (quality < MIN_MEMORY_QUALITY) {
+        console.log(`[mem0] Rejected low-quality memory (score=${quality}): ${enrichedText.slice(0, 80)}...`);
+        incrementMetric('memoriesRejected');
+        return [{ id: 'rejected', memory: text, action: 'NOOP', superseded: [], reason: 'actionability score below threshold', score: quality }];
       }
-    }
-    if (boilerplateReason) {
-      console.log(`[mem0] Rejected boilerplate memory: ${enrichedText.slice(0, 80)}...`);
-      incrementMetric('memoriesRejected');
-      return [{ id: 'rejected', memory: text, action: 'NOOP', superseded: [], reason: boilerplateReason, score: 0 }];
-    }
-    const quality = scoreMemoryQuality(enrichedText);
-    if (quality < MIN_MEMORY_QUALITY) {
-      console.log(`[mem0] Rejected low-quality memory (score=${quality}): ${enrichedText.slice(0, 80)}...`);
-      incrementMetric('memoriesRejected');
-      return [{ id: 'rejected', memory: text, action: 'NOOP', superseded: [], reason: 'actionability score below threshold', score: quality }];
     }
   }
 
@@ -1585,8 +1600,21 @@ async function consolidatePendingMerges(project?: string): Promise<{
         await updateEntry(entry.id, { status: 'failed', result: { error: 'fragments gone' } });
         continue;
       }
-      const saved = await addMemory(merged, project, { skipQualityCheck: true, skipConflictCheck: true });
-      const newId = saved[0]?.id ?? 'unknown';
+      // Verbatim save (inferFalse): the merged text is already final. With
+      // inference on, Mem0 can decompose it into an UPDATE against the still-
+      // present fragments and return no id ("unknown") — then the fragments
+      // below would be deleted with nothing saved (net loss). Same rationale
+      // as the trash path (byte-identical archive).
+      const saved = await addMemory(merged, project, { skipQualityCheck: true, skipConflictCheck: true, inferFalse: true });
+      const newId = saved[0]?.id;
+      if (!newId || newId === 'unknown' || newId === 'rejected') {
+        console.error(`[mem0] Pending merge ${entry.id.slice(0, 8)} save unconfirmed — fragments preserved`);
+        await updateEntry(entry.id, {
+          status: maxAttemptsReached(entry) ? 'failed' : 'pending',
+          result: { error: 'consolidated save unconfirmed, fragments preserved' },
+        });
+        continue;
+      }
       consolidated++;
 
       const trashIds: Record<string, string | null> = {};
@@ -1687,8 +1715,16 @@ Memórias:
         }
         // Snapshot fragments BEFORE replacing — full texts for the audit trail.
         const doomed = await snapshotMemories(group.map(m => m.id).filter(id => id && id !== 'pending'), project);
-        const saved = await addMemory(result.consolidated, project, { skipQualityCheck: true, skipConflictCheck: true });
-        const newId = saved[0]?.id ?? 'unknown';
+        // Verbatim save (inferFalse): the consolidated text is already final.
+        // With inference on, Mem0 can decompose it into an UPDATE against the
+        // still-present fragments and return no id ("unknown") — then the
+        // fragments below would be deleted with nothing saved (net loss).
+        const saved = await addMemory(result.consolidated, project, { skipQualityCheck: true, skipConflictCheck: true, inferFalse: true });
+        const newId = saved[0]?.id;
+        if (!newId || newId === 'unknown' || newId === 'rejected') {
+          console.error(`[mem0] Consolidation save unconfirmed — fragments preserved`);
+          continue;
+        }
         consolidated++;
 
         const trashIds: Record<string, string | null> = {};

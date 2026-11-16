@@ -71,8 +71,8 @@ describe('llm-client env resolution', () => {
   });
 
   it('G — model defaults and overrides', () => {
-    expect(getFastModel()).toBe('z-ai/glm-5.3-flash');
-    expect(getStandardModel()).toBe('z-ai/glm-5.3-flash');
+    expect(getFastModel()).toBe('anthropic/claude-haiku-5.5');
+    expect(getStandardModel()).toBe('anthropic/claude-haiku-5.5');
     process.env.LAIN_FAST_MODEL = 'xai/grok-4';
     process.env.LAIN_STANDARD_MODEL = 'openai/gpt-5';
     expect(getFastModel()).toBe('xai/grok-4');
@@ -152,5 +152,40 @@ describe('llm-client provider routing', () => {
     expect(bodies[0].provider).toEqual({ order: ['x'] });
     await runFastLlm('hi', { provider: null });
     expect(bodies[1]).not.toHaveProperty('provider');
+  });
+
+  it('M — reasoning minimal sent on OpenRouter, omitted elsewhere', async () => {
+    process.env.LAIN_LLM_BASE_URL = 'https://openrouter.ai/api/v1';
+    globalThis.fetch = fakeFetch('ok');
+    await runFastLlm('hi');
+    expect(bodies[0].reasoning).toEqual({ effort: 'minimal', exclude: true });
+    process.env.LAIN_LLM_BASE_URL = 'http://localhost:11434/v1';
+    globalThis.fetch = fakeFetch('ok');
+    await runFastLlm('hi');
+    expect(bodies[bodies.length - 1]).not.toHaveProperty('reasoning');
+  });
+
+  it('N — one retry on empty response, then succeeds', async () => {
+    process.env.LAIN_LLM_BASE_URL = 'https://openrouter.ai/api/v1';
+    let calls = 0;
+    globalThis.fetch = (mock(async () => {
+      calls++;
+      const content = calls === 1 ? '' : 'recovered';
+      return { ok: true, json: async () => ({ choices: [{ message: { content } }] }) };
+    }) as unknown) as typeof fetch;
+    const r = await runFastLlm('hi');
+    expect(r).toBe('recovered');
+    expect(calls).toBe(2);
+  });
+
+  it('O — finish=length throws LLM_TRUNCATED after one retry', async () => {
+    process.env.LAIN_LLM_BASE_URL = 'https://openrouter.ai/api/v1';
+    let calls = 0;
+    globalThis.fetch = (mock(async () => {
+      calls++;
+      return { ok: true, json: async () => ({ choices: [{ message: { content: '{"a":' }, finish_reason: 'length' }] }) };
+    }) as unknown) as typeof fetch;
+    await expect(runFastLlm('hi')).rejects.toThrow('LLM_TRUNCATED');
+    expect(calls).toBe(2);
   });
 });

@@ -38,6 +38,7 @@ import {
   reconcileGraph,
 } from './graphrag.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
+import { rememberChatTurn } from './chat-extract.js';
 import { getMetrics } from './mem-metrics.js';
 import { extractSeed, listSeeds } from './seed-extraction.js';
 import { PGSEngine } from './pgs/index.js';
@@ -46,6 +47,7 @@ import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
+import { startBundleSweep } from './bundle-sweep.js';
 import { parseBody, validateRoute } from './http-validation.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
@@ -79,6 +81,15 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
   switch (path) {
     case '/api/memory/remember': {
+      if (data.mode === 'chat') {
+        const result = await rememberChatTurn({
+          user: data.text,
+          assistant: data.assistant,
+          project: data.project,
+          date: data.date,
+        });
+        return json(result);
+      }
       const memOpts: { skipConflictCheck?: boolean; bundleMode?: boolean; inferFalse?: boolean; skipQualityCheck?: boolean } = {};
       if (data.mode === 'index') memOpts.skipConflictCheck = true;
       else if (data.mode === 'bundle') memOpts.bundleMode = true;
@@ -126,6 +137,12 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/memory/consolidate': {
       const result = await consolidateMemories(data.project);
+      return json(result);
+    }
+
+    case '/api/memory/bundle': {
+      const { runBundleSweep } = await import('./bundle-sweep.js');
+      const result = await runBundleSweep(data.dry_run ? { dryRun: true } : undefined);
       return json(result);
     }
 
@@ -350,6 +367,7 @@ async function boot(): Promise<void> {
   startMemoryMaintenance();
   startDedupSweep();
   startMemoryReaper();
+  startBundleSweep();
 
   Bun.serve({
     port: PORT,

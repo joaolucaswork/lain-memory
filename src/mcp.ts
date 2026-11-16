@@ -40,6 +40,8 @@ import { createPGSProviders } from './pgs/llm-provider.js';
 import { PGS_SESSIONS_DIR } from './workspace.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
+import { startBundleSweep } from './bundle-sweep.js';
+import { rememberChatTurn } from './chat-extract.js';
 
 const TOOL_DEFINITIONS = [
   {
@@ -51,11 +53,19 @@ const TOOL_DEFINITIONS = [
       properties: {
         text: { type: 'string', description: 'The fact or memory to save. Be specific and concise.' },
         project: { type: 'string', description: 'Project name (e.g. "lain", "kapso"). Omit for global memories.' },
+        assistant: {
+          type: 'string',
+          description: 'Model reply for mode=chat. Context only — never stored as a fact.',
+        },
+        date: {
+          type: 'string',
+          description: 'Turn day YYYY-MM-DD. Used by mode=chat as extraction context.',
+        },
         mode: {
           type: 'string',
-          enum: ['atomic', 'bundle', 'index', 'raw'],
+          enum: ['atomic', 'bundle', 'index', 'raw', 'chat'],
           description:
-            'Save mode. atomic (default): normal dedup. bundle: treats input as a summary — tells conflict detector to prefer UPDATE over NOOP for overlapping atoms. index: skips conflict check entirely, for summaries of already-saved atoms. raw: stores text as-is without Mem0 decomposition (infer:false).',
+            'Save mode. atomic (default): normal dedup. bundle: treats input as a summary — tells conflict detector to prefer UPDATE over NOOP for overlapping atoms. index: skips conflict check entirely, for summaries of already-saved atoms. raw: stores text as-is without Mem0 decomposition (infer:false). chat: extract durable facts from a conversation turn (text = what the user said, assistant = model reply). Assistant speech is not saved. Each fact is stored verbatim.',
         },
       },
       required: ['text'],
@@ -121,6 +131,17 @@ const TOOL_DEFINITIONS = [
         project: { type: 'string', description: 'Project name to scan (e.g. "lain", "reino-capital-pay")' },
       },
       required: ['project'],
+    },
+  },
+  {
+    name: 'bundle_diario',
+    description:
+      'Build a weekly non-destructive timeline bundle from the diario project. Never deletes fragments — appends one [Bundle: diario ...] summary. Scope is fixed to diario.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        dry_run: { type: 'boolean', description: 'Preview only, do not save (default false)' },
+      },
     },
   },
   {
@@ -202,6 +223,22 @@ const err = (t: string): ToolResult => ({ content: [{ type: 'text', text: t }], 
 async function handleTool(name: string, args: Record<string, any>): Promise<ToolResult> {
   switch (name) {
     case 'remember': {
+      if (args.mode === 'chat') {
+        const memories = await rememberChatTurn({
+          user: args.text,
+          assistant: args.assistant,
+          project: args.project,
+          date: args.date,
+        });
+        if (Array.isArray(memories) && memories[0]?.id === 'noop') {
+          return text('Nothing saved — no durable user facts in this turn.');
+        }
+        const summary =
+          Array.isArray(memories) && memories.length > 0
+            ? memories.map(m => `- ${m.memory} (id: ${m.id}${m.action ? `, ${m.action}` : ''})`).join('\n')
+            : 'Nothing saved.';
+        return text(`Remembered${args.project ? ` [${args.project}]` : ' [global]'}:\n${summary}`);
+      }
       const memOpts: { skipConflictCheck?: boolean; bundleMode?: boolean; inferFalse?: boolean } = {};
       if (args.mode === 'index') memOpts.skipConflictCheck = true;
       else if (args.mode === 'bundle') memOpts.bundleMode = true;
@@ -259,6 +296,12 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
       if (!args.project) return err('project is required for memory scan');
       const report = await scanAndCleanProjectMemories(args.project);
       return text(JSON.stringify(report, null, 2));
+    }
+
+    case 'bundle_diario': {
+      const { runBundleSweep } = await import('./bundle-sweep.js');
+      const result = await runBundleSweep(args.dry_run ? { dryRun: true } : undefined);
+      return text(JSON.stringify(result, null, 2));
     }
 
     case 'graph_query': {
@@ -345,6 +388,7 @@ async function main(): Promise<void> {
   startMemoryMaintenance();
   startDedupSweep();
   startMemoryReaper();
+  startBundleSweep();
 
   const mcpServer = new Server({ name: 'lain-memory', version: '0.1.0' }, { capabilities: { tools: {} } });
 
@@ -361,7 +405,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
   // stderr only — stdout is the MCP transport.
-  console.error('[lain-memory MCP] ready (12 tools, in-process backends)');
+  console.error('[lain-memory MCP] ready (13 tools, in-process backends)');
 }
 
 main().catch(e => {

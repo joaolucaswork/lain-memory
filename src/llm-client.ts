@@ -6,8 +6,8 @@
  *   LAIN_LLM_BASE_URL    — OpenAI-compatible base URL (default: https://openrouter.ai/api/v1)
  *   LAIN_LLM_API_KEY     — API key (fallback: OPENROUTER_API_KEY, then AI_GATEWAY_API_KEY,
  *                          then LAIN_OPENAI_API_KEY / OPENAI_API_KEY)
- *   LAIN_FAST_MODEL      — model for fast calls (default: z-ai/glm-5.3-flash)
- *   LAIN_STANDARD_MODEL  — model for standard calls (default: z-ai/glm-5.3-flash)
+ *   LAIN_FAST_MODEL      — model for fast calls (default: anthropic/claude-haiku-5.5)
+ *   LAIN_STANDARD_MODEL  — model for standard calls (default: anthropic/claude-haiku-5.5)
  *
  * Used by the memory path (conflict detection, enrichment, GraphRAG, seed
  * extraction, consolidation) — no Claude Code CLI dependency anywhere here.
@@ -46,11 +46,11 @@ export function getLlmApiKey(): string {
 }
 
 export function getFastModel(): string {
-  return process.env.LAIN_FAST_MODEL || 'z-ai/glm-5.3-flash';
+  return process.env.LAIN_FAST_MODEL || 'anthropic/claude-haiku-5.5';
 }
 
 export function getStandardModel(): string {
-  return process.env.LAIN_STANDARD_MODEL || 'z-ai/glm-5.3-flash';
+  return process.env.LAIN_STANDARD_MODEL || 'anthropic/claude-haiku-5.5';
 }
 
 export interface ChatCallOpts {
@@ -85,6 +85,26 @@ export function getDefaultProviderRouting(): Record<string, unknown> | undefined
   return { preferred_max_latency: { p90: 5 } };
 }
 
+/**
+ * Minimal-reasoning hint, OpenRouter-only (same scoping as provider routing).
+ * Thinking models burn `max_tokens` on internal reasoning before the content;
+ * `minimal + exclude` keeps the budget for the answer. Non-OpenRouter endpoints
+ * may not understand the field, so it is omitted there.
+ * Kill switch: LAIN_LLM_REASONING=off (also 0/false/no).
+ */
+export function getReasoningParam(): Record<string, unknown> | undefined {
+  const flag = (process.env.LAIN_LLM_REASONING || 'on').toLowerCase();
+  if (flag === 'off' || flag === '0' || flag === 'false' || flag === 'no') return undefined;
+  let host = '';
+  try {
+    host = new URL(getLlmBaseUrl()).hostname;
+  } catch {
+    return undefined;
+  }
+  if (!host.endsWith('openrouter.ai')) return undefined;
+  return { effort: 'minimal', exclude: true };
+}
+
 async function callChatCompletions(prompt: string, opts: {
   model: string;
   maxTokens?: number;
@@ -115,6 +135,7 @@ async function callChatCompletions(prompt: string, opts: {
         max_tokens: opts.maxTokens ?? 4096,
         temperature: opts.temperature ?? 0.3,
         ...(provider ? { provider } : {}),
+        ...(getReasoningParam() ? { reasoning: getReasoningParam() } : {}),
       }),
       signal: controller.signal,
     });
@@ -127,9 +148,13 @@ async function callChatCompletions(prompt: string, opts: {
     }
 
     const data = await res.json() as {
-      choices?: Array<{ message?: { content?: string } }>;
+      choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
+    const finish = data.choices?.[0]?.finish_reason;
+    if (finish === 'length') {
+      throw new Error('LLM_TRUNCATED (finish=length, max_tokens esgotado antes do conteúdo)');
+    }
     const content = data.choices?.[0]?.message?.content?.trim();
     if (!content) throw new Error('LLM returned empty response');
 
@@ -154,14 +179,44 @@ async function callChatCompletions(prompt: string, opts: {
 }
 
 /**
+ * 1 retry em resposta vazia/truncada — thinking models via OpenRouter às vezes
+ * voltam vazios (reasoning consome o max_tokens). Espelha o retry do BFF.
+ */
+async function callWithRetry(
+  prompt: string,
+  opts: {
+    model: string;
+    maxTokens?: number;
+    temperature?: number;
+    timeout?: number;
+    systemPrompt?: string;
+    provider?: Record<string, unknown> | null;
+  },
+): Promise<string> {
+  let lastErr: unknown = null;
+  for (let i = 0; i < 2; i++) {
+    try {
+      return await callChatCompletions(prompt, opts);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const retryable = msg === 'LLM returned empty response' || msg.startsWith('LLM_TRUNCATED');
+      if (!retryable || i === 1) throw err;
+      await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Fast LLM call. ~1-2s response time.
  */
 export async function runFastLlm(prompt: string, opts?: ChatCallOpts): Promise<string> {
-  return callChatCompletions(prompt, { model: getFastModel(), timeout: 15_000, ...opts });
+  return callWithRetry(prompt, { model: getFastModel(), timeout: 15_000, ...opts });
 }
 
 export async function runStandardLlm(prompt: string, opts?: ChatCallOpts): Promise<string> {
-  return callChatCompletions(prompt, { model: getStandardModel(), timeout: 90_000, ...opts });
+  return callWithRetry(prompt, { model: getStandardModel(), timeout: 90_000, ...opts });
 }
 
 export async function runStandardLlmJson<T>(prompt: string, opts?: ChatCallOpts): Promise<T> {
@@ -202,7 +257,7 @@ function parseJsonFromLlm<T>(raw: string): T {
  * Returns trimmed output or null on failure.
  */
 export function callFastLlmSafe(prompt: string, opts?: ChatCallOpts): Promise<string | null> {
-  return callChatCompletions(prompt, {
+  return callWithRetry(prompt, {
     model: getFastModel(),
     maxTokens: 1024,
     timeout: 15_000,

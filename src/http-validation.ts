@@ -38,7 +38,11 @@ export const routeSchemas: Record<string, z.ZodType> = {
   '/api/memory/remember': z.object({
     text: text(50000),
     project,
-    mode: z.enum(['atomic', 'bundle', 'index', 'raw']).optional(),
+    mode: z.enum(['atomic', 'bundle', 'index', 'raw', 'chat']).optional(),
+    /** Model reply. Used only by mode=chat. Not stored. */
+    assistant: z.string().max(20000).optional(),
+    /** Turn day YYYY-MM-DD. Context for chat extraction, not a stored field by itself. */
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     skipQualityCheck: z.boolean().optional(),
   }),
   '/api/memory/recall': z.object({

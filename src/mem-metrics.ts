@@ -17,6 +17,7 @@ export const metrics = {
   graphOutboxProcessed: 0,
   graphReconciled: 0,
   graphPrunedEdges: 0,
+  bundlesCreated: 0,
 };
 
 export function incrementMetric(key: keyof typeof metrics): void {

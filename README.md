@@ -176,7 +176,7 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped whe
 
 | Path | Body | Description |
 |------|------|-------------|
-| `/api/memory/remember` | `{ text, project?, mode?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`) |
+| `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim |
 | `/api/memory/recall` | `{ query, project?, limit?, cached? }` | Ranked search (`cached` = Redis-backed) |
 | `/api/memory/list` | `{ project?, limit? }` | List memories |
 | `/api/memory/forget` | `{ memory_id }` | Delete by ID |
