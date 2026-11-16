@@ -3,7 +3,7 @@
  * Smoke test for the lain-memory MCP server (src/mcp.ts).
  *
  * Default: spawns the stdio server, runs initialize + tools/list, asserts
- * the 12 memory tools are exposed. No backends touched (no Qdrant/LLM needed).
+ * the 13 memory tools are exposed. No backends touched (no Qdrant/LLM needed).
  *
  *   bun run smoke
  *
@@ -18,6 +18,7 @@
 
 const EXPECTED = [
   'remember', 'recall', 'forget', 'update_memory', 'list_memories', 'scan_memories',
+  'bundle_diario',
   'graph_query', 'graph_stats', 'pgs_query', 'pgs_stats', 'seed_extract', 'list_seeds',
 ];
 
@@ -90,7 +91,7 @@ try {
   const names: string[] = (list?.result?.tools ?? []).map((t: any) => t.name);
   const missing = EXPECTED.filter(n => !names.includes(n));
   console.log(`tools: ${names.length} (${names.join(', ')})`);
-  check(missing.length === 0 && names.length === EXPECTED.length, 'tools/list exposes the 12 memory tools',
+  check(missing.length === 0 && names.length === EXPECTED.length, 'tools/list exposes the 13 memory tools',
     missing.length > 0 ? `missing: ${missing.join(', ')}` : '');
 
   if (process.argv.includes('--live')) {
@@ -180,4 +181,4 @@ if (failures.length > 0) {
   console.error(`smoke: FAIL (${failures.length})`);
   process.exit(1);
 }
-console.log(process.argv.includes('--live') ? 'smoke: OK (list + live write path)' : 'smoke: OK (12 memory tools over stdio)');
+console.log(process.argv.includes('--live') ? 'smoke: OK (list + live write path)' : 'smoke: OK (13 memory tools over stdio)');
