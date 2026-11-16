@@ -274,6 +274,16 @@ export const EXTRACT_EXAMPLES: ExtractExample[] = [
     assistant: '(sem resposta)',
     facts: [{ text: 'O usuário acordou com dor de cabeça.', title: 'Dor de cabeça', relevance: 1, kind: 'state', sensitive: false }],
   },
+  {
+    user: 'fiz a cirurgia do calcanhar em junho, uns 3 dias depois do acidente',
+    assistant: '(sem resposta)',
+    facts: [{ text: 'O usuário fez cirurgia do calcanhar em junho/2026, cerca de 3 dias depois do acidente.', title: 'Cirurgia calcanhar junho', relevance: 5, kind: 'fact', sensitive: false }],
+  },
+  {
+    user: 'ontem internei pelo tornozelo',
+    assistant: '(sem resposta)',
+    facts: [{ text: 'O usuário foi internado pelo tornozelo em 13/11/2026.', title: 'Internação tornozelo novembro', relevance: 4, kind: 'fact', sensitive: false }],
+  },
 ];
 
 /**
@@ -302,6 +312,7 @@ Regras:
 - Preservar o tempo verbal: nunca converta passado em presente. Se a pessoa marcou passado ("antes", "antigamente", "vivia", "sentia", "tinha", "na época", "quando", "resultou em"), o fato tem que carregar o marcador com as palavras da pessoa no início ("Antes...", "Na época do surto,...") — sem adjetivos novos — e usar pretérito. Quando a pessoa disser a relação de causa ("resultou em", "por causa disso"), ela precisa aparecer no fato. Sem marcador de presente ("hoje", "agora", "ainda", "continuo"), sintoma, rotina ou estado relatado no passado fica no passado.
 - Passado e presente misturados viram fatos separados, cada um com seu tempo.
 - A data da conversa é quando foi dito, não quando aconteceu. Não use a data da conversa como data do evento sem indicação explícita da pessoa.
+- Quando a pessoa disser QUANDO aconteceu (relativo: "ontem", "semana passada", "há 5 meses", "3 dias depois"; ou absoluto: "em junho", "dia 10"), converta para data absoluta usando a Data da conversa como âncora e inclua no texto do fato (ex: "em junho/2026", "em 13/11/2026"). Sem quando explícito, não invente data nenhuma.
 - Cada fato é um objeto {"text","title","relevance","kind","sensitive"}.
 - "text": UMA frase curta, em português, sobre a pessoa, e deve conter "o usuário".
 - "text" precisa fazer sentido SOZINHO, sem ler a conversa. Teste: se o fato contiver pronome ou demonstrativo sem referente explícito ("isso", "essa mistura", "ele"), está errado — reescreva com o nome explícito.
