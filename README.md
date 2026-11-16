@@ -12,7 +12,7 @@ Standalone HTTP service (`:3341`) — the assistant talks to it over HTTP for ev
 
 - **Quality gate on write** — credential / boilerplate / noise walls reject junk before it's stored.
 - **Conflict check on write** — LLM classifier verdicts `ADD / UPDATE / NOOP`, so new facts merge with old ones instead of piling up contradictions. Modes: `atomic` (default) / `bundle` / `index` / `raw`.
-- **Ranked recall** — `0.5×cosine + 0.3×ageDecay + 0.2×importance + termBoost`, 30d half-life (180d for high-importance), hot/warm/cold tiers, `LAIN_MIN_RECALL_SCORE` threshold (default `0.356`).
+- **Ranked recall** — `(0.5×cosine + 0.3×ageDecay + 0.2×importance) × (0.5 + 0.5×confidence) + termBoost` (capped at 1.0), half-life 90d fact / 7d state / 180d importance≥0.8, hot/warm/cold tiers, `LAIN_MIN_RECALL_SCORE` threshold (default `0.356`). Details in [How recall ranks](#how-recall-ranks).
 - **Forgetting on purpose** — dedup sweep + memory reaper expire stale memories (with audit log), GraphRAG autoclean prunes the graph.
 - **Graph context** — entity/relationship extraction plus partition-based search (PGS) and seed ingestion from text/PDFs.
 
@@ -153,7 +153,7 @@ The dir must exist before boot (the server refuses to start otherwise — `./set
 
 | What | Where | Notes |
 |------|-------|-------|
-| Memory text + `lain_feedback` / `lain_importance` payload | Qdrant (`mem0` or `mem0-${LAIN_INSTANCE_ID}`) | Authority for votes, titles, importance. No TTL. Survives Redis loss. |
+| Memory text + `lain_feedback` / `lain_importance` / `lain_relevance` payload | Qdrant (`mem0` or `mem0-${LAIN_INSTANCE_ID}`) | Authority for votes, titles, importance, extractor ratings. No TTL. Survives Redis loss. |
 | Forget blocklist | `$WORKSPACE/.knowledge/forget-blocklist.json` | Authority. Atomic writes. Fail-closed on read error. |
 | Graph + seeds + PGS sessions | `$WORKSPACE/.knowledge/` | As above. |
 | Recall cache, touch timestamps, state L2 | Redis | Pure cache — safe to drop at any time. Rebuilds on its own. |
@@ -166,6 +166,29 @@ Migrating a pre-#11 Redis (one-shot, idempotent, deletes nothing):
 bun run migrate:state -- --dry-run   # report only: counts + ids with no Qdrant point
 bun run migrate:state                # copy feedback/importance/blocklist (Qdrant wins ties)
 docker volume rm lain-memory-redis   # optional afterwards: Redis rebuilds as pure cache
+```
+
+### How recall ranks
+
+`rankRecallResults` (`src/mem0.ts`) scores every hit as:
+
+`score = (0.5·cosine + 0.3·ageDecay + 0.2·importance) · (0.5 + 0.5·confidence) + termBoost` (capped at 1.0)
+
+- `ageDecay = 2^(-daysOld / halfLife)`: half-life **90d** for `fact`, **7d** for `state`, **180d** when `importance >= 0.8` (confirmed-important is protected from decay). Missing/future dates decay as 1.0.
+- `importance`: chat memories use the extractor (`relevance` 1–5 → 0.2 / 0.35 / 0.5 / 0.7 / 0.85); everything else uses the `scoreImportance` regex — dates, money, decision language (`decidiu`, `vai usar`), errors. No project, vendor, health, or personal bonuses; those are the extractor's job. Stored in memory-state (Qdrant `lain_importance`).
+- `confidence`: 0.5 default; ✓ confirm sets 1.0 (and floors importance at 0.85). Archived memories are excluded before ranking.
+- `termBoost`: up to +0.1 for exact query-term matches (terms ≥ 3 chars).
+- Recalled memories get a touch timestamp (30d TTL): the next recall uses it as virtual `updated_at` (use refreshes recency) and bumps importance +0.05. `cached` recalls serve from Redis (5min TTL); votes invalidate the cache.
+- `LAIN_MIN_RECALL_SCORE` (default `0.356`) drops low-score hits after ranking.
+
+`kind` (`fact` = stable, `state` = transient) comes from the extractor on chat saves and from a regex on other paths; it drives the decay half-life above. `sensitive` (mental health, crisis, grief, substance use) comes from the extractor; it travels in the payload and has no automated consumer yet.
+
+Auditing importance (read-only, unless `--restore`):
+
+```bash
+bun run scripts/snapshot-importance.ts                          # snapshot all points → scripts/eval-results/importance-<ts>.json + chat distribution
+bun run scripts/snapshot-importance.ts --restore <file> [--dry-run]  # rewrite importance+kind from a snapshot (skips ids that no longer exist)
+bun run scripts/compare-importance.ts <antes.json> <depois.json>     # side-by-side distribution + top movers → scripts/eval-results/compare-<ts>.txt
 ```
 
 ## Configuration
@@ -196,8 +219,8 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped whe
 
 | Path | Body | Description |
 |------|------|-------------|
-| `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim, with a short display `title` (ideal 3, max 6 words) generated in the same extractor call |
-| `/api/memory/recall` | `{ query, project?, limit?, cached? }` | Ranked search (`cached` = Redis-backed). Each hit carries `confidence`, `last_confirmed_at`, `status`, `kind`, `title` |
+| `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim, with a short display `title` (ideal 3, max 6 words) plus extractor-rated `relevance`/`kind`/`sensitive` (→ importance in memory-state), all in the same extractor call |
+| `/api/memory/recall` | `{ query, project?, limit?, cached?, debug? }` | Ranked search (`cached` = Redis-backed, `debug: true` pins `adjustedScore` + `importance` on every hit). Each hit carries `adjustedScore`, `importance`, `confidence`, `last_confirmed_at`, `status`, `kind`, `title` |
 | `/api/memory/list` | `{ project?, limit? }` | List memories (each item carries `confidence`, `last_confirmed_at`, `status`, `kind`, `title`) |
 | `/api/memory/forget` | `{ memory_id, project? }` | Trash copy (7d undo) → hard delete → forget-blocklist |
 | `/api/memory/restore` | `{ memory_id }` (trash copy id) | Undo a forget within 7d; lifts the blocklist entry |
