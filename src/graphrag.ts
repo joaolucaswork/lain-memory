@@ -18,6 +18,26 @@ import { getRedis, isRedisAvailable } from './redis.js';
 import { shouldRejectEntity, shouldRejectRelationship, sweepGraph, type SweepResult } from './graph-autoclean.js';
 import { withDistributedLock } from './distributed-lock.js';
 import { incrementMetric } from './mem-metrics.js';
+import type {
+  DecisionAttrs,
+  DecisionInput,
+  EntityAttrs,
+  EntityType,
+  GraphContext,
+  GraphIngestOpts,
+  GraphOutboxEntry,
+  RelationshipAttrs,
+} from './graphrag/types.js';
+export type {
+  DecisionAttrs,
+  DecisionInput,
+  EntityAttrs,
+  EntityType,
+  GraphContext,
+  GraphIngestOpts,
+  GraphOutboxEntry,
+  RelationshipAttrs,
+} from './graphrag/types.js';
 
 const GRAPH_FILENAME = INSTANCE_ID ? `graph-${INSTANCE_ID}.json` : 'graph.json';
 const GRAPH_PATH = path.join(KNOWLEDGE_DIR, GRAPH_FILENAME);
@@ -79,61 +99,10 @@ export async function invalidateGraphCache(): Promise<void> {
 
 // ─── Types ───
 
-export type EntityType = 'Person' | 'Project' | 'Technology' | 'Company' | 'Concept' | 'Location' | 'Decision' | 'Medication' | 'HealthCondition' | 'Food' | 'Other';
-
-export interface EntityAttrs {
-  type: EntityType;
-  description?: string;
-  firstSeen: number;
-  lastSeen: number;
-  mentions: number;
-  /**
-   * Fase 3 — proveniência: Mem0 IDs whose ingestion created/touched this
-   * entity. Undefined = legacy/pre-provenance data (never pruned for lack
-   * of sources). Defined = derived projection, safe to prune when empty.
-   */
-  sources?: string[];
-}
-
-export interface DecisionAttrs extends EntityAttrs {
-  type: 'Decision';
-  options: string[];
-  criteria: string[];
-  chosen: string;
-  reasoning: string;
-  confidence: number;
-}
-
-export interface DecisionInput {
-  name: string;
-  description: string;
-  options: string[];
-  criteria: string[];
-  chosen: string;
-  reasoning: string;
-  confidence: number;
-  relatedEntities?: Array<{ name: string; type: EntityType }>;
-}
-
-export interface RelationshipAttrs {
-  predicate: string;
-  weight: number;
-  firstSeen: number;
-  lastSeen: number;
-  /** Fase 3 — proveniência: see EntityAttrs.sources. */
-  sources?: string[];
-}
-
 interface GraphFile {
   version: number;
   exportedAt: number;
   graph: ReturnType<Graph['export']>;
-}
-
-export interface GraphContext {
-  entities: Array<EntityAttrs & { id: string }>;
-  relationships: Array<{ source: string; target: string; predicate: string; weight: number }>;
-  markdown: string;
 }
 
 interface ExtractionResult {
@@ -433,11 +402,6 @@ function upsertRelationship(sourceId: string, targetId: string, predicate: strin
 }
 
 // ─── Public API ───
-
-export interface GraphIngestOpts {
-  /** Mem0 IDs that originated this content (Fase 3 proveniência). */
-  sourceIds?: string[];
-}
 
 export async function ingest(text: string, project?: string, opts?: GraphIngestOpts): Promise<{ entities: number; relationships: number }> {
   if (!ENABLED || !graph) return { entities: 0, relationships: 0 };
@@ -1006,17 +970,6 @@ export async function runAutoclean(): Promise<SweepResult> {
 // (fast local append, no LLM wait) and triggers a background drain. A crash
 // between Mem0 save and outbox append (~ms window) is the only uncovered
 // case; crash mid-drain is recovered via `.processing` files on next drain.
-
-export interface GraphOutboxEntry {
-  id: string;
-  ts: number;
-  attempts: number;
-  project?: string;
-  sourceIds?: string[];
-  text?: string;
-  entities?: Array<{ name: string; type: string; description: string }>;
-  relationships?: Array<{ subject: string; predicate: string; object: string }>;
-}
 
 const OUTBOX_MAX_ATTEMPTS = 5;
 
