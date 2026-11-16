@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
   acceptChatFact,
+  ASSISTANT_VOICE,
   buildChatExtractPrompt,
   buildFactRatingPrompt,
   buildTitlePrompt,
   CHAT_FACT_RATING_CRITERIA,
   extractChatFacts,
+  EXTRACT_EXAMPLES,
   fallbackTitleFromFact,
   isTitleCandidate,
   normalizeChatFacts,
@@ -14,7 +16,9 @@ import {
   rateChatFact,
   relevanceToImportance,
   rememberChatTurn,
+  renderExamples,
   sanitizeChatRating,
+  TITLE_IDEAL_WORDS,
 } from './chat-extract.js';
 
 /** Cards that recall actually stored from the 2026-11-14 Seinfeld turn. */
@@ -130,6 +134,56 @@ describe('normalizeChatFactPairs', () => {
     // título vazio cai no fallback do corpo
     expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'Reassistindo Seinfeld em ordem disse', relevance: 3, kind: 'fact', sensitive: false });
     expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'Dorme tarde', relevance: 3, kind: 'fact', sensitive: false });
+  });
+});
+
+describe('EXTRACT_EXAMPLES — exemplos como dados sintéticos', () => {
+  test('nenhum exemplo é rejeitado pelo próprio pipeline', () => {
+    for (const ex of EXTRACT_EXAMPLES) {
+      const out = normalizeChatFactPairs(ex.facts);
+      expect(out.map((f) => f.text)).toEqual(ex.facts.map((f) => f.text));
+    }
+  });
+
+  test('títulos curtos (ideal + 1) e capitalizados', () => {
+    for (const ex of EXTRACT_EXAMPLES) {
+      for (const f of ex.facts) {
+        const words = f.title.split(/\s+/).filter(Boolean);
+        expect(words.length).toBeLessThanOrEqual(TITLE_IDEAL_WORDS + 1);
+        expect(f.title[0]).toBe(f.title[0]?.toUpperCase());
+      }
+    }
+  });
+
+  test('todo fato é sobre a pessoa e nunca voz do assistente', () => {
+    for (const ex of EXTRACT_EXAMPLES) {
+      for (const f of ex.facts) {
+        expect(f.text.toLowerCase()).toContain('o usuário');
+        expect(ASSISTANT_VOICE.test(f.text)).toBe(false);
+      }
+    }
+  });
+
+  test('renderExamples usa o mesmo formato do turno real', () => {
+    const rendered = renderExamples();
+    expect(rendered).toContain('PESSOA:\n');
+    expect(rendered).toContain('\n\nASSISTENTE:\n');
+    expect(rendered).toContain('→ {"facts":');
+    for (const ex of EXTRACT_EXAMPLES) {
+      expect(rendered).toContain(ex.user);
+    }
+  });
+
+  test('prompt embute os exemplos e remove dado real antigo', () => {
+    const prompt = buildChatExtractPrompt({ user: 'probe', date: '2026-11-16' });
+    for (const ex of EXTRACT_EXAMPLES) {
+      expect(prompt).toContain(ex.user);
+    }
+    expect(prompt).toContain('OUTRO projeto');
+    expect(prompt).not.toContain('Haiku 5.5');
+    expect(prompt).not.toContain('chapado');
+    expect(prompt).toContain('Estado do dia (dor, humor, sono de ontem)');
+    expect(prompt).toContain('sem adjetivos novos');
   });
 });
 

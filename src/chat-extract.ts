@@ -140,8 +140,7 @@ const stripWordPunct = (w: string) => w.replace(/^[.,;:«»“”"'()]+|[.,;:«�
 
 /**
  * Archive convention: titles open capitalized ("Dor pulsante…", never
- * "dor pulsante…"). The extractor prompt shows lowercase examples and the
- * model copies their case — deterministic fix here, not another LLM call.
+ * "dor pulsante…"). Normalization enforces this deterministically.
  */
 function capitalizeTitleHead(t: string): string {
   if (!t) return t;
@@ -219,6 +218,75 @@ export function normalizeChatFacts(facts: unknown): string[] {
   return normalizeChatFactPairs(facts).map((f) => f.text);
 }
 
+/** One extraction example: synthetic turn + expected output. No real user data. */
+export interface ExtractExample {
+  user: string;
+  assistant: string;
+  facts: ChatFact[];
+}
+
+/**
+ * Worked examples, one per rule. All turns are synthetic — never real
+ * transcript text (privacy: this prompt ships on every extraction call).
+ * Titles obey the archive convention (first letter uppercase).
+ */
+export const EXTRACT_EXAMPLES: ExtractExample[] = [
+  {
+    user: 'como isso todas as noites e nunca enjoo',
+    assistant: 'Que bom! Banana assada com batata doce, ovo e queijo é um jantar e tanto.',
+    facts: [{ text: 'O usuário come banana assada com batata doce, ovo e queijo todas as noites e nunca enjoa.', title: 'Banana assada toda noite', relevance: 3, kind: 'fact', sensitive: false }],
+  },
+  {
+    user: 'me conta o que acontece no episódio 3',
+    assistant: 'No episódio 3 o detetive encontra a carta e foge de moto pelo túnel.',
+    facts: [],
+  },
+  {
+    user: 'sim',
+    assistant: 'Você gostou do filme?',
+    facts: [],
+  },
+  {
+    user: 'sim, muito',
+    assistant: 'Você gostou de Duna 2?',
+    facts: [{ text: 'O usuário gostou muito do filme Duna 2.', title: 'Gostou de Duna 2', relevance: 2, kind: 'fact', sensitive: false }],
+  },
+  {
+    user: 'não, é minha vizinha Rita',
+    assistant: 'Seria sua irmã?',
+    facts: [{ text: 'O usuário tem uma vizinha chamada Rita.', title: 'Vizinha Rita', relevance: 3, kind: 'fact', sensitive: false }],
+  },
+  {
+    user: 'fechado',
+    assistant: 'Que tal caminhar 20 minutos depois do almoço?',
+    facts: [{ text: 'O usuário combinou de caminhar 20 minutos depois do almoço.', title: 'Caminhada após almoço', relevance: 3, kind: 'fact', sensitive: false }],
+  },
+  {
+    user: 'antes eu dormia 4h e vivia no café, hoje durmo 7h',
+    assistant: '(sem resposta)',
+    facts: [
+      { text: 'Antes, o usuário dormia 4 horas por noite e tomava muito café.', title: 'Dormia 4 horas antes', relevance: 3, kind: 'fact', sensitive: false },
+      { text: 'O usuário hoje dorme 7 horas por noite.', title: 'Dorme 7 horas hoje', relevance: 2, kind: 'state', sensitive: false },
+    ],
+  },
+  {
+    user: 'acordei com dor de cabeça',
+    assistant: '(sem resposta)',
+    facts: [{ text: 'O usuário acordou com dor de cabeça.', title: 'Dor de cabeça', relevance: 1, kind: 'state', sensitive: false }],
+  },
+];
+
+/**
+ * Render examples in the SAME shape as the real turn below
+ * (PESSOA / ASSISTENTE blocks + → JSON). Fenced as another project so the
+ * model copies the format without extracting the examples as facts.
+ */
+export function renderExamples(examples: ExtractExample[] = EXTRACT_EXAMPLES): string {
+  return examples
+    .map((ex) => `PESSOA:\n${ex.user}\n\nASSISTENTE:\n${ex.assistant}\n→ ${JSON.stringify({ facts: ex.facts })}`)
+    .join('\n\n');
+}
+
 export function buildChatExtractPrompt(input: ChatTurnInput): string {
   const date = input.date ?? new Date().toISOString().slice(0, 10);
   const assistant = (input.assistant ?? '').trim() || '(sem resposta)';
@@ -230,8 +298,8 @@ Regras:
 - Mas USE a fala do assistente para duas coisas: (a) resolver referentes — se a pessoa disser "isso", "essa mistura", "ele", "lá", escreva o nome explícito do prato/pessoa/lugar como aparece no turno ou na fala do assistente; (b) detectar proposta concreta aceita com "sim/isso/fechado".
 - Só resolva o referente se o nome estiver ESCRITO no turno ou na fala do assistente. Palpite do assistente em forma de pergunta ("Seria o seu irmão?", "Você vai ao sítio?") não confirmado pela pessoa NÃO conta — nesse caso devolva lista vazia.
 - Um "sim", "isso" ou "fechado" só vira fato se o assistente fez uma proposta concreta e a pessoa aceitou. Escreva a proposta com nomes explícitos, não o "sim".
-- Se não houver nada que ainda importe na semana que vem, devolva lista vazia.
-- Preservar o tempo verbal: nunca converta passado em presente. Se a pessoa marcou passado ("antes", "antigamente", "vivia", "sentia", "tinha", "na época", "quando", "resultou em"), o fato tem que carregar o marcador explícito no início ("Antes...", "Na época...") e usar pretérito. Sem marcador de presente ("hoje", "agora", "ainda", "continuo"), sintoma, rotina ou estado relatado no passado fica no passado.
+- Estado do dia (dor, humor, sono de ontem) entra como kind "state" com relevância 1-2. Se não houver nada sobre a pessoa, devolva lista vazia.
+- Preservar o tempo verbal: nunca converta passado em presente. Se a pessoa marcou passado ("antes", "antigamente", "vivia", "sentia", "tinha", "na época", "quando", "resultou em"), o fato tem que carregar o marcador com as palavras da pessoa no início ("Antes...", "Na época do surto,...") — sem adjetivos novos — e usar pretérito. Quando a pessoa disser a relação de causa ("resultou em", "por causa disso"), ela precisa aparecer no fato. Sem marcador de presente ("hoje", "agora", "ainda", "continuo"), sintoma, rotina ou estado relatado no passado fica no passado.
 - Passado e presente misturados viram fatos separados, cada um com seu tempo.
 - A data da conversa é quando foi dito, não quando aconteceu. Não use a data da conversa como data do evento sem indicação explícita da pessoa.
 - Cada fato é um objeto {"text","title","relevance","kind","sensitive"}.
@@ -242,13 +310,9 @@ Regras:
 - No máximo ${MAX_CHAT_FACTS}. Sem "o assistente comentou", sem roteiro, sem citação de diálogo.
 - Não invente: só use nomes que aparecem no turno ou na fala do assistente.
 
-Exemplos:
-- PESSOA: "como todas as noites e nunca enjoo" + ASSISTENTE citando "banana assada com batata doce, ovo e queijo" → {"facts":[{"text":"O usuário come banana assada com batata doce, ovo e queijo no almoço e no jantar e nunca enjoa.","title":"Banana assada com batata doce","relevance":3,"kind":"fact","sensitive":false}]}
-- PESSOA: "oi" → {"facts":[]}
-- PESSOA: "sim" + ASSISTENTE: "Você gostou do filme?" → {"facts":[]}
-- PESSOA: "fechado" + ASSISTENTE: "Proponho usar o Haiku 5.5 na conversa, topa?" → {"facts":[{"text":"O usuário aceitou usar o Haiku 5.5 como modelo de conversa.","title":"Haiku 5.5 como modelo","relevance":3,"kind":"fact","sensitive":false}]}
-- PESSOA: "antes eu so vivia chapado, e com essa dor pulsante na têmpora, vivia fumando e trabalhando 24h, o que resultou no surto que tive" → {"facts":[{"text":"Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.","title":"Época agitada antes do surto","relevance":5,"kind":"fact","sensitive":true}]}
-- PESSOA: "hoje estou com dor pulsante na têmpora" → {"facts":[{"text":"O usuário está com dor pulsante na têmpora.","title":"Dor pulsante na têmpora","relevance":2,"kind":"state","sensitive":false}]}
+Exemplos de OUTRO projeto (nunca extraia deles, só copie o formato):
+
+${renderExamples()}
 
 Data da conversa: ${date}
 
