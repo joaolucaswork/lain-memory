@@ -10,6 +10,7 @@
     "mcp": "bun run src/mcp.ts",
     "smoke": "bun run scripts/smoke-mcp.ts",
     "smoke:live": "bun run scripts/smoke-mcp.ts --live",
+    "migrate:state": "bun run scripts/migrate-state-from-redis.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/"
   },

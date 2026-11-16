@@ -82,6 +82,33 @@ function saveToDisk(file: string, hashes: Set<string>): void {
   safeWriteFileSync(file, JSON.stringify([...hashes].sort()));
 }
 
+/** Current blocklist hashes (empty set when the file does not exist yet). */
+export async function getBlocklistHashes(): Promise<Set<string>> {
+  return withFileLock(getBlocklistPath(), () => loadFromDisk(getBlocklistPath()));
+}
+
+/**
+ * Add pre-computed hashes (migration path — the original texts are gone).
+ * Returns the number of hashes actually added. Throws on write failure.
+ */
+export async function addHashesToBlocklist(hashes: string[]): Promise<{ added: number }> {
+  const clean = [...new Set(hashes.filter((h) => typeof h === 'string' && h.trim()))];
+  if (clean.length === 0) return { added: 0 };
+  const file = getBlocklistPath();
+  return withFileLock(file, () => {
+    const current = loadFromDisk(file);
+    let added = 0;
+    for (const h of clean) {
+      if (!current.has(h)) {
+        current.add(h);
+        added++;
+      }
+    }
+    if (added > 0) saveToDisk(file, current);
+    return { added };
+  });
+}
+
 /**
  * True when the text (or a near-exact repeat) was forgotten.
  * Fail-closed: on any read error (corrupt file, permissions) logs and

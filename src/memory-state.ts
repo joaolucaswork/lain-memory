@@ -155,7 +155,7 @@ function isNotFound(err: unknown): boolean {
 }
 
 /** Qdrant point ids are UUIDs (mem0 generates v4) or uints — anything else fails the whole batch. */
-function isQueryableId(id: string): boolean {
+export function isQueryableId(id: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) || /^\d+$/.test(id);
 }
 
@@ -238,6 +238,8 @@ interface QdrantState {
   importance: number | null;
   /** True when Qdrant answered (point found or confirmed missing). False on transport error. */
   answered: boolean;
+  /** True when the point was actually returned by retrieve. */
+  found: boolean;
 }
 
 async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> {
@@ -246,14 +248,14 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
   if (queryable.length === 0) return out;
   const applyPoint = (p: { id: unknown; payload?: unknown }) => {
     const st = extractStateFromMetadata(p.payload ?? null);
-    out.set(String(p.id), { feedback: st.feedback, importance: st.importance, answered: true });
+    out.set(String(p.id), { feedback: st.feedback, importance: st.importance, answered: true, found: true });
   };
   try {
     const points = await getQdrant().retrieve(collectionName(), { ids: queryable, with_payload: true });
     for (const p of points) applyPoint(p as { id: unknown; payload?: unknown });
     // Ids not returned do not exist → answered with nulls.
     for (const id of queryable) {
-      if (!out.has(id)) out.set(id, { feedback: null, importance: null, answered: true });
+      if (!out.has(id)) out.set(id, { feedback: null, importance: null, answered: true, found: false });
     }
   } catch {
     // Batch failed — retry per-id so one poison id cannot blank the batch.
@@ -261,7 +263,7 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
       try {
         const one = await getQdrant().retrieve(collectionName(), { ids: [id], with_payload: true });
         if (one.length > 0) applyPoint(one[0] as { id: unknown; payload?: unknown });
-        else out.set(id, { feedback: null, importance: null, answered: true });
+        else out.set(id, { feedback: null, importance: null, answered: true, found: false });
       } catch {
         // Per-id failure — stays absent (unanswered), caller degrades.
       }
@@ -270,7 +272,33 @@ async function qdrantRetrieve(ids: string[]): Promise<Map<string, QdrantState>> 
   return out;
 }
 
-// ─── Public reads ───
+export interface QdrantStateRead {
+  feedback: MemoryFeedback | null;
+  importance: number | null;
+  /** True when the point was found. False when missing OR id not queryable. */
+  exists: boolean;
+  /** False when Qdrant could not be reached for this id (transport error). */
+  answered: boolean;
+}
+
+/**
+ * Qdrant-only state read (no L2, no metadata). For migrations and audits
+ * that must distinguish "Qdrant has no state" from "a cache has state".
+ * Never throws; unreachable ids degrade as answered:false.
+ */
+export async function readQdrantState(ids: string[]): Promise<Map<string, QdrantStateRead>> {
+  const out = new Map<string, QdrantStateRead>();
+  const uniq = [...new Set(ids.filter(Boolean))];
+  for (const id of uniq) out.set(id, { feedback: null, importance: null, exists: false, answered: false });
+  if (uniq.length === 0) return out;
+  const qmap = await qdrantRetrieve(uniq);
+  for (const id of uniq) {
+    const q = qmap.get(id);
+    if (!q || !q.answered) continue; // transport error — answered stays false
+    out.set(id, { feedback: q.feedback, importance: q.importance, exists: q.found, answered: true });
+  }
+  return out;
+}
 
 export interface MemoryState {
   feedback: MemoryFeedback;
