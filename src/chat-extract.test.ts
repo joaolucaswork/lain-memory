@@ -3,7 +3,10 @@ import {
   acceptChatFact,
   buildChatExtractPrompt,
   extractChatFacts,
+  fallbackTitleFromFact,
   normalizeChatFacts,
+  normalizeChatFactPairs,
+  normalizeChatTitle,
   rememberChatTurn,
 } from './chat-extract.js';
 
@@ -53,7 +56,15 @@ describe('extractChatFacts', () => {
       },
       async () => ({ facts: [ASSISTANT_FESTIVUS, ASSISTANT_PARKING, ASSISTANT_HINGE, PLOT_NO_SPEAKER, USER_MARKED] }),
     );
-    expect(facts).toEqual([USER_MARKED]);
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse' }]);
+  });
+
+  test('aceita o formato novo {text,title} e normaliza o título', async () => {
+    const facts = await extractChatFacts(
+      { user: 'to revendo seinfeld', date: '2026-11-14' },
+      async () => ({ facts: [{ text: USER_MARKED, title: 'O usuário curtiu a vaga do George.' }] }),
+    );
+    expect(facts).toEqual([{ text: USER_MARKED, title: 'curtiu a vaga do George' }]);
   });
 
   test('lista vazia quando o modelo só falou', async () => {
@@ -85,39 +96,83 @@ describe('extractChatFacts', () => {
     expect(prompt).toContain('ASSISTENTE:\nThe Parking Space acaba sem vencedor');
     expect(prompt).not.toContain('mode: bundle');
   });
+
+  test('o prompt pede {text,title} com teto de 6 palavras', () => {
+    const prompt = buildChatExtractPrompt({ user: 'tomo sertralina', date: '2026-11-14' });
+    expect(prompt).toContain('"title"');
+    expect(prompt).toContain('máximo 6');
+    expect(prompt).toContain('Sem "o usuário"');
+    expect(prompt).toContain('{"facts":[{"text":"...","title":"..."}]}');
+  });
 });
 
-describe('normalizeChatFacts', () => {
-  test('corta em 5 e deduplica', () => {
-    const facts = normalizeChatFacts([
-      USER_COMFORT,
+describe('normalizeChatFactPairs', () => {
+  test('aceita objetos e strings legadas, corta em 5 e deduplica', () => {
+    const pairs = normalizeChatFactPairs([
+      { text: USER_COMFORT, title: 'Seinfeld série conforto' },
       USER_COMFORT.toLowerCase(),
-      USER_MARKED,
-      'O usuário prefere chá.',
+      { text: USER_MARKED, title: '' },
+      { text: 'O usuário prefere chá.', title: 'prefere chá' },
       'O usuário dorme tarde.',
+      { text: 'not a fact', title: 'x' },
       'O usuário gosta de banana assada.',
       'O usuário guarda a janta para o café.',
     ]);
-    expect(facts).toHaveLength(5);
-    expect(facts[0]).toBe(USER_COMFORT);
+    expect(pairs).toHaveLength(5);
+    expect(pairs[0]).toEqual({ text: USER_COMFORT, title: 'Seinfeld série conforto' });
+    // título vazio cai no fallback do corpo
+    expect(pairs[1]).toEqual({ text: USER_MARKED, title: 'reassistindo Seinfeld em ordem disse' });
+    expect(pairs[3]).toEqual({ text: 'O usuário dorme tarde.', title: 'dorme tarde' });
+  });
+});
+
+describe('normalizeChatTitle', () => {
+  const FACT = 'O usuário toma sertralina 50mg de manhã.';
+  test('tira âncora, aspas e ponto final', () => {
+    expect(normalizeChatTitle('O usuário toma sertralina', FACT)).toBe('toma sertralina');
+    expect(normalizeChatTitle('"Dor pulsante na têmpora."', FACT)).toBe('Dor pulsante na têmpora');
+  });
+  test('trunca em 6 palavras sem partir palavra', () => {
+    expect(normalizeChatTitle('uma duas três quatro cinco seis sete', FACT))
+      .toBe('uma duas três quatro cinco seis');
+  });
+  test('vazio ou não-string cai no fallback do fato', () => {
+    expect(normalizeChatTitle('', FACT)).toBe('toma sertralina 50mg de manhã');
+    expect(normalizeChatTitle(undefined, FACT)).toBe('toma sertralina 50mg de manhã');
+    expect(normalizeChatTitle(42, FACT)).toBe('toma sertralina 50mg de manhã');
+  });
+});
+
+describe('fallbackTitleFromFact', () => {
+  test('corpo com cópula: ancora + "está com" somem', () => {
+    expect(fallbackTitleFromFact('O usuário está com dor pulsante na têmpora.'))
+      .toBe('dor pulsante na têmpora');
+  });
+  test('"tem Seinfeld" vira substantivo na frente', () => {
+    expect(fallbackTitleFromFact(USER_COMFORT)).toBe('Seinfeld como série conforto já');
+  });
+  test('marcador de passado sai, fato fica', () => {
+    expect(fallbackTitleFromFact(
+      'Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.'
+    )).toBe('vivia chapado tinha dor pulsante');
   });
 });
 
 describe('rememberChatTurn', () => {
-  test('não salva o bloco do Seinfeld; salva só o fato do usuário, sem bundle', async () => {
-    const saved: Array<{ fact: string; project: string | undefined }> = [];
+  test('não salva o bloco do Seinfeld; salva só o fato do usuário, sem bundle, e repassa o título', async () => {
+    const saved: Array<{ fact: string; project: string | undefined; title?: string }> = [];
     const result = await rememberChatTurn(
       { user: 'seinfeld é comfy', assistant: ASSISTANT_FESTIVUS, project: 'diario', date: '2026-11-14' },
       {
-        extract: async () => [USER_COMFORT],
-        save: async (fact, project) => {
-          saved.push({ fact, project });
+        extract: async () => [{ text: USER_COMFORT, title: 'Seinfeld série conforto' }],
+        save: async (fact, project, title) => {
+          saved.push({ fact, project, title });
           return [{ id: 'atom-1', memory: fact, action: 'ADD' }];
         },
       },
     );
-    expect(saved).toEqual([{ fact: USER_COMFORT, project: 'diario' }]);
-    expect(result[0]?.id).toBe('atom-1');
+    expect(saved).toEqual([{ fact: USER_COMFORT, project: 'diario', title: 'Seinfeld série conforto' }]);
+    expect(result[0]).toMatchObject({ id: 'atom-1', title: 'Seinfeld série conforto' });
   });
 
   test('extração vazia não chama o save', async () => {
@@ -134,6 +189,18 @@ describe('rememberChatTurn', () => {
     );
     expect(saves).toBe(0);
     expect(result[0]).toMatchObject({ id: 'noop', action: 'NOOP' });
+  });
+
+  test('duplicata (NOOP) não carrega título no resultado', async () => {
+    const result = await rememberChatTurn(
+      { user: 'seinfeld é comfy', project: 'diario' },
+      {
+        extract: async () => [{ text: USER_COMFORT, title: 'Seinfeld série conforto' }],
+        save: async (fact) => [{ id: 'duplicate', memory: fact, action: 'NOOP', superseded: [] }],
+      },
+    );
+    expect(result[0]).toMatchObject({ id: 'duplicate' });
+    expect(result[0]?.title).toBeUndefined();
   });
 
   test('falha do extrator não salva a transcrição', async () => {

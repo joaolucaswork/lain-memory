@@ -111,6 +111,45 @@ describe('applyMemoryFeedback — archive / unarchive', () => {
   });
 });
 
+describe('setMemoryFeedback — title', () => {
+  it('roundtrips a title and merges with votes without clobbering', async () => {
+    const id = newId();
+    await setMemoryFeedback(id, { title: 'dor pulsante na têmpora' });
+    expect((await getMemoryFeedback(id)).title).toBe('dor pulsante na têmpora');
+    // vote merge (e.g. confirm after title) preserves the title
+    const next = await applyMemoryFeedback(id, 'confirm');
+    expect(next.title).toBe('dor pulsante na têmpora');
+    expect(next.confidence).toBe(1.0);
+    // kind patch (e.g. state tagging after title) preserves it too
+    const kinded = await setMemoryFeedback(id, { kind: 'state' });
+    expect(kinded.title).toBe('dor pulsante na têmpora');
+    expect(kinded.kind).toBe('state');
+  });
+
+  it('sanitizes title: trims, caps at 80 chars, non-string becomes null', async () => {
+    const id = newId();
+    const long = `  ${'palavra '.repeat(30)}  `;
+    const next = await setMemoryFeedback(id, { title: long });
+    expect(next.title!.length).toBeLessThanOrEqual(80);
+    expect(next.title).toBe(long.trim().slice(0, 80));
+    const nulled = await setMemoryFeedback(id, { title: 42 as never });
+    expect(nulled.title).toBeNull();
+  });
+
+  it('attachFeedback carries title to list items, null by default', async () => {
+    const titled = newId();
+    ids.push(titled);
+    await setMemoryFeedback(titled, { title: 'banana assada com batata' });
+    const out = await attachFeedback([
+      { id: titled, memory: 'a' },
+      { id: `fb-title-fresh-${randomUUID()}`, memory: 'b' },
+    ]);
+    ids.push(out[1].id);
+    expect(out[0].title).toBe('banana assada com batata');
+    expect(out[1].title).toBeNull();
+  });
+});
+
 describe('/api/memory/feedback — validation', () => {
   it('accepts confirm/archive/unarchive with optional kind', () => {
     for (const action of ['confirm', 'archive', 'unarchive']) {

@@ -1036,6 +1036,8 @@ export interface RankedMemory {
   last_confirmed_at?: string | null;
   status?: FeedbackStatus;
   kind?: FeedbackKind;
+  /** Fase 1 display title: short label, null until generated. */
+  title?: string | null;
 }
 
 /**
@@ -1071,9 +1073,9 @@ export async function rankRecallResults<
 
   // Fetch importance + feedback from Redis for composite ranking.
   // Archived memories are dropped here — every recall path excludes them.
-  type Enriched<U> = U & { importance: number | null; confidence: number; last_confirmed_at: string | null; status: FeedbackStatus; kind: FeedbackKind };
+  type Enriched<U> = U & { importance: number | null; confidence: number; last_confirmed_at: string | null; status: FeedbackStatus; kind: FeedbackKind; title: string | null };
   let withSignals: Array<Enriched<T>> =
-    boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, last_confirmed_at: null, status: 'active' as FeedbackStatus, kind: 'fact' as FeedbackKind }));
+    boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, last_confirmed_at: null, status: 'active' as FeedbackStatus, kind: 'fact' as FeedbackKind, title: null }));
   if (isRedisAvailable()) {
     try {
       const feedbackMap = await getManyMemoryFeedback(boostedResults.map((r) => r.id));
@@ -1089,6 +1091,7 @@ export async function rankRecallResults<
             last_confirmed_at: feedback.last_confirmed_at,
             status: feedback.status,
             kind: feedback.kind,
+            title: feedback.title ?? null,
           };
           return enriched;
         })
@@ -1282,6 +1285,8 @@ export interface MemoryFeedback {
   kind: FeedbackKind;
   sensitive: boolean;
   correct_count: number;
+  /** Short display title (ideal 3 words, max 6). Null until generated. Metadata only — never affects ranking. */
+  title: string | null;
 }
 
 export const FEEDBACK_DEFAULTS: MemoryFeedback = {
@@ -1291,7 +1296,11 @@ export const FEEDBACK_DEFAULTS: MemoryFeedback = {
   kind: 'fact',
   sensitive: false,
   correct_count: 0,
+  title: null,
 };
+
+/** Display-title cap: 6 words ≈ 80 chars with margin. */
+export const FEEDBACK_TITLE_MAX_CHARS = 80;
 
 const FEEDBACK_TTL = 365 * 24 * 60 * 60; // 1 year (same as importance)
 
@@ -1311,6 +1320,9 @@ function sanitizeFeedback(parsed: Partial<MemoryFeedback>): MemoryFeedback {
     correct_count: Number.isInteger(parsed.correct_count) && (parsed.correct_count as number) >= 0
       ? (parsed.correct_count as number)
       : 0,
+    title: typeof parsed.title === 'string' && parsed.title.trim()
+      ? parsed.title.trim().slice(0, FEEDBACK_TITLE_MAX_CHARS)
+      : null,
   };
 }
 
