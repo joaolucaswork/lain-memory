@@ -2,8 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
   acceptChatFact,
   buildChatExtractPrompt,
+  buildTitlePrompt,
   extractChatFacts,
   fallbackTitleFromFact,
+  isTitleCandidate,
   normalizeChatFacts,
   normalizeChatFactPairs,
   normalizeChatTitle,
@@ -155,6 +157,23 @@ describe('fallbackTitleFromFact', () => {
     expect(fallbackTitleFromFact(
       'Na época agitada antes do surto, o usuário vivia chapado, tinha dor pulsante na têmpora, fumava e trabalhava 24h.'
     )).toBe('vivia chapado tinha dor pulsante');
+  });
+});
+
+describe('backfill helpers', () => {
+  test('isTitleCandidate: pula bundle, vazio e já titulados', () => {
+    expect(isTitleCandidate({ memory: 'O usuário toma sertralina.', title: null })).toBe(true);
+    expect(isTitleCandidate({ memory: '[Bundle: diario 2026-11-07] resumo', title: null })).toBe(false);
+    expect(isTitleCandidate({ memory: '  ', title: null })).toBe(false);
+    expect(isTitleCandidate({ memory: 'O usuário toma sertralina.', title: 'sertralina diária' })).toBe(false);
+    expect(isTitleCandidate({})).toBe(false);
+  });
+  test('buildTitlePrompt carrega as mesmas regras do extrator', () => {
+    const p = buildTitlePrompt('O usuário toma sertralina 50mg de manhã.');
+    expect(p).toContain('ideal 3 palavras, máximo 6');
+    expect(p).toContain('Sem "o usuário"');
+    expect(p).toContain('{"title":"..."}');
+    expect(p).toContain('O usuário toma sertralina 50mg de manhã.');
   });
 });
 

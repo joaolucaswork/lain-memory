@@ -202,6 +202,31 @@ ${assistant}
 Responda só JSON: {"facts":[{"text":"...","title":"..."}]}`;
 }
 
+/** Prefixo dos digests semanais — nunca entra no backfill de títulos. */
+export const BUNDLE_PREFIX = '[Bundle:';
+
+/** Backfill candidate: real text, not a bundle digest, still untitled. */
+export function isTitleCandidate(item: { memory?: unknown; title?: unknown }): boolean {
+  if (typeof item.memory !== 'string' || !item.memory.trim()) return false;
+  if (item.memory.trimStart().startsWith(BUNDLE_PREFIX)) return false;
+  return item.title == null;
+}
+
+/**
+ * Standalone title prompt for the backfill: same model, same rules as the
+ * extractor (ideal 3, max 6, PT, no "o usuário"), but the fact arrives
+ * without its original turn — so no turn-dependent instructions.
+ */
+export function buildTitlePrompt(factText: string): string {
+  return `Dê um título curtíssimo em português para este fato de memória de longo prazo.
+
+Regras: ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der. Só use palavras do fato — não invente.
+
+Fato: ${factText.trim()}
+
+Responda só JSON: {"title":"..."}`;
+}
+
 export async function extractChatFacts(
   input: ChatTurnInput,
   runJson: JsonRunner = runFastLlmJson,
