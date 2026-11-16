@@ -10,9 +10,22 @@
  */
 
 import { Memory, OpenAILLM, OpenAIEmbedder } from 'mem0ai/oss';
-import { createHash } from 'node:crypto';
 import * as graphrag from './graphrag.js';
+import { createHash } from 'node:crypto';
 import { getRedis, isRedisAvailable } from './redis.js';
+import {
+  FEEDBACK_DEFAULTS as STATE_FEEDBACK_DEFAULTS,
+  IMPORTANCE_DEFAULT as STATE_IMPORTANCE_DEFAULT,
+  getManyState,
+  getFeedback as stateGetFeedback,
+  getManyFeedback as stateGetManyFeedback,
+  getImportance as stateGetImportance,
+  setFeedback as stateSetFeedback,
+  setImportance as stateSetImportance,
+  type FeedbackKind as StateFeedbackKind,
+  type FeedbackStatus as StateFeedbackStatus,
+  type MemoryFeedback as StateMemoryFeedback,
+} from './memory-state.js';
 import { INSTANCE_ID, listProjects } from './workspace.js';
 import { withDistributedLock } from './distributed-lock.js';
 import { classifyMemoryAction } from './contradiction-detector.js';
@@ -696,7 +709,7 @@ Original: ${text}`
         if (heuristicKind(enrichedText) === 'state') {
           await setMemoryFeedback(item.id, { kind: 'state' });
         }
-      })().catch(() => {});
+      })().catch((err) => console.error(`[mem0] post-save state write failed for ${item.id}:`, err instanceof Error ? err.message : err));
     }
   }
 
@@ -882,12 +895,14 @@ export async function searchMemory(query: string, project?: string, limit: numbe
     topK: limit,
   });
   // Preserve timestamps from Mem0 response for age-decay scoring
+  // Preserve payload metadata (carries lain_feedback/lain_importance — free state).
   const mapped = (result.results ?? []).map((item: any) => ({
     id: item.id,
     memory: item.memory,
     score: item.score,
     created_at: item.created_at ?? item.createdAt,
     updated_at: item.updated_at ?? item.updatedAt,
+    ...(item.metadata ? { metadata: item.metadata } : {}),
   }));
   const filtered = applyMinScoreFilter(mapped, resolveMinRecallScore());
   return rankRecallResults(filtered, query);
@@ -945,35 +960,37 @@ export async function rankRecallResults<
     }
   }
 
-  // Fetch importance + feedback from Redis for composite ranking.
-  // Archived memories are dropped here — every recall path excludes them.
+  // Fetch importance + feedback from memory-state (Qdrant payload authority,
+  // Redis L2). Archived memories are dropped here — every recall path
+  // excludes them. State rides free on mem0 metadata when present, so this
+  // is usually zero extra round-trips. Never throws — degrades to defaults.
   type Enriched<U> = U & { importance: number | null; confidence: number; last_confirmed_at: string | null; status: FeedbackStatus; kind: FeedbackKind; title: string | null };
   let withSignals: Array<Enriched<T>> =
     boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, last_confirmed_at: null, status: 'active' as FeedbackStatus, kind: 'fact' as FeedbackKind, title: null }));
-  if (isRedisAvailable()) {
-    try {
-      const feedbackMap = await getManyMemoryFeedback(boostedResults.map((r) => r.id));
-      const maybe: Array<Enriched<T> | null> = await Promise.all(
-        boostedResults.map(async (r) => {
-          const importance = await getMemoryImportance(r.id);
-          const feedback = feedbackMap.get(r.id) ?? FEEDBACK_DEFAULTS;
-          if (feedback.status === 'archived') return null;
-          const enriched: Enriched<T> = {
-            ...r,
-            importance,
-            confidence: feedback.confidence,
-            last_confirmed_at: feedback.last_confirmed_at,
-            status: feedback.status,
-            kind: feedback.kind,
-            title: feedback.title ?? null,
-          };
-          return enriched;
-        })
-      );
-      withSignals = maybe.filter((r): r is Enriched<T> => r !== null);
-    } catch {
-      // Signal fetch failed — rank on raw scores with neutral defaults
+  try {
+    const preloaded = new Map<string, unknown>();
+    for (const r of boostedResults) {
+      const meta = (r as { metadata?: unknown }).metadata;
+      if (meta !== undefined) preloaded.set(r.id, meta);
     }
+    const states = await getManyState(boostedResults.map((r) => r.id), preloaded);
+    const maybe: Array<Enriched<T> | null> = boostedResults.map((r) => {
+      const st = states.get(r.id);
+      const feedback = st?.feedback ?? FEEDBACK_DEFAULTS;
+      if (feedback.status === 'archived') return null;
+      return {
+        ...r,
+        importance: st?.importance ?? null,
+        confidence: feedback.confidence,
+        last_confirmed_at: feedback.last_confirmed_at,
+        status: feedback.status,
+        kind: feedback.kind,
+        title: feedback.title ?? null,
+      };
+    });
+    withSignals = maybe.filter((r): r is Enriched<T> => r !== null);
+  } catch {
+    // Signal fetch failed — rank on raw scores with neutral defaults
   }
 
   const queryTerms = query.split(/\s+/).filter(t => t.length >= 3);
@@ -1033,8 +1050,9 @@ export async function cachedSearchMemory(query: string, project?: string, limit:
 
 // ─── Importance Scoring (Poignancy) ───
 
-const IMPORTANCE_TTL = 365 * 24 * 60 * 60; // 1 year
-const IMPORTANCE_DEFAULT = 0.5; // neutral when not scored
+// Authority: src/memory-state.ts (Qdrant payload, Redis L2). Re-exported
+// here so existing import sites keep working.
+export const IMPORTANCE_DEFAULT = STATE_IMPORTANCE_DEFAULT;
 
 /**
  * Score the importance/poignancy of a memory — puramente algorítmico, sem LLM.
@@ -1074,28 +1092,20 @@ export function scoreImportance(text: string): number {
 }
 
 /**
- * Persist importance score for a memory ID in Redis.
+ * Persist importance score for a memory ID.
+ * Authority is Qdrant (memory-state.ts) — throws on write failure (fail-hard).
  */
 export async function setMemoryImportance(memoryId: string, score: number): Promise<void> {
-  if (!isRedisAvailable()) return;
-  try {
-    await getRedis().set(`mem0:importance:${memoryId}`, score.toString(), 'EX', IMPORTANCE_TTL);
-  } catch { /* non-critical */ }
+  await stateSetImportance(memoryId, score);
 }
 
 /**
- * Get stored importance score for a memory ID.
- * Returns null if not yet scored (key absent from Redis).
- * Returns IMPORTANCE_DEFAULT only on error or Redis unavailable.
+ * Stored importance score for a memory ID.
+ * Returns null if not yet scored, IMPORTANCE_DEFAULT when the backend is
+ * unreachable. Never throws.
  */
 export async function getMemoryImportance(memoryId: string): Promise<number | null> {
-  if (!isRedisAvailable()) return IMPORTANCE_DEFAULT;
-  try {
-    const val = await getRedis().get(`mem0:importance:${memoryId}`);
-    if (val === null) return null; // not yet scored
-    const score = parseFloat(val);
-    return isNaN(score) ? IMPORTANCE_DEFAULT : score;
-  } catch { return IMPORTANCE_DEFAULT; }
+  return stateGetImportance(memoryId);
 }
 
 /**
@@ -1146,91 +1156,33 @@ export async function getMemoryTouchTimestamp(memoryId: string): Promise<number 
 
 // ─── Memory Feedback (user votes: ✓ confirm / 🕐 archive) ───
 // Fase 0 of per-memory quick actions (replaces like/dislike).
-// Stored beside importance scores; absent key = neutral defaults,
-// so existing ranking behavior is unchanged until the first vote.
+// Authority: src/memory-state.ts (Qdrant payload, Redis L2). Absent state =
+// neutral defaults, so existing ranking behavior is unchanged until the
+// first vote. Re-exported here so existing import sites keep working.
 
-export type FeedbackStatus = 'active' | 'archived';
-export type FeedbackKind = 'fact' | 'state';
+export type FeedbackStatus = StateFeedbackStatus;
+export type FeedbackKind = StateFeedbackKind;
+export type MemoryFeedback = StateMemoryFeedback;
 
-export interface MemoryFeedback {
-  confidence: number;
-  last_confirmed_at: string | null;
-  status: FeedbackStatus;
-  kind: FeedbackKind;
-  sensitive: boolean;
-  correct_count: number;
-  /** Short display title (ideal 3 words, max 6). Null until generated. Metadata only — never affects ranking. */
-  title: string | null;
-}
-
-export const FEEDBACK_DEFAULTS: MemoryFeedback = {
-  confidence: 0.5,
-  last_confirmed_at: null,
-  status: 'active',
-  kind: 'fact',
-  sensitive: false,
-  correct_count: 0,
-  title: null,
-};
+export const FEEDBACK_DEFAULTS: MemoryFeedback = STATE_FEEDBACK_DEFAULTS;
 
 /** Display-title cap: 6 words ≈ 80 chars with margin. */
 export const FEEDBACK_TITLE_MAX_CHARS = 80;
 
-const FEEDBACK_TTL = 365 * 24 * 60 * 60; // 1 year (same as importance)
-
-function feedbackKey(memoryId: string): string {
-  return `mem0:feedback:${memoryId}`;
-}
-
-function sanitizeFeedback(parsed: Partial<MemoryFeedback>): MemoryFeedback {
-  return {
-    confidence: typeof parsed.confidence === 'number'
-      ? Math.min(1, Math.max(0, parsed.confidence))
-      : FEEDBACK_DEFAULTS.confidence,
-    last_confirmed_at: typeof parsed.last_confirmed_at === 'string' ? parsed.last_confirmed_at : null,
-    status: parsed.status === 'archived' ? 'archived' : 'active',
-    kind: parsed.kind === 'state' ? 'state' : 'fact',
-    sensitive: parsed.sensitive === true,
-    correct_count: Number.isInteger(parsed.correct_count) && (parsed.correct_count as number) >= 0
-      ? (parsed.correct_count as number)
-      : 0,
-    title: typeof parsed.title === 'string' && parsed.title.trim()
-      ? parsed.title.trim().slice(0, FEEDBACK_TITLE_MAX_CHARS)
-      : null,
-  };
-}
-
-/** Stored feedback for a memory, or neutral defaults when never voted. */
+/** Stored feedback for a memory, or neutral defaults when never voted. Never throws. */
 export async function getMemoryFeedback(memoryId: string): Promise<MemoryFeedback> {
-  if (!isRedisAvailable()) return { ...FEEDBACK_DEFAULTS };
-  try {
-    const raw = await getRedis().get(feedbackKey(memoryId));
-    if (!raw) return { ...FEEDBACK_DEFAULTS };
-    return sanitizeFeedback(JSON.parse(raw) as Partial<MemoryFeedback>);
-  } catch { return { ...FEEDBACK_DEFAULTS }; }
+  return stateGetFeedback(memoryId);
 }
 
 /**
- * Batch feedback fetch (single Redis round-trip via pipeline).
+ * Batch feedback fetch. Preloaded mem0 `metadata` is free — no I/O.
  * Missing keys → neutral defaults. Never throws.
  */
-export async function getManyMemoryFeedback(ids: string[]): Promise<Map<string, MemoryFeedback>> {
-  const out = new Map<string, MemoryFeedback>();
-  const uniq = [...new Set(ids.filter(Boolean))];
-  for (const id of uniq) out.set(id, { ...FEEDBACK_DEFAULTS });
-  if (uniq.length === 0 || !isRedisAvailable()) return out;
-  try {
-    const pipeline = getRedis().pipeline();
-    for (const id of uniq) pipeline.get(feedbackKey(id));
-    const rows = await pipeline.exec();
-    uniq.forEach((id, i) => {
-      try {
-        const raw = rows?.[i]?.[1] as string | null;
-        if (raw) out.set(id, sanitizeFeedback(JSON.parse(raw) as Partial<MemoryFeedback>));
-      } catch { /* keep defaults */ }
-    });
-  } catch { /* defaults */ }
-  return out;
+export async function getManyMemoryFeedback(
+  ids: string[],
+  preloadedById?: Map<string, unknown> | Record<string, unknown>,
+): Promise<Map<string, MemoryFeedback>> {
+  return stateGetManyFeedback(ids, preloadedById);
 }
 
 /**
@@ -1239,23 +1191,24 @@ export async function getManyMemoryFeedback(ids: string[]): Promise<Map<string, 
  */
 export async function attachFeedback<T extends { id: string }>(items: T[]): Promise<(T & MemoryFeedback)[]> {
   if (items.length === 0) return [];
-  const map = await getManyMemoryFeedback(items.map((m) => m.id));
+  const preloaded = new Map<string, unknown>();
+  for (const m of items) {
+    const meta = (m as { metadata?: unknown }).metadata;
+    if (meta !== undefined) preloaded.set(m.id, meta);
+  }
+  const map = await stateGetManyFeedback(items.map((m) => m.id), preloaded);
   return items.map((m) => ({ ...m, ...(map.get(m.id) ?? FEEDBACK_DEFAULTS) }));
 }
 
-/** Merge patch into stored feedback (creates with defaults when absent). */
+/**
+ * Merge patch into stored feedback (creates with defaults when absent).
+ * Fail-hard: throws when Qdrant cannot persist (the route surfaces 500).
+ */
 export async function setMemoryFeedback(
   memoryId: string,
   patch: Partial<MemoryFeedback>,
 ): Promise<MemoryFeedback> {
-  const current = await getMemoryFeedback(memoryId);
-  const next: MemoryFeedback = sanitizeFeedback({ ...current, ...patch });
-  if (isRedisAvailable()) {
-    try {
-      await getRedis().set(feedbackKey(memoryId), JSON.stringify(next), 'EX', FEEDBACK_TTL);
-    } catch { /* non-critical */ }
-  }
-  return next;
+  return stateSetFeedback(memoryId, patch);
 }
 
 export type FeedbackAction = 'confirm' | 'archive' | 'unarchive';
@@ -1285,12 +1238,11 @@ export async function applyMemoryFeedback(
       correct_count: current.correct_count + 1,
       ...kindPatch,
     });
-    // Recency refresh; reinforce side-effect (+0.05) is best-effort.
+    // Recency refresh is best-effort cache. The importance floor below is a
+    // user-decision write (Qdrant authority) — fail-hard, like the vote above.
     await touchMemoryTimestamp(memoryId).catch(() => {});
-    try {
-      const importance = await getMemoryImportance(memoryId);
-      await setMemoryImportance(memoryId, Math.max(importance ?? 0, 0.85));
-    } catch { /* non-critical */ }
+    const importance = await getMemoryImportance(memoryId);
+    await setMemoryImportance(memoryId, Math.max(importance ?? 0, 0.85));
     return next;
   }
   if (action === 'archive') {
@@ -2160,7 +2112,13 @@ export async function backfillImportanceScores(maxToScore = 50): Promise<number>
         const existing = await getMemoryImportance(mem.id);
         if (existing !== null) continue; // already scored
         const score = scoreImportance(mem.memory);
-        await setMemoryImportance(mem.id, score);
+        try {
+          await setMemoryImportance(mem.id, score);
+        } catch (err) {
+          // Maintenance must not die on one bad point — retry next tick.
+          console.error(`[mem0] backfillImportance failed for ${mem.id}:`, err instanceof Error ? err.message : err);
+          continue;
+        }
         totalScored++;
       }
     } catch { /* non-critical — skip project */ }

@@ -149,8 +149,15 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/memory/feedback': {
       const kind = data.kind === 'state' || data.kind === 'fact' ? data.kind : undefined;
-      const feedback = await applyMemoryFeedback(data.id, data.action, kind ? { kind } : undefined);
-      return json({ id: data.id, ...feedback });
+      try {
+        const feedback = await applyMemoryFeedback(data.id, data.action, kind ? { kind } : undefined);
+        return json({ id: data.id, ...feedback });
+      } catch (err) {
+        // Fail-hard: the vote was NOT persisted (Qdrant unavailable, unknown
+        // id, ...). Surface 500 so callers never assume a silent success.
+        console.error(`[lain-memory] /api/memory/feedback failed for ${data.id}:`, err instanceof Error ? err.message : err);
+        return json({ error: 'feedback not persisted' }, 500);
+      }
     }
 
     case '/api/memory/add': {

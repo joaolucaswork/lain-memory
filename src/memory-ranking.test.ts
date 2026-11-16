@@ -1,15 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { randomUUID } from 'node:crypto';
 import {
   heuristicKind,
   rankRecallResults,
   setMemoryFeedback,
 } from './mem0.js';
 import { connectRedis, getRedis, isRedisAvailable } from './redis.js';
+import { newTestPoint, deleteTestPoints } from './test-points.js';
 
 const feedbackIds: string[] = [];
-const fbId = (tag: string) => {
-  const id = `rank-test-${tag}-${randomUUID()}`;
+const fbId = async (tag: string) => {
+  const id = await newTestPoint(`rank-test-${tag}`);
   feedbackIds.push(id);
   return id;
 };
@@ -20,6 +20,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await deleteTestPoints(feedbackIds).catch(() => {});
   if (!isRedisAvailable()) return;
   const r = getRedis();
   for (const id of feedbackIds) {
@@ -47,9 +48,9 @@ describe('rankRecallResults', () => {
   it('drops archived and ranks confirmed fact above stale state', async () => {
     const twentyDaysAgo = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
-    const factId = fbId('fact');
-    const stateId = fbId('state');
-    const archId = fbId('arch');
+    const factId = await fbId('fact');
+    const stateId = await fbId('state');
+    const archId = await fbId('arch');
 
     await setMemoryFeedback(factId, { confidence: 1.0, kind: 'fact', last_confirmed_at: now });
     await setMemoryFeedback(stateId, { kind: 'state' });
@@ -68,7 +69,7 @@ describe('rankRecallResults', () => {
   });
 
   it('passes through unvoted memories with neutral defaults', async () => {
-    const id = fbId('fresh');
+    const id = await fbId('fresh');
     const now = new Date().toISOString();
     const ranked = await rankRecallResults(
       [{ id, memory: 'fato novo', score: 0.8, created_at: now }],

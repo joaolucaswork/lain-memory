@@ -5,16 +5,18 @@ import {
   setMemoryFeedback,
   applyMemoryFeedback,
   getMemoryImportance,
+  setMemoryImportance,
   getManyMemoryFeedback,
   attachFeedback,
   FEEDBACK_DEFAULTS,
 } from './mem0.js';
-import { connectRedis, getRedis, isRedisAvailable } from './redis.js';
+import { connectRedis, disconnectRedis, getRedis, isRedisAvailable } from './redis.js';
 import { validateRoute } from './http-validation.js';
+import { newTestPoint, deleteTestPoints } from './test-points.js';
 
 const ids: string[] = [];
-const newId = () => {
-  const id = `fb-test-${randomUUID()}`;
+const newId = async () => {
+  const id = await newTestPoint('fb-test');
   ids.push(id);
   return id;
 };
@@ -22,9 +24,15 @@ const newId = () => {
 beforeAll(async () => {
   await connectRedis();
   if (!isRedisAvailable()) throw new Error('Redis required for memory-feedback tests');
+  // Qdrant must answer (it is the authority now) — fail fast otherwise.
+  await newTestPoint('fb-probe').then(async (id) => {
+    ids.push(id);
+    await deleteTestPoints([id]);
+  }).catch(() => { throw new Error('Qdrant required for memory-feedback tests'); });
 });
 
 afterAll(async () => {
+  await deleteTestPoints(ids).catch(() => {});
   if (!isRedisAvailable()) return;
   const r = getRedis();
   const keys = ids.flatMap((id) => [`mem0:feedback:${id}`, `mem0:importance:${id}`, `mem0:touch:${id}`]);
@@ -33,13 +41,13 @@ afterAll(async () => {
 
 describe('getMemoryFeedback — defaults', () => {
   it('unknown id returns neutral defaults (ranking unchanged)', async () => {
-    expect(await getMemoryFeedback(newId())).toEqual(FEEDBACK_DEFAULTS);
+    expect(await getMemoryFeedback(await newId())).toEqual(FEEDBACK_DEFAULTS);
   });
 });
 
 describe('setMemoryFeedback — merge + sanitize', () => {
   it('roundtrips a partial patch over defaults', async () => {
-    const id = newId();
+    const id = await newId();
     const next = await setMemoryFeedback(id, { kind: 'state' });
     expect(next.kind).toBe('state');
     expect(next.confidence).toBe(0.5);
@@ -47,7 +55,7 @@ describe('setMemoryFeedback — merge + sanitize', () => {
   });
 
   it('clamps out-of-range confidence and unknown enums', async () => {
-    const id = newId();
+    const id = await newId();
     const next = await setMemoryFeedback(id, {
       confidence: 5,
       status: 'deleted' as never,
@@ -63,7 +71,7 @@ describe('setMemoryFeedback — merge + sanitize', () => {
 
 describe('applyMemoryFeedback — confirm', () => {
   it('sets full confidence, timestamp, count and importance floor', async () => {
-    const id = newId();
+    const id = await newId();
     const before = new Date().toISOString();
     const next = await applyMemoryFeedback(id, 'confirm');
     expect(next.confidence).toBe(1.0);
@@ -76,7 +84,7 @@ describe('applyMemoryFeedback — confirm', () => {
   });
 
   it('second confirm bumps correct_count', async () => {
-    const id = newId();
+    const id = await newId();
     await applyMemoryFeedback(id, 'confirm');
     const next = await applyMemoryFeedback(id, 'confirm');
     expect(next.correct_count).toBe(2);
@@ -84,7 +92,7 @@ describe('applyMemoryFeedback — confirm', () => {
   });
 
   it('accepts kind override', async () => {
-    const id = newId();
+    const id = await newId();
     const next = await applyMemoryFeedback(id, 'confirm', { kind: 'state' });
     expect(next.kind).toBe('state');
   });
@@ -92,7 +100,7 @@ describe('applyMemoryFeedback — confirm', () => {
 
 describe('applyMemoryFeedback — archive / unarchive', () => {
   it('archive keeps confidence but flips status', async () => {
-    const id = newId();
+    const id = await newId();
     await applyMemoryFeedback(id, 'confirm');
     const next = await applyMemoryFeedback(id, 'archive');
     expect(next.status).toBe('archived');
@@ -101,7 +109,7 @@ describe('applyMemoryFeedback — archive / unarchive', () => {
   });
 
   it('unarchive restores active and refreshes timestamp', async () => {
-    const id = newId();
+    const id = await newId();
     await applyMemoryFeedback(id, 'archive');
     const before = new Date().toISOString();
     const next = await applyMemoryFeedback(id, 'unarchive');
@@ -113,7 +121,7 @@ describe('applyMemoryFeedback — archive / unarchive', () => {
 
 describe('setMemoryFeedback — title', () => {
   it('roundtrips a title and merges with votes without clobbering', async () => {
-    const id = newId();
+    const id = await newId();
     await setMemoryFeedback(id, { title: 'dor pulsante na têmpora' });
     expect((await getMemoryFeedback(id)).title).toBe('dor pulsante na têmpora');
     // vote merge (e.g. confirm after title) preserves the title
@@ -127,7 +135,7 @@ describe('setMemoryFeedback — title', () => {
   });
 
   it('sanitizes title: trims, caps at 80 chars, non-string becomes null', async () => {
-    const id = newId();
+    const id = await newId();
     const long = `  ${'palavra '.repeat(30)}  `;
     const next = await setMemoryFeedback(id, { title: long });
     expect(next.title!.length).toBeLessThanOrEqual(80);
@@ -137,14 +145,13 @@ describe('setMemoryFeedback — title', () => {
   });
 
   it('attachFeedback carries title to list items, null by default', async () => {
-    const titled = newId();
-    ids.push(titled);
+    const titled = await newId();
     await setMemoryFeedback(titled, { title: 'banana assada com batata' });
+    const fresh = await newId();
     const out = await attachFeedback([
       { id: titled, memory: 'a' },
-      { id: `fb-title-fresh-${randomUUID()}`, memory: 'b' },
+      { id: fresh, memory: 'b' },
     ]);
-    ids.push(out[1].id);
     expect(out[0].title).toBe('banana assada com batata');
     expect(out[1].title).toBeNull();
   });
@@ -169,9 +176,8 @@ describe('/api/memory/feedback — validation', () => {
 
 describe('getManyMemoryFeedback + attachFeedback', () => {
   it('batch fetch returns stored votes and defaults for the rest', async () => {
-    const voted = `fb-batch-voted-${randomUUID()}`;
-    const fresh = `fb-batch-fresh-${randomUUID()}`;
-    ids.push(voted, fresh);
+    const voted = await newId();
+    const fresh = await newId();
     await setMemoryFeedback(voted, { confidence: 1.0, kind: 'state' });
     const map = await getManyMemoryFeedback([voted, fresh, voted]);
     expect(map.get(voted)?.confidence).toBe(1.0);
@@ -180,22 +186,70 @@ describe('getManyMemoryFeedback + attachFeedback', () => {
   });
 
   it('attachFeedback enriches list items additively', async () => {
-    const voted = `fb-attach-voted-${randomUUID()}`;
-    ids.push(voted);
+    const voted = await newId();
     await setMemoryFeedback(voted, { status: 'archived' });
+    const fresh = await newId();
     const out = await attachFeedback([
       { id: voted, memory: 'a' },
-      { id: `fb-attach-fresh-${randomUUID()}`, memory: 'b' },
+      { id: fresh, memory: 'b' },
     ]);
-    ids.push(out[1].id);
     expect(out[0].status).toBe('archived');
     expect(out[0].memory).toBe('a');
     expect(out[1].status).toBe('active');
     expect(out[1].confidence).toBe(0.5);
   });
 
-  it('empty input returns empty without touching Redis', async () => {
+  it('empty input returns empty without touching backends', async () => {
     expect(await attachFeedback([])).toEqual([]);
     expect(await getManyMemoryFeedback([])).toEqual(new Map());
+  });
+});
+
+describe('memory-state — Qdrant authority (issue #8)', () => {
+  it('survives an L2 eviction (flush equivalent): falls through to Qdrant', async () => {
+    const id = await newId();
+    await setMemoryFeedback(id, { confidence: 1.0, title: 'sobrevive flush' });
+    await setMemoryImportance(id, 0.9);
+    // Evict exactly this id's L2 entries (same code path as a full flush,
+    // without wiping other tests' keys).
+    await getRedis().del(`mem0:feedback:${id}`, `mem0:importance:${id}`);
+    expect((await getMemoryFeedback(id)).confidence).toBe(1.0);
+    expect((await getMemoryFeedback(id)).title).toBe('sobrevive flush');
+    expect(await getMemoryImportance(id)).toBe(0.9);
+  });
+
+  it('works with Redis unavailable (Qdrant authority)', async () => {
+    const id = await newId();
+    await setMemoryFeedback(id, { confidence: 1.0 });
+    await disconnectRedis();
+    try {
+      // Reads degrade to Qdrant, not to defaults.
+      expect((await getMemoryFeedback(id)).confidence).toBe(1.0);
+      // Writes go to Qdrant (L2 skipped), merging — not resetting — state.
+      const next = await setMemoryFeedback(id, { kind: 'state' });
+      expect(next.kind).toBe('state');
+      expect(next.confidence).toBe(1.0);
+      // Confirmed-missing importance reads null (not the unreachable default).
+      expect(await getMemoryImportance(id)).toBeNull();
+    } finally {
+      const { connectRedis: reconnect } = await import('./redis.js');
+      await reconnect();
+    }
+    expect((await getMemoryFeedback(id)).kind).toBe('state');
+  });
+
+  it('write to a missing point throws (never silent success)', async () => {
+    const ghost = randomUUID(); // valid UUID, no Qdrant point
+    ids.push(ghost);
+    await expect(setMemoryFeedback(ghost, { confidence: 1 })).rejects.toThrow();
+    await expect(setMemoryImportance(ghost, 0.9)).rejects.toThrow();
+  });
+
+  it('reads on missing/garbage ids degrade to defaults (never throw)', async () => {
+    const ghost = randomUUID();
+    ids.push(ghost);
+    await expect(getMemoryFeedback(ghost)).resolves.toEqual(FEEDBACK_DEFAULTS);
+    await expect(getMemoryImportance(ghost)).resolves.toBeNull();
+    await expect(getMemoryFeedback('not-a-point')).resolves.toEqual(FEEDBACK_DEFAULTS);
   });
 });
