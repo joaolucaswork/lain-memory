@@ -221,6 +221,40 @@ type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean
 const text = (t: string): ToolResult => ({ content: [{ type: 'text', text: t }] });
 const err = (t: string): ToolResult => ({ content: [{ type: 'text', text: t }], isError: true });
 
+/** Rows returned by addMemoryWithConflictCheck (narrowed for formatting). */
+export interface RememberedRow {
+  id: string;
+  memory: string;
+  action?: string;
+  reason?: string;
+  conflictsWith?: Array<{ id: string; score: number }>;
+}
+
+/**
+ * Render a remember result honestly. An empty extraction (Mem0 produced no
+ * atoms) must NEVER read as success — that silent "Memory saved." cost real
+ * data loss (the caller moves on, nothing was stored).
+ */
+export function formatRememberResult(memories: RememberedRow[], project?: string): string {
+  const scope = project ? ` [${project}]` : ' [global]';
+  if (!Array.isArray(memories) || memories.length === 0) {
+    return 'Nothing saved — the extractor produced no atoms from this text. Retry with mode:raw to store it verbatim.';
+  }
+  if (memories[0]?.id === 'duplicate') {
+    const conflicts = memories[0].conflictsWith;
+    if (conflicts && conflicts.length > 0) {
+      const list = conflicts.map(c => `${c.id} (sim ${c.score.toFixed(2)})`).join(', ');
+      return `Memory skipped — conflicts with: ${list}`;
+    }
+    return 'Memory skipped — duplicate of existing memory.';
+  }
+  if (memories[0]?.id === 'rejected') {
+    return `Memory rejected — reason: ${memories[0].reason ?? 'quality below threshold'}`;
+  }
+  const summary = memories.map(m => `- ${m.memory} (id: ${m.id})`).join('\n');
+  return `Remembered${scope}:\n${summary}`;
+}
+
 async function handleTool(name: string, args: Record<string, any>): Promise<ToolResult> {
   switch (name) {
     case 'remember': {
@@ -245,22 +279,7 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
       else if (args.mode === 'bundle') memOpts.bundleMode = true;
       else if (args.mode === 'raw') memOpts.inferFalse = true;
       const memories = await addMemoryWithConflictCheck(args.text, args.project, memOpts);
-      if (Array.isArray(memories) && memories[0]?.id === 'duplicate') {
-        const conflicts = memories[0].conflictsWith;
-        if (conflicts && conflicts.length > 0) {
-          const list = conflicts.map(c => `${c.id} (sim ${c.score.toFixed(2)})`).join(', ');
-          return text(`Memory skipped — conflicts with: ${list}`);
-        }
-        return text('Memory skipped — duplicate of existing memory.');
-      }
-      if (Array.isArray(memories) && memories[0]?.id === 'rejected') {
-        return text(`Memory rejected — reason: ${memories[0].reason ?? 'quality below threshold'}`);
-      }
-      const summary =
-        Array.isArray(memories) && memories.length > 0
-          ? memories.map(m => `- ${m.memory} (id: ${m.id})`).join('\n')
-          : 'Memory saved.';
-      return text(`Remembered${args.project ? ` [${args.project}]` : ' [global]'}:\n${summary}`);
+      return text(formatRememberResult(memories as RememberedRow[], args.project));
     }
 
     case 'recall': {
