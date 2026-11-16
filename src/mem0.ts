@@ -25,9 +25,6 @@ import {
   deleteState as stateDeleteState,
   isDefaultState,
   parseStateSnapshot,
-  type FeedbackKind as StateFeedbackKind,
-  type FeedbackStatus as StateFeedbackStatus,
-  type MemoryFeedback as StateMemoryFeedback,
 } from './memory-state.js';
 import { INSTANCE_ID, listProjects } from './workspace.js';
 import { withDistributedLock } from './distributed-lock.js';
@@ -35,13 +32,36 @@ import { classifyMemoryAction } from './contradiction-detector.js';
 import { incrementMetric } from './mem-metrics.js';
 import { BOILERPLATE_PATTERNS } from './memory-patterns.js';
 import type { PolicyAuditRecord } from './memory-policy.js';
-
-/** Budget limits for spawn-context composition (see getContextForSpawn). */
-export interface MemoryLimits {
-  globalLimit: number;
-  projectLimit: number;
-  graphEnabled: boolean;
-}
+import type {
+  AddMemoryOpts,
+  ConsolidationDetail,
+  ContradictionSweepReport,
+  FeedbackAction,
+  FeedbackKind,
+  FeedbackStatus,
+  MemoryFeedback,
+  MemoryLimits,
+  MemorySnapshot,
+  MemoryTier,
+  RankedMemory,
+  RestoreResult,
+  TrashProvenance,
+} from './mem0/types.js';
+export type {
+  AddMemoryOpts,
+  ConsolidationDetail,
+  ContradictionSweepReport,
+  FeedbackAction,
+  FeedbackKind,
+  FeedbackStatus,
+  MemoryFeedback,
+  MemoryLimits,
+  MemorySnapshot,
+  MemoryTier,
+  RankedMemory,
+  RestoreResult,
+  TrashProvenance,
+} from './mem0/types.js';
 
 let client: Memory | null = null;
 
@@ -228,8 +248,6 @@ export function applyAgeDecayToResults<T extends { id?: string; score?: number; 
 
 // ─── Memory Tier Classification ───
 
-export type MemoryTier = 'hot' | 'warm' | 'cold';
-
 /**
  * Classify a memory's tier based on age and scope.
  *
@@ -401,40 +419,6 @@ export function scoreMemoryQuality(text: string): number {
   // actionability 2-3: neutral (has some detail but not complete)
 
   return score;
-}
-
-export interface AddMemoryOpts {
-  /** Skip quality scoring (for callers that already filter, like seed-extraction). */
-  skipQualityCheck?: boolean;
-  /** Skip contradiction detection (for consolidation, seed-extraction, etc.) */
-  skipConflictCheck?: boolean;
-  /** Treat input as a bundle/summary — informs LLM to prefer UPDATE over NOOP for overlapping atoms. */
-  bundleMode?: boolean;
-  /** Metadata stored on the Mem0 item (provenance, trash records, etc.). */
-  metadata?: Record<string, unknown>;
-  /** Skip graph ingestion (trash copies must not pollute the knowledge graph). */
-  skipGraphIngest?: boolean;
-  /**
-   * Skip the forget-blocklist check. Trash copies carry forgotten text by
-   * design — blocking them would turn every forget into silent data loss.
-   * Everything else (including index-mode re-ingests) stays checked so a
-   * forgotten memory cannot be resurrected through another path.
-   */
-  skipBlocklistCheck?: boolean;
-  /**
-   * Verbatim mode (mode:raw). Passes infer:false to the Mem0 SDK (no
-   * gpt-4o-mini decomposition) AND bypasses pre-save LLM enrichment
-   * entirely (see shouldEnrichTechnicalMemory). The stored text is exactly
-   * the input — 0 bytes changed. Previously enrichment still ran here and
-   * could rewrite/fabricate before Mem0 ever saw the text.
-   */
-  inferFalse?: boolean;
-  /**
-   * Fact already extracted from a chat turn. Still hard-rejects credentials
-   * and boilerplate, but skips the technical quality score — a diary sentence
-   * ("o usuário tem Seinfeld como série conforto") would lose that rubric.
-   */
-  chatAtom?: boolean;
 }
 
 // Symbol used to guard against double-patching the OpenAILLM prototype
@@ -918,23 +902,6 @@ export async function searchMemory(query: string, project?: string, limit: numbe
  * A memory hit after the recall pipeline: raw cosine plus ranking signals.
  * `status` is omitted — archived memories are filtered before this point.
  */
-export interface RankedMemory {
-  id: string;
-  memory: string;
-  score?: number;
-  created_at?: string;
-  updated_at?: string;
-  adjustedScore: number;
-  importance?: number | null;
-  /** Fase 0 feedback contract: confidence, last_confirmed_at, status, kind. */
-  confidence?: number;
-  last_confirmed_at?: string | null;
-  status?: FeedbackStatus;
-  kind?: FeedbackKind;
-  /** Fase 1 display title: short label, null until generated. */
-  title?: string | null;
-}
-
 /**
  * Shared recall pipeline (Fase 0 feedback): touch-boost recency, attach
  * importance + feedback, drop archived, rank by adjusted score.
@@ -1196,10 +1163,6 @@ export async function getMemoryTouchTimestamp(memoryId: string): Promise<number 
 // neutral defaults, so existing ranking behavior is unchanged until the
 // first vote. Re-exported here so existing import sites keep working.
 
-export type FeedbackStatus = StateFeedbackStatus;
-export type FeedbackKind = StateFeedbackKind;
-export type MemoryFeedback = StateMemoryFeedback;
-
 export const FEEDBACK_DEFAULTS: MemoryFeedback = STATE_FEEDBACK_DEFAULTS;
 
 /** Display-title cap: 6 words ≈ 80 chars with margin. */
@@ -1255,8 +1218,6 @@ export async function setMemoryFeedback(
 ): Promise<MemoryFeedback> {
   return stateSetFeedback(memoryId, patch);
 }
-
-export type FeedbackAction = 'confirm' | 'archive' | 'unarchive';
 
 /**
  * Apply a user vote. Side effects per action:
@@ -1500,14 +1461,6 @@ export async function deleteMemory(memoryId: string): Promise<void> {
  * (reaper/dedup/consolidation only scan workspace projects + global scope). */
 export const TRASH_PROJECT = 'trash';
 
-export interface MemorySnapshot {
-  id: string;
-  memory: string;
-  created_at?: string;
-  /** True when the id was not found (already gone) — nothing to snapshot. */
-  missing?: boolean;
-}
-
 /** Fetch full texts for ids BEFORE deleting. Never throws — returns
  * `{id, missing:true}` entries for anything unfetchable. */
 export async function snapshotMemories(ids: string[], project?: string, limit = 100): Promise<MemorySnapshot[]> {
@@ -1523,12 +1476,6 @@ export async function snapshotMemories(ids: string[], project?: string, limit = 
     console.error('[mem0] snapshotMemories failed:', err instanceof Error ? err.message : err);
     return ids.map(id => ({ id, memory: '', missing: true as const }));
   }
-}
-
-export interface TrashProvenance {
-  reason: string;
-  trigger: string;
-  replacedById?: string;
 }
 
 /**
@@ -1597,12 +1544,6 @@ export async function trashAndDelete(
 
 /** Undo window for ✕ (forget). Trash copies older than this cannot be restored. */
 export const RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-
-export interface RestoreResult {
-  id: string | null;
-  restored: boolean;
-  reason?: string;
-}
 
 /**
  * Undo a forget: re-save the trash copy into its original scope, delete the
@@ -1754,15 +1695,6 @@ function groupMemories(memories: { id: string; memory: string }[]): Map<string, 
  * Groups related memories, merges them via the fast LLM, replaces fragments.
  * Returns { consolidated, deleted, groups }.
  */
-export interface ConsolidationDetail {
-  fragments: string[];
-  result: string;
-  /** Full-fidelity audit (untruncated). Present on entries written by the audit-trail path. */
-  fragmentsFull?: { id: string; memory: string; created_at: string | null; missing: boolean; trash_id: string | null }[];
-  resultFull?: string;
-  newId?: string;
-}
-
 /**
  * LLM-merge a set of fragment texts into one memory.
  * Same prompt + retry as the group path in consolidateMemories.
@@ -2260,17 +2192,6 @@ async function setContradictionScopeIdx(idx: number): Promise<void> {
       await getRedis().set('mem0:contradiction_scope_idx', String(contradictionScopeIdxFallback));
     } catch { /* non-critical */ }
   }
-}
-
-export interface ContradictionSweepReport {
-  scope: string | undefined;
-  total: number;
-  checked: number;
-  removed: number;
-  llmCalls: number;
-  nextCursor: number;
-  queuedMerges: number;
-  queuedContradictions: number;
 }
 
 /** Process one slice of one scope. Never throws on per-memory errors. */
