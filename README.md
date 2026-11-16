@@ -177,9 +177,11 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped whe
 | Path | Body | Description |
 |------|------|-------------|
 | `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim |
-| `/api/memory/recall` | `{ query, project?, limit?, cached? }` | Ranked search (`cached` = Redis-backed) |
-| `/api/memory/list` | `{ project?, limit? }` | List memories |
-| `/api/memory/forget` | `{ memory_id }` | Delete by ID |
+| `/api/memory/recall` | `{ query, project?, limit?, cached? }` | Ranked search (`cached` = Redis-backed). Each hit carries `confidence`, `last_confirmed_at`, `status`, `kind` |
+| `/api/memory/list` | `{ project?, limit? }` | List memories (each item carries `confidence`, `last_confirmed_at`, `status`, `kind`) |
+| `/api/memory/forget` | `{ memory_id, project? }` | Trash copy (7d undo) → hard delete → forget-blocklist |
+| `/api/memory/restore` | `{ memory_id }` (trash copy id) | Undo a forget within 7d; lifts the blocklist entry |
+| `/api/memory/feedback` | `{ id, action: confirm\|archive\|unarchive, kind? }` | User vote: ✓ confirm (confidence 1.0 + importance floor), 🕐 archive (hidden from recall), ↩ unarchive |
 | `/api/memory/add` | `{ text, project?, opts? }` | Direct add, no conflict check |
 | `/api/memory/context` | `{ message, project?, charBudget?, limits? }` | Spawn-context composition |
 | `/api/memory/update` | `{ id, memory, project? }` | Update preserving native ID |

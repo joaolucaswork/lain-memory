@@ -5,6 +5,8 @@ import {
   setMemoryFeedback,
   applyMemoryFeedback,
   getMemoryImportance,
+  getManyMemoryFeedback,
+  attachFeedback,
   FEEDBACK_DEFAULTS,
 } from './mem0.js';
 import { connectRedis, getRedis, isRedisAvailable } from './redis.js';
@@ -123,5 +125,38 @@ describe('/api/memory/feedback — validation', () => {
     expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'forget' }).ok).toBe(false);
     expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'confirm', kind: 'mood' }).ok).toBe(false);
     expect(validateRoute('/api/memory/feedback', { action: 'confirm' }).ok).toBe(false);
+  });
+});
+
+describe('getManyMemoryFeedback + attachFeedback', () => {
+  it('batch fetch returns stored votes and defaults for the rest', async () => {
+    const voted = `fb-batch-voted-${randomUUID()}`;
+    const fresh = `fb-batch-fresh-${randomUUID()}`;
+    ids.push(voted, fresh);
+    await setMemoryFeedback(voted, { confidence: 1.0, kind: 'state' });
+    const map = await getManyMemoryFeedback([voted, fresh, voted]);
+    expect(map.get(voted)?.confidence).toBe(1.0);
+    expect(map.get(voted)?.kind).toBe('state');
+    expect(map.get(fresh)).toEqual(FEEDBACK_DEFAULTS);
+  });
+
+  it('attachFeedback enriches list items additively', async () => {
+    const voted = `fb-attach-voted-${randomUUID()}`;
+    ids.push(voted);
+    await setMemoryFeedback(voted, { status: 'archived' });
+    const out = await attachFeedback([
+      { id: voted, memory: 'a' },
+      { id: `fb-attach-fresh-${randomUUID()}`, memory: 'b' },
+    ]);
+    ids.push(out[1].id);
+    expect(out[0].status).toBe('archived');
+    expect(out[0].memory).toBe('a');
+    expect(out[1].status).toBe('active');
+    expect(out[1].confidence).toBe(0.5);
+  });
+
+  it('empty input returns empty without touching Redis', async () => {
+    expect(await attachFeedback([])).toEqual([]);
+    expect(await getManyMemoryFeedback([])).toEqual(new Map());
   });
 });

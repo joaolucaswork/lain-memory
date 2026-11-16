@@ -1031,7 +1031,10 @@ export interface RankedMemory {
   updated_at?: string;
   adjustedScore: number;
   importance?: number | null;
+  /** Fase 0 feedback contract: confidence, last_confirmed_at, status, kind. */
   confidence?: number;
+  last_confirmed_at?: string | null;
+  status?: FeedbackStatus;
   kind?: FeedbackKind;
 }
 
@@ -1068,19 +1071,26 @@ export async function rankRecallResults<
 
   // Fetch importance + feedback from Redis for composite ranking.
   // Archived memories are dropped here — every recall path excludes them.
-  type Enriched<U> = U & { importance: number | null; confidence: number; kind: FeedbackKind };
+  type Enriched<U> = U & { importance: number | null; confidence: number; last_confirmed_at: string | null; status: FeedbackStatus; kind: FeedbackKind };
   let withSignals: Array<Enriched<T>> =
-    boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, kind: 'fact' as FeedbackKind }));
+    boostedResults.map((r) => ({ ...r, importance: null, confidence: FEEDBACK_DEFAULTS.confidence, last_confirmed_at: null, status: 'active' as FeedbackStatus, kind: 'fact' as FeedbackKind }));
   if (isRedisAvailable()) {
     try {
+      const feedbackMap = await getManyMemoryFeedback(boostedResults.map((r) => r.id));
       const maybe: Array<Enriched<T> | null> = await Promise.all(
         boostedResults.map(async (r) => {
-          const [importance, feedback] = await Promise.all([
-            getMemoryImportance(r.id),
-            getMemoryFeedback(r.id),
-          ]);
+          const importance = await getMemoryImportance(r.id);
+          const feedback = feedbackMap.get(r.id) ?? FEEDBACK_DEFAULTS;
           if (feedback.status === 'archived') return null;
-          return { ...r, importance, confidence: feedback.confidence, kind: feedback.kind };
+          const enriched: Enriched<T> = {
+            ...r,
+            importance,
+            confidence: feedback.confidence,
+            last_confirmed_at: feedback.last_confirmed_at,
+            status: feedback.status,
+            kind: feedback.kind,
+          };
+          return enriched;
         })
       );
       withSignals = maybe.filter((r): r is Enriched<T> => r !== null);
@@ -1314,6 +1324,39 @@ export async function getMemoryFeedback(memoryId: string): Promise<MemoryFeedbac
   } catch { return { ...FEEDBACK_DEFAULTS }; }
 }
 
+/**
+ * Batch feedback fetch (single Redis round-trip via pipeline).
+ * Missing keys → neutral defaults. Never throws.
+ */
+export async function getManyMemoryFeedback(ids: string[]): Promise<Map<string, MemoryFeedback>> {
+  const out = new Map<string, MemoryFeedback>();
+  const uniq = [...new Set(ids.filter(Boolean))];
+  for (const id of uniq) out.set(id, { ...FEEDBACK_DEFAULTS });
+  if (uniq.length === 0 || !isRedisAvailable()) return out;
+  try {
+    const pipeline = getRedis().pipeline();
+    for (const id of uniq) pipeline.get(feedbackKey(id));
+    const rows = await pipeline.exec();
+    uniq.forEach((id, i) => {
+      try {
+        const raw = rows?.[i]?.[1] as string | null;
+        if (raw) out.set(id, sanitizeFeedback(JSON.parse(raw) as Partial<MemoryFeedback>));
+      } catch { /* keep defaults */ }
+    });
+  } catch { /* defaults */ }
+  return out;
+}
+
+/**
+ * Attach feedback signals to list-style items. Additive — safe for all
+ * getMemories consumers (vault, sweeps, snapshots, restore).
+ */
+export async function attachFeedback<T extends { id: string }>(items: T[]): Promise<(T & MemoryFeedback)[]> {
+  if (items.length === 0) return [];
+  const map = await getManyMemoryFeedback(items.map((m) => m.id));
+  return items.map((m) => ({ ...m, ...(map.get(m.id) ?? FEEDBACK_DEFAULTS) }));
+}
+
 /** Merge patch into stored feedback (creates with defaults when absent). */
 export async function setMemoryFeedback(
   memoryId: string,
@@ -1347,7 +1390,8 @@ export async function applyMemoryFeedback(
   const now = new Date().toISOString();
   const kindPatch = opts?.kind ? { kind: opts.kind } : {};
   // Votes change ranking immediately — don't serve stale cached recalls.
-  invalidateMem0Cache().catch(() => {});  if (action === 'confirm') {
+  invalidateMem0Cache().catch(() => {});
+  if (action === 'confirm') {
     const current = await getMemoryFeedback(memoryId);
     const next = await setMemoryFeedback(memoryId, {
       confidence: 1.0,
@@ -1561,7 +1605,7 @@ export async function invalidateMem0Cache(project?: string): Promise<void> {
   }
 }
 
-export async function getMemories(project?: string, limit: number = 20): Promise<{ id: string; memory: string; created_at?: string; updated_at?: string; metadata?: Record<string, unknown> }[]> {
+export async function getMemories(project?: string, limit: number = 20): Promise<Array<{ id: string; memory: string; created_at?: string; updated_at?: string; metadata?: Record<string, unknown> } & MemoryFeedback>> {
   const m = getClient();
   const result = await m.getAll({
     // v3 requires snake_case entity keys in filters (camelCase throws).
@@ -1569,13 +1613,15 @@ export async function getMemories(project?: string, limit: number = 20): Promise
     topK: limit,
   });
   // Preserve created_at/updated_at from Mem0 response
-  return (result.results ?? []).map((item: any) => ({
+  const mapped = (result.results ?? []).map((item: any) => ({
     id: item.id,
     memory: item.memory,
     created_at: item.created_at ?? item.createdAt,
     updated_at: item.updated_at ?? item.updatedAt,
     ...(item.metadata ? { metadata: item.metadata } : {}),
   }));
+  // Fase 0: feedback signals ride along for vault badges (single pipeline round-trip)
+  return attachFeedback(mapped);
 }
 
 export async function deleteMemory(memoryId: string): Promise<void> {
