@@ -142,11 +142,31 @@ All file state lives under `LAIN_WORKSPACE_DIR` (default `~/lain-memory-workspac
 └── .knowledge/
     ├── graph.json            # knowledge graph (GraphRAG)
     ├── graph-blocklist.json  # autoclean reject list
+    ├── forget-blocklist.json # hashes of user-forgotten texts (fail-closed: unreadable = blocked)
     ├── seeds/                # extracted seed files
     └── pgs-sessions/         # resumable PGS sessions
 ```
 
 The dir must exist before boot (the server refuses to start otherwise — `./setup.sh` creates it). Vector memories live separately in Qdrant (`./data/qdrant`); Redis holds cache only. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
+
+### Where user state lives (post-#8–#11)
+
+| What | Where | Notes |
+|------|-------|-------|
+| Memory text + `lain_feedback` / `lain_importance` payload | Qdrant (`mem0` or `mem0-${LAIN_INSTANCE_ID}`) | Authority for votes, titles, importance. No TTL. Survives Redis loss. |
+| Forget blocklist | `$WORKSPACE/.knowledge/forget-blocklist.json` | Authority. Atomic writes. Fail-closed on read error. |
+| Graph + seeds + PGS sessions | `$WORKSPACE/.knowledge/` | As above. |
+| Recall cache, touch timestamps, state L2 | Redis | Pure cache — safe to drop at any time. Rebuilds on its own. |
+
+`/api/memory/feedback` is fail-hard: if the vote cannot be persisted (Qdrant down, unknown id) it answers 500 instead of a silent success.
+
+Migrating a pre-#11 Redis (one-shot, idempotent, deletes nothing):
+
+```bash
+bun run migrate:state -- --dry-run   # report only: counts + ids with no Qdrant point
+bun run migrate:state                # copy feedback/importance/blocklist (Qdrant wins ties)
+docker volume rm lain-memory-redis   # optional afterwards: Redis rebuilds as pure cache
+```
 
 ## Configuration
 
