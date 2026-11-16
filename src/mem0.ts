@@ -1196,6 +1196,117 @@ export async function getMemoryTouchTimestamp(memoryId: string): Promise<number 
   } catch { return null; }
 }
 
+// ─── Memory Feedback (user votes: ✓ confirm / 🕐 archive) ───
+// Fase 0 of per-memory quick actions (replaces like/dislike).
+// Stored beside importance scores; absent key = neutral defaults,
+// so existing ranking behavior is unchanged until the first vote.
+
+export type FeedbackStatus = 'active' | 'archived';
+export type FeedbackKind = 'fact' | 'state';
+
+export interface MemoryFeedback {
+  confidence: number;
+  last_confirmed_at: string | null;
+  status: FeedbackStatus;
+  kind: FeedbackKind;
+  sensitive: boolean;
+  correct_count: number;
+}
+
+export const FEEDBACK_DEFAULTS: MemoryFeedback = {
+  confidence: 0.5,
+  last_confirmed_at: null,
+  status: 'active',
+  kind: 'fact',
+  sensitive: false,
+  correct_count: 0,
+};
+
+const FEEDBACK_TTL = 365 * 24 * 60 * 60; // 1 year (same as importance)
+
+function feedbackKey(memoryId: string): string {
+  return `mem0:feedback:${memoryId}`;
+}
+
+function sanitizeFeedback(parsed: Partial<MemoryFeedback>): MemoryFeedback {
+  return {
+    confidence: typeof parsed.confidence === 'number'
+      ? Math.min(1, Math.max(0, parsed.confidence))
+      : FEEDBACK_DEFAULTS.confidence,
+    last_confirmed_at: typeof parsed.last_confirmed_at === 'string' ? parsed.last_confirmed_at : null,
+    status: parsed.status === 'archived' ? 'archived' : 'active',
+    kind: parsed.kind === 'state' ? 'state' : 'fact',
+    sensitive: parsed.sensitive === true,
+    correct_count: Number.isInteger(parsed.correct_count) && (parsed.correct_count as number) >= 0
+      ? (parsed.correct_count as number)
+      : 0,
+  };
+}
+
+/** Stored feedback for a memory, or neutral defaults when never voted. */
+export async function getMemoryFeedback(memoryId: string): Promise<MemoryFeedback> {
+  if (!isRedisAvailable()) return { ...FEEDBACK_DEFAULTS };
+  try {
+    const raw = await getRedis().get(feedbackKey(memoryId));
+    if (!raw) return { ...FEEDBACK_DEFAULTS };
+    return sanitizeFeedback(JSON.parse(raw) as Partial<MemoryFeedback>);
+  } catch { return { ...FEEDBACK_DEFAULTS }; }
+}
+
+/** Merge patch into stored feedback (creates with defaults when absent). */
+export async function setMemoryFeedback(
+  memoryId: string,
+  patch: Partial<MemoryFeedback>,
+): Promise<MemoryFeedback> {
+  const current = await getMemoryFeedback(memoryId);
+  const next: MemoryFeedback = sanitizeFeedback({ ...current, ...patch });
+  if (isRedisAvailable()) {
+    try {
+      await getRedis().set(feedbackKey(memoryId), JSON.stringify(next), 'EX', FEEDBACK_TTL);
+    } catch { /* non-critical */ }
+  }
+  return next;
+}
+
+export type FeedbackAction = 'confirm' | 'archive' | 'unarchive';
+
+/**
+ * Apply a user vote. Side effects per action:
+ *   confirm   → confidence=1.0, last_confirmed_at=now, correct_count+1,
+ *                touch (recency refresh) + importance floor 0.85 (180d half-life protection).
+ *   archive   → status=archived (excluded from recall, kept in list/history).
+ *   unarchive → status=active.
+ * `forget` is NOT here — it deletes via trash+blocklist (issue #2).
+ */
+export async function applyMemoryFeedback(
+  memoryId: string,
+  action: FeedbackAction,
+  opts?: { kind?: FeedbackKind },
+): Promise<MemoryFeedback> {
+  const now = new Date().toISOString();
+  const kindPatch = opts?.kind ? { kind: opts.kind } : {};
+  if (action === 'confirm') {
+    const current = await getMemoryFeedback(memoryId);
+    const next = await setMemoryFeedback(memoryId, {
+      confidence: 1.0,
+      last_confirmed_at: now,
+      correct_count: current.correct_count + 1,
+      ...kindPatch,
+    });
+    // Recency refresh; reinforce side-effect (+0.05) is best-effort.
+    await touchMemoryTimestamp(memoryId).catch(() => {});
+    try {
+      const importance = await getMemoryImportance(memoryId);
+      await setMemoryImportance(memoryId, Math.max(importance ?? 0, 0.85));
+    } catch { /* non-critical */ }
+    return next;
+  }
+  if (action === 'archive') {
+    return setMemoryFeedback(memoryId, { status: 'archived', ...kindPatch });
+  }
+  return setMemoryFeedback(memoryId, { status: 'active', last_confirmed_at: now, ...kindPatch });
+}
+
 // ─── Memory Cleanup (memoryScan) ───
 // Fase 4: automatic deletions go through the shared domain policy
 // (archive to trash + audit). The trash scope itself is never scanned.

@@ -2,7 +2,7 @@
  * lain-memory HTTP server.
  *
  * Serves the full `/api/...` memory/graph/seed/pgs surface:
- * remember, recall, list, forget, add, context, update, consolidate,
+ * remember, recall, list, forget, feedback, add, context, update, consolidate,
  * scan, resolve-entities, contradiction-scan, metrics, graph query/stats/
  * nodes/remove/autoclean/dump/ingest, seed extract/list, pgs execute/stats.
  *
@@ -18,6 +18,7 @@ import {
   getMemories,
   deleteMemory,
   updateMemory,
+  applyMemoryFeedback,
   consolidateMemories,
   scanAndCleanProjectMemories,
   getContextForSpawn,
@@ -49,6 +50,7 @@ import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { parseBody, validateRoute } from './http-validation.js';
+import { connectRedis } from './redis.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
@@ -114,6 +116,12 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/memory/forget': {
       await deleteMemory(data.memory_id);
       return json({ success: true });
+    }
+
+    case '/api/memory/feedback': {
+      const kind = data.kind === 'state' || data.kind === 'fact' ? data.kind : undefined;
+      const feedback = await applyMemoryFeedback(data.id, data.action, kind ? { kind } : undefined);
+      return json({ id: data.id, ...feedback });
     }
 
     case '/api/memory/add': {
@@ -363,6 +371,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 }
 
 async function boot(): Promise<void> {
+  await connectRedis(); // non-fatal: helpers degrade to defaults without it
   await initGraph();
   startMemoryMaintenance();
   startDedupSweep();

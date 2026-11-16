@@ -53,6 +53,11 @@ export const routeSchemas: Record<string, z.ZodType> = {
   }),
   '/api/memory/list': z.object({ project, limit: limit(500) }),
   '/api/memory/forget': z.object({ memory_id: z.string().min(1).max(200) }),
+  '/api/memory/feedback': z.object({
+    id: z.string().min(1).max(200),
+    action: z.enum(['confirm', 'archive', 'unarchive']),
+    kind: z.enum(['fact', 'state']).optional(),
+  }),
   '/api/memory/add': z.object({
     text: text(50000),
     project,
