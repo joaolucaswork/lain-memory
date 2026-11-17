@@ -65,7 +65,6 @@ const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
 const API_KEY = process.env.LAIN_API_KEY ?? '';
 
 function unauthorized(req: Request): boolean {
-  if (!API_KEY) return false; // empty key = open (same semantics as lain validateApiKey)
   const h = req.headers.get('authorization') ?? '';
   return h !== `Bearer ${API_KEY}`;
 }
@@ -178,7 +177,7 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/health':
     case '/api/health':
-      return json({ ok: true, service: 'lain-memory', auth: API_KEY ? 'bearer' : 'open' });
+      return json({ ok: true, service: 'lain-memory', auth: 'bearer' });
 
     default:
       return json({ error: `unknown route: ${path}` }, 404);
@@ -223,10 +222,12 @@ async function boot(): Promise<void> {
       }
     },
   });
-  if (!API_KEY) {
-    console.warn('[lain-memory] WARNING: LAIN_API_KEY is empty — HTTP API is OPEN. Set LAIN_API_KEY to require bearer auth.');
-  }
-  console.log(`[lain-memory] listening on ${BIND}:${PORT} (auth: ${API_KEY ? 'bearer' : 'open'})`);
+  console.log(`[lain-memory] listening on ${BIND}:${PORT} (auth: bearer)`);
+}
+
+if (!API_KEY) {
+  console.error('[lain-memory] fatal: LAIN_API_KEY is required');
+  process.exit(1);
 }
 
 boot().catch(err => {
