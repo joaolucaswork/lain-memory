@@ -21,15 +21,21 @@ import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { withFileLock, safeWriteFileSync } from './file-io-lock.js';
 import { KNOWLEDGE_DIR } from './workspace.js';
+import { MASTER_TENANT, normalizeTenant } from './tenants.js';
 
 export const FORGET_BLOCKLIST_FILENAME = 'forget-blocklist.json';
 
 /** Test override (see __setBlocklistPathForTests). Null = production path. */
 let _pathOverride: string | null = null;
 
-/** Production path. Tests swap it via __setBlocklistPathForTests + restore. */
-export function getBlocklistPath(): string {
-  return _pathOverride ?? join(KNOWLEDGE_DIR, FORGET_BLOCKLIST_FILENAME);
+/** Production path. Master tenant keeps the legacy file (compat); every other
+ * tenant gets its own file so a forget in one scope never blocks another.
+ * Tests swap it via __setBlocklistPathForTests + restore. */
+export function getBlocklistPath(tenant: string = MASTER_TENANT): string {
+  if (_pathOverride) return _pathOverride;
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  if (t === MASTER_TENANT) return join(KNOWLEDGE_DIR, FORGET_BLOCKLIST_FILENAME);
+  return join(KNOWLEDGE_DIR, `forget-blocklist-${t}.json`);
 }
 
 /** Test-only: redirect the blocklist file (pass null to restore). */
@@ -83,18 +89,18 @@ function saveToDisk(file: string, hashes: Set<string>): void {
 }
 
 /** Current blocklist hashes (empty set when the file does not exist yet). */
-export async function getBlocklistHashes(): Promise<Set<string>> {
-  return withFileLock(getBlocklistPath(), () => loadFromDisk(getBlocklistPath()));
+export async function getBlocklistHashes(tenant: string = MASTER_TENANT): Promise<Set<string>> {
+  return withFileLock(getBlocklistPath(tenant), () => loadFromDisk(getBlocklistPath(tenant)));
 }
 
 /**
  * Add pre-computed hashes (migration path — the original texts are gone).
  * Returns the number of hashes actually added. Throws on write failure.
  */
-export async function addHashesToBlocklist(hashes: string[]): Promise<{ added: number }> {
+export async function addHashesToBlocklist(hashes: string[], tenant: string = MASTER_TENANT): Promise<{ added: number }> {
   const clean = [...new Set(hashes.filter((h) => typeof h === 'string' && h.trim()))];
   if (clean.length === 0) return { added: 0 };
-  const file = getBlocklistPath();
+  const file = getBlocklistPath(tenant);
   return withFileLock(file, () => {
     const current = loadFromDisk(file);
     let added = 0;
@@ -115,10 +121,10 @@ export async function addHashesToBlocklist(hashes: string[]): Promise<{ added: n
  * returns true — a forgotten memory must not resurrect because of an I/O
  * error. Only blank text and a confirmed-missing entry return false.
  */
-export async function isBlocklisted(text: string): Promise<boolean> {
+export async function isBlocklisted(text: string, tenant: string = MASTER_TENANT): Promise<boolean> {
   if (!text.trim()) return false;
   try {
-    return loadFromDisk(getBlocklistPath()).has(blocklistHash(text));
+    return loadFromDisk(getBlocklistPath(tenant)).has(blocklistHash(text));
   } catch (err) {
     console.error('[blocklist] read failed — failing closed (blocked):', err instanceof Error ? err.message : err);
     return true;
@@ -126,10 +132,10 @@ export async function isBlocklisted(text: string): Promise<boolean> {
 }
 
 /** Record a forgotten text hash. Throws on write failure. No-op for blank text. */
-export async function addToBlocklist(text: string): Promise<void> {
+export async function addToBlocklist(text: string, tenant: string = MASTER_TENANT): Promise<void> {
   if (!text.trim()) return;
   const hash = blocklistHash(text);
-  const file = getBlocklistPath();
+  const file = getBlocklistPath(tenant);
   await withFileLock(file, () => {
     const hashes = loadFromDisk(file);
     if (hashes.has(hash)) return;
@@ -139,10 +145,10 @@ export async function addToBlocklist(text: string): Promise<void> {
 }
 
 /** Lift a blocklist entry (restore flow). Throws on write failure. */
-export async function removeFromBlocklist(text: string): Promise<void> {
+export async function removeFromBlocklist(text: string, tenant: string = MASTER_TENANT): Promise<void> {
   if (!text.trim()) return;
   const hash = blocklistHash(text);
-  const file = getBlocklistPath();
+  const file = getBlocklistPath(tenant);
   await withFileLock(file, () => {
     const hashes = loadFromDisk(file);
     if (!hashes.has(hash)) return;

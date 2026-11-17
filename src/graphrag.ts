@@ -27,6 +27,8 @@ export {
   resolveNodeId,
   SCOPE_SEPARATOR,
   scopedId,
+  tenantBase,
+  tenantScope,
 } from './graphrag/store.js';
 export {
   cachedGetStats,
@@ -38,6 +40,7 @@ export { query, queryDecisions } from './graphrag/query.js';
 export {
   appendGraphOutbox,
   drainGraphOutbox,
+  purgeTenantOutbox,
   queueGraphIngest,
   queueGraphIngestExtracted,
 } from './graphrag/outbox.js';
@@ -55,4 +58,5 @@ export {
   removeGraphProvenance,
   removeNodes,
   removeRelationships,
+  removeTenantGraph,
 } from './graphrag/reconcile.js';

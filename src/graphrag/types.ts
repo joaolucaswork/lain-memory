@@ -59,6 +59,8 @@ export interface GraphContext {
 export interface GraphIngestOpts {
   /** Mem0 IDs that originated this content (Fase 3 proveniência). */
   sourceIds?: string[];
+  /** Tenant scope. Master (`lucas`) reproduces the legacy unprefixed shape. */
+  tenant?: string;
 }
 
 export interface GraphOutboxEntry {
@@ -66,6 +68,8 @@ export interface GraphOutboxEntry {
   ts: number;
   attempts: number;
   project?: string;
+  /** Tenant scope — entries without it belong to the master tenant. */
+  tenant?: string;
   sourceIds?: string[];
   text?: string;
   entities?: Array<{ name: string; type: string; description: string }>;

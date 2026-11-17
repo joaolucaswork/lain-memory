@@ -9,12 +9,14 @@
 import { readdirSync } from 'fs';
 import { withDistributedLock } from '../distributed-lock.js';
 import { incrementMetric } from '../mem-metrics.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import {
   getGraph,
   isNodeVisibleToProject,
   normalizeProject,
   resolveNodeId,
   saveGraph,
+  tenantBase,
 } from './store.js';
 import {
   CACHE_TTL_PGS,
@@ -139,11 +141,11 @@ export async function reconcileGraph(): Promise<{
  * Remove specific nodes (and all their edges) from the graph.
  * Returns the list of nodes actually removed.
  */
-export async function removeNodes(nodeIds: string[], project?: string): Promise<string[]> {
+export async function removeNodes(nodeIds: string[], project?: string, tenant: string = MASTER_TENANT): Promise<string[]> {
   if (!getGraph()) return [];
   const removed: string[] = [];
   for (const id of nodeIds) {
-    const key = resolveNodeId(id, project);
+    const key = resolveNodeId(id, project, tenant);
     if (getGraph().hasNode(key)) {
       getGraph().dropNode(key);
       removed.push(key);
@@ -165,13 +167,14 @@ export async function removeRelationships(
   source: string,
   predicates?: string[],
   targets?: string[],
-  project?: string
+  project?: string,
+  tenant: string = MASTER_TENANT
 ): Promise<number> {
   if (!getGraph()) return 0;
-  const srcKey = resolveNodeId(source, project);
+  const srcKey = resolveNodeId(source, project, tenant);
   if (!getGraph().hasNode(srcKey)) return 0;
 
-  const scopedTargets = targets?.map(t => resolveNodeId(t, project));
+  const scopedTargets = targets?.map(t => resolveNodeId(t, project, tenant));
   const toRemove: string[] = [];
   getGraph().forEachOutEdge(srcKey, (edge, attrs, _src, tgt) => {
     const relAttrs = attrs as RelationshipAttrs;
@@ -196,11 +199,11 @@ export async function removeRelationships(
  * List all nodes in the graph with basic info.
  * With project: only nodes visible to that project (global + its scope).
  */
-export function listAllNodes(project?: string): Array<{ id: string; type: string; mentions: number; edgeCount: number }> {
+export function listAllNodes(project?: string, tenant: string = MASTER_TENANT): Array<{ id: string; type: string; mentions: number; edgeCount: number }> {
   if (!getGraph()) return [];
   const out: Array<{ id: string; type: string; mentions: number; edgeCount: number }> = [];
   getGraph().forEachNode((key, attrs) => {
-    if (!isNodeVisibleToProject(key, project)) return;
+    if (!isNodeVisibleToProject(key, project, tenant)) return;
     const a = attrs as EntityAttrs;
     out.push({
       id: key,
@@ -218,16 +221,17 @@ export function listAllNodes(project?: string): Array<{ id: string; type: string
  * Export graph data in PGS-compatible format.
  * Maps entity descriptions to `concept` field for PGS consumption.
  */
-export async function cachedGetGraphForPGS(project?: string): Promise<ReturnType<typeof getGraphForPGS>> {
+export async function cachedGetGraphForPGS(project?: string, tenant: string = MASTER_TENANT): Promise<ReturnType<typeof getGraphForPGS>> {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
   const scopeSuffix = project ? normalizeProject(project) : '';
-  const cached = await cacheGet<ReturnType<typeof getGraphForPGS>>(`pgs:${scopeSuffix}`);
+  const cached = await cacheGet<ReturnType<typeof getGraphForPGS>>(`pgs:${t}:${scopeSuffix}`);
   if (cached) return cached;
-  const result = getGraphForPGS(project);
-  await cacheSet(`pgs:${scopeSuffix}`, result, CACHE_TTL_PGS);
+  const result = getGraphForPGS(project, t);
+  await cacheSet(`pgs:${t}:${scopeSuffix}`, result, CACHE_TTL_PGS);
   return result;
 }
 
-export function getGraphForPGS(project?: string): {
+export function getGraphForPGS(project?: string, tenant: string = MASTER_TENANT): {
   nodes: Array<{ id: string; concept: string; tag: string; weight: number }>;
   edges: Array<{ source: string; target: string; weight: number }>;
 } {
@@ -237,7 +241,7 @@ export function getGraphForPGS(project?: string): {
 
   const nodes: Array<{ id: string; concept: string; tag: string; weight: number }> = [];
   getGraph().forEachNode((nodeId, attrs) => {
-    if (!isNodeVisibleToProject(nodeId, project)) return;
+    if (!isNodeVisibleToProject(nodeId, project, tenant)) return;
     const a = attrs as EntityAttrs;
     nodes.push({
       id: nodeId,
@@ -249,7 +253,7 @@ export function getGraphForPGS(project?: string): {
 
   const edges: Array<{ source: string; target: string; weight: number }> = [];
   getGraph().forEachEdge((_edge, attrs, source, target) => {
-    if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
+    if (!isNodeVisibleToProject(source, project, tenant) || !isNodeVisibleToProject(target, project, tenant)) return;
     const a = attrs as RelationshipAttrs;
     edges.push({
       source,
@@ -259,4 +263,30 @@ export function getGraphForPGS(project?: string): {
   });
 
   return { nodes, edges };
+}
+
+/**
+ * Wipe every node belonging to a tenant (LGPD elimination / demo reset).
+ * Master wipe is refused — it would drop the shared legacy graph. Returns
+ * the number of nodes dropped.
+ */
+export async function removeTenantGraph(tenant: string): Promise<number> {
+  if (!getGraph()) return 0;
+  const base = tenantBase(tenant);
+  if (!base) return 0; // master: refuse (shared legacy graph)
+  const drop: string[] = [];
+  getGraph().forEachNode((key) => {
+    const idx = key.indexOf('::');
+    const scope = idx <= 0 ? null : key.slice(0, idx);
+    if (scope === base || (scope && scope.startsWith(`${base}--`))) drop.push(key);
+  });
+  for (const key of drop) {
+    try { getGraph().dropNode(key); } catch { /* already removed */ }
+  }
+  if (drop.length > 0) {
+    await saveGraph();
+    await invalidateGraphCache();
+    console.log(`[graphrag] Removed tenant graph ${base}: ${drop.length} nodes`);
+  }
+  return drop.length;
 }

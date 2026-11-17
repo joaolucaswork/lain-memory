@@ -10,6 +10,7 @@
 import { TtlCache } from '../lib/ttl-cache.js';
 import { getManyState } from '../memory-state.js';
 import { incrementMetric } from '../mem-metrics.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import { getClient, userId } from './config.js';
 import { applyAgeDecayToResults } from './scoring.js';
 import {
@@ -60,11 +61,11 @@ export function resolveMinRecallScore(env: NodeJS.ProcessEnv = process.env): num
   return parseFloat(env.LAIN_MIN_RECALL_SCORE ?? String(DEFAULT_MIN_RECALL_SCORE)) || 0;
 }
 
-export async function searchMemory(query: string, project?: string, limit: number = 10): Promise<RankedMemory[]> {
+export async function searchMemory(query: string, project?: string, limit: number = 10, tenant: string = MASTER_TENANT): Promise<RankedMemory[]> {
   const m = getClient();
   const result = await m.search(query, {
     // v3 requires snake_case entity keys in filters (camelCase throws).
-    filters: { user_id: userId(project) },
+    filters: { user_id: userId(project, tenant) },
     topK: limit,
   });
   // Preserve timestamps from Mem0 response for age-decay scoring
@@ -151,8 +152,9 @@ export async function rankRecallResults<
 const MEM0_CACHE_TTL = 300; // 5 minutes
 const recallCache = new TtlCache<RankedMemory[]>({ maxEntries: 500 });
 
-function mem0CacheKey(query: string, project?: string): string {
-  const normalized = `${query}:${project || ''}`.toLowerCase().trim();
+function mem0CacheKey(query: string, project?: string, tenant: string = MASTER_TENANT): string {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  const normalized = `${t}:${query}:${project || ''}`.toLowerCase().trim();
   let hash = 0;
   for (let i = 0; i < normalized.length; i++) {
     hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
@@ -163,8 +165,8 @@ function mem0CacheKey(query: string, project?: string): string {
 /**
  * Search memory with in-memory cache. Cache hit: ~0.5ms vs API call: ~200-500ms.
  */
-export async function cachedSearchMemory(query: string, project?: string, limit: number = 10): Promise<RankedMemory[]> {
-  const key = mem0CacheKey(query, project);
+export async function cachedSearchMemory(query: string, project?: string, limit: number = 10, tenant: string = MASTER_TENANT): Promise<RankedMemory[]> {
+  const key = mem0CacheKey(query, project, tenant);
 
   // Try cache first
   try {
@@ -179,7 +181,7 @@ export async function cachedSearchMemory(query: string, project?: string, limit:
   incrementMetric('cacheMisses');
 
   // Cache miss — full pipeline (touch-boost, signals, archived filter, rank)
-  const withDecay = await searchMemory(query, project, limit);
+  const withDecay = await searchMemory(query, project, limit, tenant);
 
   // Touch top-3 results to boost their relevance (fire-and-forget)
   // touchMemoryTimestamp also reinforces importance score
@@ -210,11 +212,11 @@ export async function invalidateMem0Cache(project?: string): Promise<void> {
   }
 }
 
-export async function getMemories(project?: string, limit: number = 20): Promise<Array<{ id: string; memory: string; created_at?: string; updated_at?: string; metadata?: Record<string, unknown> } & MemoryFeedback>> {
+export async function getMemories(project?: string, limit: number = 20, tenant: string = MASTER_TENANT): Promise<Array<{ id: string; memory: string; created_at?: string; updated_at?: string; metadata?: Record<string, unknown> } & MemoryFeedback>> {
   const m = getClient();
   const result = await m.getAll({
     // v3 requires snake_case entity keys in filters (camelCase throws).
-    filters: { user_id: userId(project) },
+    filters: { user_id: userId(project, tenant) },
     topK: limit,
   });
   // Preserve created_at/updated_at from Mem0 response

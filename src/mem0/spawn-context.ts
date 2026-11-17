@@ -6,6 +6,7 @@
  */
 
 import { cachedSearchMemory } from './read.js';
+import { MASTER_TENANT } from '../tenants.js';
 import type { MemoryLimits } from './types.js';
 
 // ─── Progressive Context (Patch 5 → v2: dynamic char budget) ───
@@ -70,7 +71,7 @@ function buildSearchQuery(message: string, project?: string): string {
   return query.length >= 5 ? query : message;
 }
 
-export async function getContextForSpawn(message: string, project?: string, charBudget?: number, limits?: MemoryLimits): Promise<string> {
+export async function getContextForSpawn(message: string, project?: string, charBudget?: number, limits?: MemoryLimits, tenant: string = MASTER_TENANT): Promise<string> {
   // Early exit if memory is completely disabled for this tier
   if (limits && limits.globalLimit === 0 && limits.projectLimit === 0) {
     return '';
@@ -86,7 +87,7 @@ export async function getContextForSpawn(message: string, project?: string, char
   const globalMemsPromise = effectiveGlobalLimit > 0
     ? (async () => {
         try {
-          return await cachedSearchMemory(searchQuery, undefined, effectiveGlobalLimit) as { memory: string; score?: number }[];
+          return await cachedSearchMemory(searchQuery, undefined, effectiveGlobalLimit, tenant) as { memory: string; score?: number }[];
         } catch { return []; }
       })()
     : Promise.resolve([] as { memory: string; score?: number }[]);
@@ -95,7 +96,7 @@ export async function getContextForSpawn(message: string, project?: string, char
     ? (async () => {
         try {
           const t0 = Date.now();
-          const results = await cachedSearchMemory(searchQuery, project, effectiveProjectLimit) as { memory: string; score?: number }[];
+          const results = await cachedSearchMemory(searchQuery, project, effectiveProjectLimit, tenant) as { memory: string; score?: number }[];
           if (effectiveGlobalLimit === 5 && effectiveProjectLimit === 5) {
             console.log(`[recall:simple] project memories fetched in ${Date.now() - t0}ms (${results.length} results)`);
           }

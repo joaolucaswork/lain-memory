@@ -7,6 +7,8 @@
 
 import { createHash } from 'crypto';
 import { TtlCache } from '../lib/ttl-cache.js';
+import { MASTER_TENANT } from '../tenants.js';
+import { normalizeTenant } from '../tenants.js';
 import { getStats, normalizeProject } from './store.js';
 
 export const CACHE_TTL_QUERY = 300;       // 5 min for query results
@@ -42,11 +44,12 @@ export async function invalidateGraphCache(): Promise<void> {
   }
 }
 
-export async function cachedGetStats(project?: string): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
+export async function cachedGetStats(project?: string, tenant: string = MASTER_TENANT): Promise<{ nodes: number; edges: number; types: Record<string, number> }> {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
   const scopeSuffix = project ? normalizeProject(project) : '';
-  const cached = await cacheGet<{ nodes: number; edges: number; types: Record<string, number> }>(`stats:${scopeSuffix}`);
+  const cached = await cacheGet<{ nodes: number; edges: number; types: Record<string, number> }>(`stats:${t}:${scopeSuffix}`);
   if (cached) return cached;
-  const result = getStats(project);
-  await cacheSet(`stats:${scopeSuffix}`, result, CACHE_TTL_STATS);
+  const result = getStats(project, t);
+  await cacheSet(`stats:${t}:${scopeSuffix}`, result, CACHE_TTL_STATS);
   return result;
 }

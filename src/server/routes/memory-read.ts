@@ -16,12 +16,13 @@ import {
 import { getGraphSyncStatus, resolveEntities } from '../../graphrag.js';
 import { classifyMemoryAction } from '../../contradiction-detector.js';
 import { getMetrics } from '../../mem-metrics.js';
-import { json, type Handler } from '../http.js';
+import { json, tenantOf, type Handler } from '../http.js';
 
 export const handleRecall: Handler = async (data) => {
+  const tenant = tenantOf(data);
   const result = data.cached
-    ? await cachedSearchMemory(data.query, data.project, data.limit)
-    : await searchMemory(data.query, data.project, data.limit);
+    ? await cachedSearchMemory(data.query, data.project, data.limit, tenant)
+    : await searchMemory(data.query, data.project, data.limit, tenant);
   // debug:true pins the measurement contract (adjustedScore + importance
   // on every hit). RankedMemory already carries both, so the spread is a
   // no-op today — non-debug responses are byte-identical to before.
@@ -32,25 +33,27 @@ export const handleRecall: Handler = async (data) => {
 };
 
 export const handleList: Handler = async (data) => {
-  const result = await getMemories(data.project, data.limit);
+  const result = await getMemories(data.project, data.limit, tenantOf(data));
   return json(result);
 };
 
 export const handleContext: Handler = async (data) => {
   // Spawn-context composition. Keeps the
   // query-building + budget logic server-side with the ranker.
-  const result = await getContextForSpawn(data.message, data.project, data.charBudget, data.limits);
+  const result = await getContextForSpawn(data.message, data.project, data.charBudget, data.limits, tenantOf(data));
   return json({ context: result });
 };
 
 export const handleConsolidate: Handler = async (data) => {
+  // Maintenance op on the shared pending-review queue — master only.
+  if (tenantOf(data) !== 'lucas') return json({ error: 'consolidation is a maintenance op (master only)' }, 403);
   const result = await consolidateMemories(data.project);
   return json(result);
 };
 
 export const handleScan: Handler = async (data) => {
   if (!data.project) return json({ error: 'project is required for memory scan' }, 400);
-  const report = await scanAndCleanProjectMemories(data.project);
+  const report = await scanAndCleanProjectMemories(data.project, tenantOf(data));
   return json({
     total: report.total,
     deleted: report.deleted,
@@ -62,7 +65,7 @@ export const handleScan: Handler = async (data) => {
 };
 
 export const handleResolveEntities: Handler = async (data) => {
-  const result = await resolveEntities(data.threshold ?? 0.75, data.project);
+  const result = await resolveEntities(data.threshold ?? 0.75, data.project, tenantOf(data));
   return json(result);
 };
 
@@ -73,13 +76,14 @@ export const handleContradictionScan: Handler = async (data) => {
   // Paged (limit/offset) so 100x LLM no longer times out: callers
   // iterate offset += limit until scanned < limit.
   const project = data?.project as string | undefined;
+  const tenant = tenantOf(data ?? {});
   const limit = Math.min(Math.max(Number(data?.limit ?? 20) || 20, 1), 100);
   const offset = Math.max(Number(data?.offset ?? 0) || 0, 0);
-  const fetched = await getMemories(project, Math.min(offset + limit, 500));
+  const fetched = await getMemories(project, Math.min(offset + limit, 500), tenant);
   const memories = fetched.slice(offset, offset + limit);
   const results: { id: string; action: string; domainOp: string; reason: string; memory: string }[] = [];
   for (const mem of memories) {
-    const similar = await searchMemory(mem.memory, project, 5);
+    const similar = await searchMemory(mem.memory, project, 5, tenant);
     const others = similar
       .filter(s => s.id !== mem.id && (s.score ?? 0) > 0.6)
       .map(s => ({ id: s.id, memory: s.memory, score: s.score ?? 0 }));

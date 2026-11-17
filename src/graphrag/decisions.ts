@@ -15,14 +15,15 @@ import {
   upsertRelationship,
 } from './store.js';
 import { invalidateGraphCache } from './cache.js';
+import { MASTER_TENANT } from '../tenants.js';
 import type { DecisionAttrs, DecisionInput, EntityAttrs } from './types.js';
 
 // ─── Decision Framework ───
 
-export async function addDecision(decision: DecisionInput, project?: string, sourceIds?: string[]): Promise<string> {
+export async function addDecision(decision: DecisionInput, project?: string, sourceIds?: string[], tenant: string = MASTER_TENANT): Promise<string> {
   if (!ENABLED || !getGraph()) return '';
 
-  const id = scopedId(decision.name, project);
+  const id = scopedId(decision.name, project, tenant);
   const now = Date.now();
 
   const attrs: DecisionAttrs = {
@@ -49,13 +50,13 @@ export async function addDecision(decision: DecisionInput, project?: string, sou
   }
 
   // Create DECIDED_FOR edge to the chosen option
-  const chosenId = upsertEntity(decision.chosen, 'Concept', undefined, project, sourceIds);
+  const chosenId = upsertEntity(decision.chosen, 'Concept', undefined, project, sourceIds, tenant);
   upsertRelationship(id, chosenId, 'DECIDED_FOR', sourceIds);
 
   // Create DECIDED_AGAINST edges to rejected options
   for (const option of decision.options) {
     if (option !== decision.chosen) {
-      const optionId = upsertEntity(option, 'Concept', undefined, project, sourceIds);
+      const optionId = upsertEntity(option, 'Concept', undefined, project, sourceIds, tenant);
       upsertRelationship(id, optionId, 'DECIDED_AGAINST', sourceIds);
     }
   }
@@ -63,7 +64,7 @@ export async function addDecision(decision: DecisionInput, project?: string, sou
   // Link to related entities
   if (decision.relatedEntities) {
     for (const related of decision.relatedEntities) {
-      const relatedId = upsertEntity(related.name, related.type, undefined, project, sourceIds);
+      const relatedId = upsertEntity(related.name, related.type, undefined, project, sourceIds, tenant);
       upsertRelationship(id, relatedId, 'RELATED_TO', sourceIds);
     }
   }

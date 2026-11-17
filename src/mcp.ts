@@ -42,6 +42,10 @@ import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { rememberChatTurn } from './chat-extract.js';
+import { normalizeTenant, recordTenantProject, MASTER_TENANT } from './tenants.js';
+
+/** MCP tenant scope. Local stdio is single-user: master unless LAIN_TENANT is set (demo/testing). */
+const MCP_TENANT = normalizeTenant(process.env.LAIN_TENANT ?? '') || MASTER_TENANT;
 
 const TOOL_DEFINITIONS = [
   {
@@ -254,7 +258,7 @@ export function formatRememberResult(memories: RememberedRow[], project?: string
   return `Remembered${scope}:\n${summary}`;
 }
 
-async function handleTool(name: string, args: Record<string, any>): Promise<ToolResult> {
+async function handleTool(name: string, args: Record<string, any>, tenant: string = MCP_TENANT): Promise<ToolResult> {
   switch (name) {
     case 'remember': {
       if (args.mode === 'chat') {
@@ -263,7 +267,9 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
           assistant: args.assistant,
           project: args.project,
           date: args.date,
+          tenant,
         });
+        await recordTenantProject(tenant, args.project);
         if (Array.isArray(memories) && memories[0]?.id === 'noop') {
           return text('Nothing saved — no durable user facts in this turn.');
         }
@@ -277,12 +283,13 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
       if (args.mode === 'index') memOpts.skipConflictCheck = true;
       else if (args.mode === 'bundle') memOpts.bundleMode = true;
       else if (args.mode === 'raw') memOpts.inferFalse = true;
-      const memories = await addMemoryWithConflictCheck(args.text, args.project, memOpts);
+      const memories = await addMemoryWithConflictCheck(args.text, args.project, memOpts, tenant);
+      await recordTenantProject(tenant, args.project);
       return text(formatRememberResult(memories as RememberedRow[], args.project));
     }
 
     case 'recall': {
-      const memories = await searchMemory(args.query, args.project, args.limit);
+      const memories = await searchMemory(args.query, args.project, args.limit, tenant);
       if (!Array.isArray(memories) || memories.length === 0) {
         return text(`No memories found for: "${args.query}"${args.project ? ` in project ${args.project}` : ''}`);
       }
@@ -293,17 +300,33 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
     }
 
     case 'forget': {
+      const { snapshotMemories } = await import('./mem0/lifecycle.js');
+      const { getTenantProjects } = await import('./tenants.js');
+      // Scope check: the id must live in this tenant's global scope, the
+      // given project, or a known tenant project. UUIDs are unguessable,
+      // but a wrong-tenant forget must still 404 instead of deleting.
+      const scopes = new Set<string | undefined>([undefined, args.project]);
+      for (const p of await getTenantProjects(tenant)) scopes.add(p);
+      let found = false;
+      for (const scope of scopes) {
+        const [snap] = await snapshotMemories([args.memory_id], scope, 500, tenant);
+        if (snap && !snap.missing) { found = true; break; }
+      }
+      if (!found) return err(`Memory ${args.memory_id} not found in scope.`);
       await deleteMemory(args.memory_id);
       return text(`Memory ${args.memory_id} deleted.`);
     }
 
     case 'update_memory': {
-      const result = await updateMemory(args.id, args.memory, args.project);
+      const { snapshotMemories } = await import('./mem0/lifecycle.js');
+      const [snap] = await snapshotMemories([args.id], args.project, 500, tenant);
+      if (!snap || snap.missing) return err(`Memory ${args.id} not found in scope.`);
+      const result = await updateMemory(args.id, args.memory, args.project, tenant);
       return text(`Memory updated. New ID: ${result.id}`);
     }
 
     case 'list_memories': {
-      const memories = await getMemories(args.project, args.limit);
+      const memories = await getMemories(args.project, args.limit, tenant);
       if (!Array.isArray(memories) || memories.length === 0) {
         return text(`No memories stored${args.project ? ` for project ${args.project}` : ' globally'}.`);
       }
@@ -313,40 +336,41 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
 
     case 'scan_memories': {
       if (!args.project) return err('project is required for memory scan');
-      const report = await scanAndCleanProjectMemories(args.project);
+      const report = await scanAndCleanProjectMemories(args.project, tenant);
       return text(JSON.stringify(report, null, 2));
     }
 
     case 'bundle_diario': {
       const { runBundleSweep } = await import('./bundle-sweep.js');
-      const result = await runBundleSweep(args.dry_run ? { dryRun: true } : undefined);
+      const result = await runBundleSweep(args.dry_run ? { dryRun: true, tenant } : { tenant });
+      await recordTenantProject(tenant, 'diario');
       return text(JSON.stringify(result, null, 2));
     }
 
     case 'graph_query': {
-      const ctx = await graphQuery(args.query ?? '', { maxDepth: args.depth, maxNodes: args.maxNodes, project: args.project });
+      const ctx = await graphQuery(args.query ?? '', { maxDepth: args.depth, maxNodes: args.maxNodes, project: args.project, tenant });
       return text(JSON.stringify(ctx));
     }
 
     case 'graph_stats': {
-      return text(JSON.stringify(await cachedGetStats()));
+      return text(JSON.stringify(await cachedGetStats(undefined, tenant)));
     }
 
     case 'pgs_query': {
       if (!args.query) return err('query required');
-      const pgsGraph = await cachedGetGraphForPGS();
+      const pgsGraph = await cachedGetGraphForPGS(undefined, tenant);
       if (pgsGraph.nodes.length === 0) return err('Graph is empty');
       const providers = createPGSProviders();
       const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
       const result = await pgsEngine.execute(args.query, pgsGraph, {
         mode: args.mode,
-        sessionId: args.sessionId,
+        sessionId: args.sessionId ? `${tenant}:${args.sessionId}` : tenant,
       });
       return text(JSON.stringify(result, null, 2));
     }
 
     case 'pgs_stats': {
-      const pgsGraph = await cachedGetGraphForPGS();
+      const pgsGraph = await cachedGetGraphForPGS(undefined, tenant);
       const providers = createPGSProviders();
       const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
       const partitions = pgsEngine.partition(pgsGraph);
@@ -376,7 +400,9 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
           source: args.source,
           rawText: args.rawText,
           project: args.project,
+          tenant,
         });
+        await recordTenantProject(tenant, args.project);
         return text(
           JSON.stringify({
             success: true,
@@ -394,7 +420,7 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
     }
 
     case 'list_seeds': {
-      return text(JSON.stringify(listSeeds(args.project)));
+      return text(JSON.stringify(listSeeds(args.project, tenant)));
     }
 
     default:

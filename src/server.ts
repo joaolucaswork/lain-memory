@@ -58,14 +58,32 @@ import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { parseBody, validateRoute } from './http-validation.js';
+import {
+  checkSignupAllowed,
+  checkTenantRateLimit,
+  findTenantByKey,
+  MASTER_TENANT,
+  type TenantIdentity,
+} from './tenants.js';
+import { handleTenantSignup, handleTenantWipe } from './server/routes/tenant.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
 const API_KEY = process.env.LAIN_API_KEY ?? '';
 
-function unauthorized(req: Request): boolean {
+/** Open signup: no key, but strictly rate-limited per IP (anti-abuse). */
+const SIGNUP_PATH = '/api/tenant/signup';
+
+/**
+ * Bearer → tenant. Master key maps to the legacy tenant; tenant keys map
+ * via the workspace registry. Unknown keys → null (caller answers 401).
+ * Reads never throw — a corrupt store fails closed (null).
+ */
+async function tenantFromRequest(req: Request): Promise<TenantIdentity | null> {
   const h = req.headers.get('authorization') ?? '';
-  return h !== `Bearer ${API_KEY}`;
+  const m = /^Bearer (.+)$/.exec(h);
+  if (!m) return null;
+  return findTenantByKey(m[1]);
 }
 
 const GET_ROUTES = new Set([
@@ -174,6 +192,12 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/pgs/stats':
       return handlePgsStats(data);
 
+    case SIGNUP_PATH:
+      return handleTenantSignup(data);
+
+    case '/api/tenant/data':
+      return handleTenantWipe(data);
+
     case '/health':
     case '/api/health':
       return json({ ok: true, service: 'lain-memory', auth: 'bearer' });
@@ -193,14 +217,46 @@ async function boot(): Promise<void> {
   Bun.serve({
     port: PORT,
     hostname: BIND,
-    async fetch(req) {
+    async fetch(req, server) {
       const url = new URL(req.url);
-      if (unauthorized(req)) return json({ error: 'unauthorized' }, 401);
+
+      // Open signup (no key) with a strict per-IP budget. Everything else
+      // needs a known bearer (master or tenant key).
+      let tenant: TenantIdentity | null = null;
+      let clientIp = 'unknown';
+      try {
+        clientIp = server.requestIP(req)?.address ?? 'unknown';
+      } catch { /* Bun without requestIP — signup budget falls back to shared */ }
+      if (url.pathname === SIGNUP_PATH) {
+        if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
+        if (!checkSignupAllowed(clientIp)) return json({ error: 'signup rate limit exceeded — try again later' }, 429);
+      } else {
+        const found = await tenantFromRequest(req);
+        if (!found) return json({ error: 'unauthorized' }, 401);
+        tenant = found;
+        if (!checkTenantRateLimit(tenant.tenant)) {
+          return json({ error: 'tenant rate limit exceeded (60 req/min)' }, 429);
+        }
+      }
+      const withTenant = (data: Record<string, any>): Record<string, any> => {
+        data.tenant = tenant?.tenant ?? MASTER_TENANT;
+        data.clientIp = clientIp;
+        return data;
+      };
       if (req.method === 'GET' && GET_ROUTES.has(url.pathname)) {
         const validated = validateRoute(url.pathname, Object.fromEntries(url.searchParams));
         if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
         try {
-          return await route(url.pathname, validated.data);
+          return await route(url.pathname, withTenant(validated.data));
+        } catch (err) {
+          console.error(`[lain-memory] route ${url.pathname} failed:`, err);
+          return json({ error: 'internal error' }, 500);
+        }
+      }
+      // Tenant wipe is a DELETE with no body (LGPD elimination).
+      if (req.method === 'DELETE' && url.pathname === '/api/tenant/data') {
+        try {
+          return await route(url.pathname, { tenant: tenant?.tenant ?? MASTER_TENANT, clientIp });
         } catch (err) {
           console.error(`[lain-memory] route ${url.pathname} failed:`, err);
           return json({ error: 'internal error' }, 500);
@@ -212,7 +268,7 @@ async function boot(): Promise<void> {
       const validated = validateRoute(url.pathname, body.data);
       if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
       try {
-        return await route(url.pathname, validated.data);
+        return await route(url.pathname, withTenant(validated.data));
       } catch (err) {
         // Never leak internals (stacks, paths, backend messages) to callers.
         console.error(`[lain-memory] route ${url.pathname} failed:`, err);

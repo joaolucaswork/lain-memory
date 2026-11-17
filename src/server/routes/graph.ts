@@ -18,31 +18,31 @@ import {
   removeRelationships,
   runAutoclean,
 } from '../../graphrag.js';
-import { json, type Handler } from '../http.js';
+import { json, tenantOf, type Handler } from '../http.js';
 
 export const handleGraphQuery: Handler = async (data) => {
-  const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project });
+  const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project, tenant: tenantOf(data) });
   return json(ctx);
 };
 
 export const handleGraphStats: Handler = async (data) => {
-  return json(await cachedGetStats(data.project));
+  return json(await cachedGetStats(data.project, tenantOf(data)));
 };
 
 export const handleGraphNodes: Handler = async (data) => {
-  return json(listAllNodes(data.project));
+  return json(listAllNodes(data.project, tenantOf(data)));
 };
 
 export const handleGraphRemoveNodes: Handler = async (data) => {
   const ids = data.ids as string[];
   if (!ids || !Array.isArray(ids)) return json({ error: 'ids array required' }, 400);
-  return json({ removed: await removeNodes(ids, data.project) });
+  return json({ removed: await removeNodes(ids, data.project, tenantOf(data)) });
 };
 
 export const handleGraphRemoveRelationships: Handler = async (data) => {
   const { source, predicates, targets, project } = data;
   if (!source) return json({ error: 'source required' }, 400);
-  return json({ removed: await removeRelationships(source, predicates, targets, project) });
+  return json({ removed: await removeRelationships(source, predicates, targets, project, tenantOf(data)) });
 };
 
 export const handleGraphAutoclean: Handler = async (_data) => {
@@ -51,14 +51,15 @@ export const handleGraphAutoclean: Handler = async (_data) => {
 
 export const handleGraphDump: Handler = async (data) => {
   // Full graph payload for PGS sweeps running outside this server.
-  return json(await cachedGetGraphForPGS(data.project));
+  return json(await cachedGetGraphForPGS(data.project, tenantOf(data)));
 };
 
 export const handleGraphIngest: Handler = async (data) => {
   // Pre-extracted payload: applied directly (synchronous, no LLM).
   // On failure the payload is queued durably and reported (Fase 3).
+  const tenant = tenantOf(data);
   try {
-    await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds });
+    await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds, tenant });
     return json({ success: true });
   } catch (err) {
     try {
@@ -66,6 +67,7 @@ export const handleGraphIngest: Handler = async (data) => {
         entities: data.entities ?? [],
         relationships: data.relationships ?? [],
         project: data.project,
+        tenant,
         sourceIds: data.sourceIds,
       });
       return json({ success: true, queued: true });

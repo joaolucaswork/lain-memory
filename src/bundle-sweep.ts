@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { MASTER_TENANT } from './tenants.js';
 import {
   addMemory,
   getMemories,
@@ -138,6 +139,7 @@ export async function runBundleSweep(opts?: {
   dryRun?: boolean;
   now?: number;
   windowDays?: number;
+  tenant?: string;
 }): Promise<BundleSweepResult> {
   const dryRun = opts?.dryRun ?? isBundleDryRun();
   if (!isBundleEnabled()) {
@@ -151,7 +153,7 @@ export async function runBundleSweep(opts?: {
 
   let memories: BundleCandidate[];
   try {
-    memories = await getMemories(BUNDLE_PROJECT, getBundleFetchLimit());
+    memories = await getMemories(BUNDLE_PROJECT, getBundleFetchLimit(), opts?.tenant ?? MASTER_TENANT);
   } catch (err) {
     console.error('[bundle] Failed to fetch diario memories:', err);
     return { bundles: 0, skipped: 0, dryRun, details: [] };
@@ -207,7 +209,7 @@ export async function runBundleSweep(opts?: {
     skipConflictCheck: true,
     skipQualityCheck: true,
     metadata: { kind: 'bundle', bundle_of: bundleOf, non_destructive: true, run_id: runId },
-  });
+  }, opts?.tenant ?? MASTER_TENANT);
   const newId = saved[0]?.id ?? 'unknown';
   incrementMetric('bundlesCreated');
   try {

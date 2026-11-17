@@ -15,7 +15,9 @@ import {
   MAX_DEPTH,
   normalize,
   normalizeProject,
+  tenantScope,
 } from './store.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import {
   CACHE_TTL_DECISIONS,
   CACHE_TTL_QUERY,
@@ -32,7 +34,7 @@ import type {
 
 export async function query(
   queryText: string,
-  opts?: { maxDepth?: number; maxNodes?: number; project?: string }
+  opts?: { maxDepth?: number; maxNodes?: number; project?: string; tenant?: string }
 ): Promise<GraphContext> {
   if (!ENABLED || !getGraph() || getGraph().order === 0) {
     return { entities: [], relationships: [], markdown: '' };
@@ -41,7 +43,9 @@ export async function query(
   const maxDepth = opts?.maxDepth ?? MAX_DEPTH;
   const maxNodes = opts?.maxNodes ?? MAX_CONTEXT_NODES;
   const project = opts?.project;
-  const cacheKey = `query:${hashText(queryText)}:${maxDepth}:${maxNodes}:${project ? normalizeProject(project) : ''}`;
+  const tenant = normalizeTenant(opts?.tenant) || MASTER_TENANT;
+  const scopeSuffix = tenantScope(tenant, project) ?? '';
+  const cacheKey = `query:${hashText(queryText)}:${maxDepth}:${maxNodes}:${tenant}:${scopeSuffix}`;
 
   // Check cache
   const cached = await cacheGet<GraphContext>(cacheKey);
@@ -65,7 +69,7 @@ export async function query(
   const minMatches = queryWords.length > 1 ? 2 : 1;
   const matchingNodes: string[] = [];
   getGraph().forEachNode((nodeId) => {
-    if (!isNodeVisibleToProject(nodeId, project)) return;
+    if (!isNodeVisibleToProject(nodeId, project, tenant)) return;
     const matchCount = queryWords.filter(w => nodeId.includes(w)).length;
     if (matchCount >= minMatches) {
       matchingNodes.push(nodeId);
@@ -77,7 +81,7 @@ export async function query(
   if (matchingNodes.length === 0 && queryWords.length === 1) {
     const q = queryWords[0];
     getGraph().forEachNode((nodeId) => {
-      if (!isNodeVisibleToProject(nodeId, project)) return;
+      if (!isNodeVisibleToProject(nodeId, project, tenant)) return;
       if (entitySimilarity(q, nodeId) >= 0.65 || nodeId.split(' ').some(tok => entitySimilarity(q, tok) >= 0.65)) {
         matchingNodes.push(nodeId);
       }
@@ -97,11 +101,11 @@ export async function query(
 
     bfsFromNode(getGraph(), startNode, (node, _attrs, depth) => {
       if (depth > maxDepth || visited.size >= maxNodes) return true;
-      if (!isNodeVisibleToProject(node, project)) return true;
+      if (!isNodeVisibleToProject(node, project, tenant)) return true;
       visited.add(node);
 
       getGraph().forEachOutEdge(node, (_edge, attrs, source, target) => {
-        if (!isNodeVisibleToProject(source, project) || !isNodeVisibleToProject(target, project)) return;
+        if (!isNodeVisibleToProject(source, project, tenant) || !isNodeVisibleToProject(target, project, tenant)) return;
         const relAttrs = attrs as RelationshipAttrs;
         contextEdges.push({
           source,
@@ -176,10 +180,11 @@ function toMarkdown(ctx: GraphContext): string {
   return lines.join('\n');
 }
 
-export async function queryDecisions(context: string, project?: string): Promise<Array<DecisionAttrs & { id: string }>> {
+export async function queryDecisions(context: string, project?: string, tenant: string = MASTER_TENANT): Promise<Array<DecisionAttrs & { id: string }>> {
   if (!ENABLED || !getGraph() || getGraph().order === 0) return [];
 
-  const cacheKey = `decisions:${hashText(context)}:${project ? normalizeProject(project) : ''}`;
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  const cacheKey = `decisions:${hashText(context)}:${t}:${project ? normalizeProject(project) : ''}`;
   const cached = await cacheGet<Array<DecisionAttrs & { id: string }>>(cacheKey);
   if (cached) return cached;
 
@@ -189,7 +194,7 @@ export async function queryDecisions(context: string, project?: string): Promise
   const decisions: Array<DecisionAttrs & { id: string; relevance: number }> = [];
 
   getGraph().forEachNode((nodeId, attrs) => {
-    if (!isNodeVisibleToProject(nodeId, project)) return;
+    if (!isNodeVisibleToProject(nodeId, project, t)) return;
     const a = attrs as EntityAttrs;
     if (a.type !== 'Decision') return;
 
@@ -212,7 +217,7 @@ export async function queryDecisions(context: string, project?: string): Promise
 
     // Also check connected entities
     getGraph().forEachOutNeighbor(nodeId, (neighbor) => {
-      if (!isNodeVisibleToProject(neighbor, project)) return;
+      if (!isNodeVisibleToProject(neighbor, project, t)) return;
       if (contextWords.some(w => neighbor.includes(w))) relevance += 0.5;
     });
 

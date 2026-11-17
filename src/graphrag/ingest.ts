@@ -23,11 +23,13 @@ import {
 } from './extract.js';
 import { addDecision } from './decisions.js';
 import type { EntityType, GraphIngestOpts } from './types.js';
+import { MASTER_TENANT } from '../tenants.js';
 
 // ─── Public API ───
 
 export async function ingest(text: string, project?: string, opts?: GraphIngestOpts): Promise<{ entities: number; relationships: number }> {
   if (!ENABLED || !getGraph()) return { entities: 0, relationships: 0 };
+  const tenant = opts?.tenant ?? MASTER_TENANT;
 
   try {
     const result = await extractEntities(text);
@@ -35,15 +37,15 @@ export async function ingest(text: string, project?: string, opts?: GraphIngestO
 
     for (const entity of result.entities) {
       if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-      upsertEntity(entity.name, entity.type, entity.description, project, sourceIds);
+      upsertEntity(entity.name, entity.type, entity.description, project, sourceIds, tenant);
     }
 
     for (const rel of result.relationships) {
       if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
-      const sourceId = scopedId(rel.subject, project);
-      const targetId = scopedId(rel.object, project);
-      if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
-      if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+      const sourceId = scopedId(rel.subject, project, tenant);
+      const targetId = scopedId(rel.object, project, tenant);
+      if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds, tenant);
+      if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds, tenant);
       upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
     }
 
@@ -55,7 +57,7 @@ export async function ingest(text: string, project?: string, opts?: GraphIngestO
     if (containsDecisionLanguage(text)) {
       extractDecision(text).then(decision => {
         if (decision) {
-          addDecision(decision, project, sourceIds).catch(err =>
+          addDecision(decision, project, sourceIds, tenant).catch(err =>
             console.error('[graphrag] Auto-decision extraction error:', err)
           );
         }
@@ -79,18 +81,19 @@ export async function ingestExtracted(
 ): Promise<void> {
   if (!ENABLED || !getGraph()) return;
   const sourceIds = opts?.sourceIds;
+  const tenant = opts?.tenant ?? MASTER_TENANT;
 
   for (const entity of entities) {
     if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
-    upsertEntity(entity.name, entity.type as EntityType, entity.description, project, sourceIds);
+    upsertEntity(entity.name, entity.type as EntityType, entity.description, project, sourceIds, tenant);
   }
 
   for (const rel of relationships) {
     if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
-    const sourceId = scopedId(rel.subject, project);
-    const targetId = scopedId(rel.object, project);
-    if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds);
-    if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds);
+    const sourceId = scopedId(rel.subject, project, tenant);
+    const targetId = scopedId(rel.object, project, tenant);
+    if (!getGraph().hasNode(sourceId)) upsertEntity(rel.subject, 'Other', undefined, project, sourceIds, tenant);
+    if (!getGraph().hasNode(targetId)) upsertEntity(rel.object, 'Other', undefined, project, sourceIds, tenant);
     upsertRelationship(sourceId, targetId, rel.predicate, sourceIds);
   }
 

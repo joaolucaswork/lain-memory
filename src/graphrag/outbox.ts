@@ -8,7 +8,7 @@
  */
 
 import path from 'path';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { KNOWLEDGE_DIR } from '../workspace.js';
 import { withDistributedLock } from '../distributed-lock.js';
@@ -103,6 +103,7 @@ export function appendGraphOutbox(entry: Omit<GraphOutboxEntry, 'id' | 'ts' | 'a
     ts: Date.now(),
     attempts: entry.attempts ?? 0,
     ...(entry.project ? { project: entry.project } : {}),
+    ...(entry.tenant ? { tenant: entry.tenant } : {}),
     ...(entry.sourceIds ? { sourceIds: entry.sourceIds } : {}),
     ...(entry.text ? { text: entry.text } : {}),
     ...(entry.entities ? { entities: entry.entities } : {}),
@@ -134,10 +135,10 @@ async function applyOutboxEntry(
     return;
   }
   if (entry.text !== undefined) {
-    await ingest(entry.text, entry.project, { sourceIds: entry.sourceIds });
+    await ingest(entry.text, entry.project, { sourceIds: entry.sourceIds, tenant: entry.tenant });
     return;
   }
-  await ingestExtracted(entry.entities ?? [], entry.relationships ?? [], entry.project, { sourceIds: entry.sourceIds });
+  await ingestExtracted(entry.entities ?? [], entry.relationships ?? [], entry.project, { sourceIds: entry.sourceIds, tenant: entry.tenant });
 }
 
 /**
@@ -215,6 +216,31 @@ export async function drainGraphOutbox(
   return { processed, failed, deadLettered, pending: survivors.length, quarantined };
 }
 
+/**
+ * Drop queued (not yet drained) outbox entries for a tenant (wipe flow).
+ * Prevents a post-wipe drain from re-ingesting the tenant's graph nodes.
+ * Best-effort: entries already claimed by an in-flight drain still apply —
+ * a second wipe right after clears those (drain takes seconds).
+ */
+export function purgeTenantOutbox(tenant: string): number {
+  const file = outboxPath();
+  let entries: GraphOutboxEntry[];
+  try {
+    entries = readOutboxFile(file).entries;
+  } catch {
+    return 0;
+  }
+  const keep = entries.filter(e => e.tenant !== tenant);
+  if (keep.length === entries.length) return 0;
+  try {
+    writeFileSync(file, keep.map(e => JSON.stringify(e)).join('\n') + (keep.length > 0 ? '\n' : ''), 'utf8');
+  } catch (err) {
+    console.error('[graphrag] Tenant outbox purge failed:', err instanceof Error ? err.message : err);
+    return 0;
+  }
+  return entries.length - keep.length;
+}
+
 function triggerOutboxDrain(): void {
   if (drainInFlight) return;
   drainInFlight = withDistributedLock('graphrag:outbox-drain', 120_000, async () => {
@@ -233,10 +259,10 @@ function triggerOutboxDrain(): void {
  * background drain. Never throws — write-path latency is unchanged and a
  * graph failure never fails the memory save (Mem0 is source of truth).
  */
-export function queueGraphIngest(text: string, project?: string, sourceIds?: string[]): void {
+export function queueGraphIngest(text: string, project?: string, sourceIds?: string[], tenant?: string): void {
   if (!ENABLED || !getGraph()) return;
   try {
-    appendGraphOutbox({ text, project, sourceIds });
+    appendGraphOutbox({ text, project, sourceIds, tenant });
   } catch (err) {
     lastSyncError = err instanceof Error ? err.message : String(err);
     incrementMetric('graphIngestErrors');
@@ -251,11 +277,12 @@ export function queueGraphIngestExtracted(
   entities: Array<{ name: string; type: string; description: string }>,
   relationships: Array<{ subject: string; predicate: string; object: string }>,
   project?: string,
-  sourceIds?: string[]
+  sourceIds?: string[],
+  tenant?: string
 ): void {
   if (!ENABLED || !getGraph()) return;
   try {
-    appendGraphOutbox({ entities, relationships, project, sourceIds });
+    appendGraphOutbox({ entities, relationships, project, sourceIds, tenant });
   } catch (err) {
     lastSyncError = err instanceof Error ? err.message : String(err);
     incrementMetric('graphIngestErrors');

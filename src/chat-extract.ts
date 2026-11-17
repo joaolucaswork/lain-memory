@@ -41,6 +41,8 @@ export interface ChatTurnInput {
   project?: string;
   /** Calendar day of the turn, YYYY-MM-DD. Context for the extractor only. */
   date?: string;
+  /** Tenant scope. Master (`lucas`) reproduces the legacy shape. */
+  tenant?: string;
 }
 
 export interface ChatFact {
@@ -441,7 +443,7 @@ export async function rememberChatTurn(
         // Origin record: how the extractor rated this fact.
         ...(rating ? { chat_relevance: rating.relevance, chat_kind: rating.kind, chat_sensitive: rating.sensitive } : {}),
       },
-    });
+    }, input.tenant);
     // Persist the title as feedback metadata (merge — never touches the
     // verbatim body). Best-effort: a title failure never fails the save.
     if (title) {

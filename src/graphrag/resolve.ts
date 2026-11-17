@@ -10,12 +10,14 @@ import {
   ENABLED,
   entitySimilarity,
   getGraph,
+  isNodeVisibleToProject,
   mergeSources,
   nodeProject,
   normalizeProject,
   relationshipKey,
   saveGraph,
 } from './store.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import { invalidateGraphCache } from './cache.js';
 import type { EntityAttrs, RelationshipAttrs } from './types.js';
 
@@ -28,9 +30,10 @@ import type { EntityAttrs, RelationshipAttrs } from './types.js';
  * - Transfers edges from duplicates to canonical entity
  * Returns number of entities merged.
  */
-export async function resolveEntities(threshold = 0.75, project?: string): Promise<{ merged: number; pairs: string[][] }> {
+export async function resolveEntities(threshold = 0.75, project?: string, tenant: string = MASTER_TENANT): Promise<{ merged: number; pairs: string[][] }> {
   if (!ENABLED || !getGraph() || getGraph().order < 2) return { merged: 0, pairs: [] };
 
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
   const onlyScope = project ? normalizeProject(project) : undefined;
 
   const nodes = getGraph().mapNodes((key, attrs) => ({
@@ -40,10 +43,12 @@ export async function resolveEntities(threshold = 0.75, project?: string): Promi
 
   // Group by scope + type: never merge across scopes (Fase 2).
   // A project-scoped sweep only touches that project's group.
+  // Tenant filter first: a tenant only ever sees (and merges) its own nodes.
   const byType = new Map<string, typeof nodes>();
   for (const node of nodes) {
+    if (!isNodeVisibleToProject(node.key, project, t)) continue;
     const scope = nodeProject(node.key) ?? '';
-    if (onlyScope && scope !== onlyScope) continue;
+    if (onlyScope && t === MASTER_TENANT && scope !== onlyScope) continue;
     const type = node.attrs.type || 'Other';
     const groupKey = `${scope}\0${type}`;
     const group = byType.get(groupKey) || [];

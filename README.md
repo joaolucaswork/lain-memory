@@ -301,6 +301,39 @@ curl -s localhost:3341/api/memory/recall -X POST -H 'Content-Type: application/j
 
 Entity scheme: `lucas` → global facts, `lucas:<project>` → project-scoped.
 
+### Multitenant (MVP demo)
+
+Tenant = namespace, not a new collection. The bearer key resolves the tenant:
+master `LAIN_API_KEY` → `lucas` (legacy data byte-identical), per-tenant keys
+(`lm_…`, stored hashed in `$WORKSPACE/tenants.json`, mode `0600`) →
+`<tenant>` / `<tenant>:<project>`.
+
+| Path | Auth | Body | Description |
+|------|------|------|-------------|
+| `POST /api/tenant/signup` | none (10/hour per IP) | `{ name }` (1–40 chars) | Creates `{ tenant, apiKey }`. Names slugify (`João` → `joao`); `lucas`/`admin`/`trash`/`global` reserved; duplicates → `409` |
+| `POST` or `DELETE /api/tenant/data` | tenant key | — | LGPD wipe: every memory scope + trash, tenant graph nodes, queued graph outbox entries, tenant blocklist, project registry. Master → `403` (use forget/scan for lucas data) |
+
+Budgets per tenant: **60 req/min** (`429` past it), **500 memories per scope**
+(global or project) on the write path (`429` past it, wipe to start over).
+Caches (recall, graph stats/query/PGS), the graph node scheme
+(`tn-<slug>` / `tn-<slug>--<project>::name`), the forget-blocklist (one file
+per tenant) and seeds are all tenant-scoped. Master unscoped reads keep the
+legacy admin behavior (everything, including tenant nodes).
+
+Not tenant-scoped (documented MVP limits): the pending-review queue and
+`consolidate` (master only — `403` for tenants), background sweeps
+(reaper/dedup/bundle timer run on the master scope), metrics counters,
+`graph/autoclean` pattern hygiene (content-based, drops only).
+
+```bash
+# demo flow
+S=$(curl -s api.lainmemo.dev/api/tenant/signup -X POST -H 'Content-Type: application/json' -d '{"name":"Ana"}')
+KEY=$(echo "$S" | python3 -c 'import json,sys; print(json.load(sys.stdin)["apiKey"])')
+curl -s api.lainmemo.dev/api/memory/remember -X POST -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"text":"Ana prefere café forte","mode":"raw"}'
+curl -s api.lainmemo.dev/api/tenant/data -X DELETE -H "Authorization: Bearer $KEY"
+```
+
 ### Delete audit trail (trash + log)
 
 Every automated delete (conflict-check supersede, consolidation, contradiction-scan)

@@ -17,6 +17,7 @@ import {
 } from '../memory-state.js';
 import { removeFromBlocklist } from '../forget-blocklist.js';
 import type { PolicyAuditRecord } from '../memory-policy.js';
+import { MASTER_TENANT } from '../tenants.js';
 import { getClient } from './config.js';
 import { scoreMemoryQuality } from './scoring.js';
 import {
@@ -48,6 +49,7 @@ import type {
 export async function deleteMemoriesWithPolicy(input: {
   ids: string[];
   project?: string;
+  tenant?: string;
   reason: string;
   trigger: string;
   replacedById?: string;
@@ -72,8 +74,8 @@ export async function deleteMemoriesWithPolicy(input: {
   const report = await applyDeletionPolicy(
     { ...input, op: 'archive' },
     {
-      snapshot: ids => snapshotMemories(ids, input.project),
-      trashAndDelete: (snap, fromProject, provenance) => trashAndDelete(snap, fromProject, provenance),
+      snapshot: ids => snapshotMemories(ids, input.project, 100, input.tenant),
+      trashAndDelete: (snap, fromProject, provenance) => trashAndDelete(snap, fromProject, provenance, input.tenant),
       audit: record => logMaintenance('memory_policy_delete', { ...record }),
     }
   );
@@ -93,12 +95,12 @@ export async function deleteMemoriesWithPolicy(input: {
  *   - Archived items land in the trash scope with provenance + audit trail
  *   - Returns a report of what was archived
  */
-export async function scanAndCleanProjectMemories(project: string): Promise<{
+export async function scanAndCleanProjectMemories(project: string, tenant: string = MASTER_TENANT): Promise<{
   total: number;
   deleted: number;
   deletedItems: { id: string; memory: string; daysOld: number }[];
 }> {
-  const memories = await getMemories(project, 200);
+  const memories = await getMemories(project, 200, tenant);
 
   // Collect hygiene candidates first; the policy archives them as one batch.
   const candidates = new Map<string, { memory: string; daysOld: number; quality: number }>();
@@ -117,6 +119,7 @@ export async function scanAndCleanProjectMemories(project: string): Promise<{
     const report = await deleteMemoriesWithPolicy({
       ids: [...candidates.keys()],
       project,
+      tenant,
       reason: 'stale low-quality memory (90+ days old, quality < 3)',
       trigger: 'memory_scan',
     });
@@ -162,9 +165,9 @@ export const TRASH_PROJECT = 'trash';
 
 /** Fetch full texts for ids BEFORE deleting. Never throws — returns
  * `{id, missing:true}` entries for anything unfetchable. */
-export async function snapshotMemories(ids: string[], project?: string, limit = 100): Promise<MemorySnapshot[]> {
+export async function snapshotMemories(ids: string[], project?: string, limit = 100, tenant: string = MASTER_TENANT): Promise<MemorySnapshot[]> {
   try {
-    const all = await getMemories(project, limit);
+    const all = await getMemories(project, limit, tenant);
     const byId = new Map(all.map(m => [m.id, m]));
     return ids.map(id => {
       const found = byId.get(id);
@@ -189,6 +192,7 @@ export async function trashAndDelete(
   snapshot: MemorySnapshot,
   fromProject: string | undefined,
   provenance: TrashProvenance,
+  tenant: string = MASTER_TENANT,
 ): Promise<{ trashId: string | null; deleted: boolean }> {
   if (!snapshot.missing && snapshot.memory) {
     // Snapshot user state BEFORE deleting — the Qdrant payload (and its
@@ -220,7 +224,7 @@ export async function trashAndDelete(
           ...(stateSnapshot ? { [STATE_SNAPSHOT_KEY]: stateSnapshot } : {}),
           trashed_at: new Date().toISOString(),
         },
-      });
+      }, tenant);
       trashId = saved[0]?.id ?? null;
     } catch (err) {
       console.error(`[mem0] trash copy failed for ${snapshot.id} — original preserved:`, err instanceof Error ? err.message : err);
@@ -249,10 +253,10 @@ export const RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
  * trash copy, and lift the blocklist entry. FAIL-CLOSED: the trash copy is
  * deleted only after the re-save is confirmed.
  */
-export async function restoreFromTrash(trashId: string, expectedProject?: string): Promise<RestoreResult> {
+export async function restoreFromTrash(trashId: string, expectedProject?: string, tenant: string = MASTER_TENANT): Promise<RestoreResult> {
   let found;
   try {
-    const all = await getMemories(TRASH_PROJECT, 500);
+    const all = await getMemories(TRASH_PROJECT, 500, tenant);
     found = all.find(m => m.id === trashId);
   } catch (err) {
     console.error('[mem0] restore failed (trash unreadable):', err instanceof Error ? err.message : err);
@@ -279,7 +283,7 @@ export async function restoreFromTrash(trashId: string, expectedProject?: string
       skipQualityCheck: true,
       skipConflictCheck: true,
       skipBlocklistCheck: true, // restoring a forget — text is blocklisted until lifted below
-    });
+    }, tenant);
     savedId = saved[0]?.id ?? null;
   } catch (err) {
     console.error(`[mem0] restore re-save failed for ${trashId} — trash preserved:`, err instanceof Error ? err.message : err);
@@ -315,14 +319,14 @@ export async function restoreFromTrash(trashId: string, expectedProject?: string
   // Evict the trash copy's leftovers (L2). Best-effort.
   await stateDeleteState(trashId).catch((err) =>
     console.error(`[mem0] post-restore state cleanup failed for ${trashId}:`, err instanceof Error ? err.message : err));
-  await removeFromBlocklist(found.memory);
+  await removeFromBlocklist(found.memory, tenant);
   return { id: savedId, restored: true };
 }
 
 // C3: Update an existing memory by ID. Uses Mem0 SDK native update.
 // OSS Memory.update(id, string) takes a plain string and returns { message: string }.
 // ID is preserved (in-place update). No conflict check — caller asserts intentional replacement.
-export async function updateMemory(memoryId: string, newText: string, project?: string): Promise<{ id: string; memory: string }> {
+export async function updateMemory(memoryId: string, newText: string, project?: string, tenant: string = MASTER_TENANT): Promise<{ id: string; memory: string }> {
   const m = getClient();
   await m.update(memoryId, newText);
   invalidateMem0Cache(project).catch(() => {});
@@ -330,7 +334,7 @@ export async function updateMemory(memoryId: string, newText: string, project?: 
   // then re-ingest the new text with the same memory ID as provenance.
   try {
     await graphrag.removeGraphProvenance(memoryId);
-    graphrag.queueGraphIngest(newText, project, [memoryId]);
+    graphrag.queueGraphIngest(newText, project, [memoryId], tenant);
   } catch (err) {
     console.error('[mem0] graph re-ingest after update failed:', err instanceof Error ? err.message : err);
   }

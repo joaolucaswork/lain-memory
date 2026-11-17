@@ -14,6 +14,7 @@ import { addMemoryWithConflictCheck } from './mem0.js';
 import { scoreActionability, scoreFactQuality } from './memory-patterns.js';
 import { isGraphEnabled, ingestExtracted, appendGraphOutbox } from './graphrag.js';
 import { SEEDS_DIR } from './workspace.js';
+import { MASTER_TENANT } from './tenants.js';
 import { safeWriteFileSync } from './file-io-lock.js';
 const ENABLED = process.env.LAIN_SEED_ENABLED !== 'false';
 const MAX_CHUNKS = parseInt(process.env.LAIN_SEED_MAX_CHUNKS || '10', 10);
@@ -56,6 +57,8 @@ export interface SeedInput {
   language?: string;
   /** Force re-extraction even if source was already extracted. Bypasses source dedup check. */
   force?: boolean;
+  /** Tenant scope. Master (`lucas`) reproduces the legacy shape. */
+  tenant?: string;
 }
 
 interface ExtractedEntity {
@@ -84,6 +87,8 @@ export interface SeedOutput {
   processedAt: number;
   project?: string;
   memoryIds: string[];
+  /** Tenant that owns this seed (absent = legacy master seed). */
+  tenant?: string;
 }
 
 const SeedOutputSchema: z.ZodType<SeedOutput> = z.object({
@@ -100,6 +105,7 @@ const SeedOutputSchema: z.ZodType<SeedOutput> = z.object({
   processedAt: z.number(),
   project: z.string().optional(),
   memoryIds: z.array(z.string()),
+  tenant: z.string().optional(),
 });
 
 function parseSeedFile(raw: string): SeedOutput | null {
@@ -316,11 +322,11 @@ async function mergeChunkResults(results: ChunkResult[]): Promise<{
 
 // ─── Storage ───
 
-async function storeSeedResults(output: SeedOutput, project?: string): Promise<string[]> {
+async function storeSeedResults(output: SeedOutput, project?: string, tenant?: string): Promise<string[]> {
   const memoryIds: string[] = [];
 
   try {
-    const results = await addMemoryWithConflictCheck(`[Seed: ${output.title}] ${output.summary}`, project, { skipQualityCheck: true });
+    const results = await addMemoryWithConflictCheck(`[Seed: ${output.title}] ${output.summary}`, project, { skipQualityCheck: true }, tenant);
     if (Array.isArray(results) && results[0]?.id) memoryIds.push(results[0].id);
   } catch (err) {
     console.error('[seed] Failed to save summary:', err);
@@ -336,7 +342,7 @@ async function storeSeedResults(output: SeedOutput, project?: string): Promise<s
   for (let i = 0; i < factsToSave.length; i += BATCH_SIZE) {
     const batch = factsToSave.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.allSettled(
-      batch.map(fact => addMemoryWithConflictCheck(`[Seed: ${output.title}] ${fact}`, project, { skipQualityCheck: true }))
+      batch.map(fact => addMemoryWithConflictCheck(`[Seed: ${output.title}] ${fact}`, project, { skipQualityCheck: true }, tenant))
     );
     for (const res of batchResults) {
       if (res.status === 'fulfilled' && Array.isArray(res.value) && res.value[0]?.id) {
@@ -349,11 +355,11 @@ async function storeSeedResults(output: SeedOutput, project?: string): Promise<s
 
   if (isGraphEnabled()) {
     try {
-      await ingestExtracted(output.entities, output.relationships, project, { sourceIds: memoryIds });
+      await ingestExtracted(output.entities, output.relationships, project, { sourceIds: memoryIds, tenant });
     } catch (err) {
       console.error('[seed] GraphRAG ingestion error, queued for reconcile:', err);
       try {
-        appendGraphOutbox({ entities: output.entities, relationships: output.relationships, project, sourceIds: memoryIds });
+        appendGraphOutbox({ entities: output.entities, relationships: output.relationships, project, tenant, sourceIds: memoryIds });
       } catch {
         console.error('[seed] GraphRAG outbox append failed — seed facts Mem0-only');
       }
@@ -382,7 +388,7 @@ export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
 
   // Source-level dedup: return existing seed if same source was already extracted
   if (!input.force) {
-    const existing = listSeeds(input.project)
+    const existing = listSeeds(input.project, input.tenant)
       .find(s => s.source === input.source);
     if (existing) {
       console.log(`[seed] Dedup hit — source already extracted as ${existing.id}, returning existing seed`);
@@ -442,10 +448,11 @@ export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
     wordCount,
     processedAt: Date.now(),
     project: input.project,
+    tenant: input.tenant,
     memoryIds: [],
   };
 
-  output.memoryIds = await storeSeedResults(output, input.project);
+  output.memoryIds = await storeSeedResults(output, input.project, input.tenant);
 
   ensureSeedsDir();
   const seedPath = path.join(SEEDS_DIR, `${seedId}.json`);
@@ -455,13 +462,21 @@ export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
   return output;
 }
 
-export function listSeeds(project?: string): SeedOutput[] {
+export function listSeeds(project?: string, tenant?: string): SeedOutput[] {
   ensureSeedsDir();
   const files = readdirSync(SEEDS_DIR).filter(f => f.endsWith('.json'));
   const seeds: SeedOutput[] = [];
   for (const file of files) {
     try {
       const seed = parseSeedFile(readFileSync(path.join(SEEDS_DIR, file), 'utf-8'));
+      // Legacy seeds carry no tenant → visible only to the master tenant.
+      // Tenant seeds are visible only to their owner.
+      const seedTenant = seed?.tenant;
+      if (tenant !== undefined && tenant !== MASTER_TENANT) {
+        if (seedTenant !== tenant) continue;
+      } else if (seedTenant !== undefined) {
+        continue;
+      }
       if (seed && (!project || seed.project === project)) {
         seeds.push(seed);
       }

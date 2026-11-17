@@ -14,6 +14,7 @@ import { existsSync, mkdirSync } from 'fs';
 import { KNOWLEDGE_DIR, INSTANCE_ID } from '../workspace.js';
 import { getConfig } from '../config.js';
 import { withDistributedLock } from '../distributed-lock.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import type {
   EntityAttrs,
   EntityType,
@@ -63,15 +64,40 @@ export function normalize(name: string): string {
 
 export const SCOPE_SEPARATOR = '::';
 
+/**
+ * Tenant scope prefix. Master (`lucas`) has none — its nodes keep the legacy
+ * `project::name` / bare shape byte-identical. Every other tenant gets
+ * `tn-<slug>` so its nodes can never collide with (or leak into) another
+ * scope. The `tn-` prefix is reserved: a lucas project literally named
+ * `tn-...` would share that scope (documented, no such project exists).
+ */
+export function tenantBase(tenant: string | undefined): string | null {
+  const t = normalizeTenant(tenant ?? MASTER_TENANT) || MASTER_TENANT;
+  if (t === MASTER_TENANT) return null;
+  return `tn-${t}`;
+}
+
+/**
+ * Combined scope for a (tenant, project) pair. Master reproduces the legacy
+ * scheme (`project` or undefined); other tenants get `tn-<slug>` (global) or
+ * `tn-<slug>--<project>` (project-local). The `--` join keeps the scope a
+ * single `::`-free segment, so nodeProject() keeps working unchanged.
+ */
+export function tenantScope(tenant: string | undefined, project?: string): string | undefined {
+  const base = tenantBase(tenant);
+  if (!base) return project ? normalizeProject(project) : undefined;
+  if (!project) return base;
+  return `${base}--${normalizeProject(project)}`;
+}
+
 export function normalizeProject(project: string): string {
   return normalize(project).replace(/\s+/g, '-');
 }
 
 /** Scoped node id. Preserves already-qualified ids (idempotent). */
-export function scopedId(name: string, project?: string): string {
+export function scopedId(name: string, project?: string, tenant: string = MASTER_TENANT): string {
   const normalized = normalize(name);
-  if (!project) return normalized;
-  const scope = normalizeProject(project);
+  const scope = tenantScope(tenant, project);
   if (!scope) return normalized;
   if (normalized.startsWith(`${scope}${SCOPE_SEPARATOR}`)) return normalized;
   return `${scope}${SCOPE_SEPARATOR}${normalized}`;
@@ -86,29 +112,37 @@ export function nodeProject(id: string): string | undefined {
 
 /**
  * Visibility rule (explicit contract — Opção 2: compatibilidade documentada).
- * - Scoped read (project P): global nodes + P's local nodes. Never another
- *   project's locals.
- * - Unscoped read (no project): EVERYTHING (legacy/admin behavior, NOT
- *   global-only). Pre-scope consumers keep seeing the same data as before.
- *   Restricted to trusted consumers — do not expose unscoped reads to
- *   untrusted multi-user clients.
- * - Explicit all-projects read (project '*'): same as unscoped. Prefer this
- *   over omitting the parameter when you mean "all projects" — it declares
- *   intent and survives the future multi-user flip (unscoped reads will
- *   become global-only; '*' will keep meaning all).
+ * - Scoped read (project P) as master: global nodes + P's local nodes. Never
+ *   another project's locals — and never another tenant's nodes (their
+ *   `tn-...` scopes never equal a project name; the `tn-` prefix is reserved).
+ * - Unscoped read (no project) as master: EVERYTHING (legacy/admin behavior).
+ * - Non-master tenant T: only `tn-T` nodes (its global `tn-T` + its
+ *   `tn-T--P` project nodes when P is given). Legacy bare globals are
+ *   lucas's data — invisible. Boundary-checked (`tn-T` + `--`), so tenant
+ *   `ana` never sees tenant `ana2`'s nodes.
+ * - Explicit all-projects read (project '*'): same as unscoped for that tenant.
  */
-export function isNodeVisibleToProject(id: string, project?: string): boolean {
-  if (!project || project === '*') return true;
+export function isNodeVisibleToProject(id: string, project?: string, tenant: string = MASTER_TENANT): boolean {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  if (t === MASTER_TENANT) {
+    if (!project || project === '*') return true;
+    const scope = nodeProject(id);
+    if (!scope) return true;
+    return scope === normalizeProject(project);
+  }
   const scope = nodeProject(id);
-  if (!scope) return true;
-  return scope === normalizeProject(project);
+  const base = `tn-${t}`;
+  if (!scope) return false;
+  if (scope !== base && !scope.startsWith(`${base}--`)) return false;
+  if (!project || project === '*') return true;
+  return scope === base || scope === `${base}--${normalizeProject(project)}`;
 }
 
 /** Resolve user input (bare or qualified) to a stored node id. */
-export function resolveNodeId(input: string, project?: string): string {
+export function resolveNodeId(input: string, project?: string, tenant: string = MASTER_TENANT): string {
   const normalized = normalize(input);
   if (normalized.includes(SCOPE_SEPARATOR)) return normalized;
-  return scopedId(normalized, project);
+  return scopedId(normalized, project, tenant);
 }
 
 /**
@@ -202,27 +236,27 @@ export function isGraphEnabled(): boolean {
   return ENABLED;
 }
 
-export function getStats(project?: string): { nodes: number; edges: number; types: Record<string, number> } {
+export function getStats(project?: string, tenant: string = MASTER_TENANT): { nodes: number; edges: number; types: Record<string, number> } {
   if (!graph) return { nodes: 0, edges: 0, types: {} };
   const types: Record<string, number> = {};
   let nodes = 0;
   graph.forEachNode((key, attrs) => {
-    if (!isNodeVisibleToProject(key, project)) return;
+    if (!isNodeVisibleToProject(key, project, tenant)) return;
     nodes++;
     const t = (attrs as EntityAttrs).type || 'Other';
     types[t] = (types[t] || 0) + 1;
   });
   let edges = 0;
   graph.forEachEdge((_edge, _attrs, source, target) => {
-    if (isNodeVisibleToProject(source, project) && isNodeVisibleToProject(target, project)) edges++;
+    if (isNodeVisibleToProject(source, project, tenant) && isNodeVisibleToProject(target, project, tenant)) edges++;
   });
   return { nodes, edges, types };
 }
 
 // ─── Primitive upserts (graph ops — no LLM, no I/O) ───
 
-export function upsertEntity(name: string, type: EntityType, description?: string, project?: string, sourceIds?: string[]): string {
-  const id = scopedId(name, project);
+export function upsertEntity(name: string, type: EntityType, description?: string, project?: string, sourceIds?: string[], tenant: string = MASTER_TENANT): string {
+  const id = scopedId(name, project, tenant);
   const now = Date.now();
 
   if (graph.hasNode(id)) {

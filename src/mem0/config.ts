@@ -9,6 +9,7 @@
 
 import { Memory, OpenAIEmbedder, OpenAILLM } from 'mem0ai/oss';
 import { INSTANCE_ID } from '../workspace.js';
+import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 
 let client: Memory | null = null;
 
@@ -193,10 +194,13 @@ export function getClient(): Memory {
   return client;
 }
 
-export function userId(project?: string): string {
+export function userId(project?: string, tenant: string = MASTER_TENANT): string {
   // mem0 rejeita user_id com whitespace — sanitiza para projetos com espaço (ex "lain::latency fixes").
+  // Multitenant: o tenant prefixa o user_id (`<tenant>` / `<tenant>:<projeto>`).
+  // Master (`lucas`) reproduz o esquema legado byte-identical: `lucas[:projeto].
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
   const clean = project?.trim().replace(/\s+/g, '_');
-  return clean ? `lucas:${clean}` : 'lucas';
+  return clean ? `${t}:${clean}` : t;
 }
 
 export function isMem0Configured(): boolean {

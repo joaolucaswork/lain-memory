@@ -12,6 +12,7 @@ import * as graphrag from '../graphrag.js';
 import { incrementMetric } from '../mem-metrics.js';
 import { classifyMemoryAction } from '../contradiction-detector.js';
 import { isBlocklisted } from '../forget-blocklist.js';
+import { MASTER_TENANT } from '../tenants.js';
 import { getClient, userId, withRetry } from './config.js';
 import {
   acceptEnrichedMemory,
@@ -34,27 +35,29 @@ import type {
 
 /** Lifecycle helpers (M7). Lazy so write.ts never statically imports back. */
 async function lifecycleHelpers(): Promise<{
-  snapshotMemories: (ids: string[], project?: string, limit?: number) => Promise<MemorySnapshot[]>;
+  snapshotMemories: (ids: string[], project?: string, limit?: number, tenant?: string) => Promise<MemorySnapshot[]>;
   trashAndDelete: (
     snapshot: MemorySnapshot,
     fromProject: string | undefined,
     provenance: TrashProvenance,
+    tenant?: string,
   ) => Promise<{ trashId: string | null; deleted: boolean }>;
 }> {
   return (await import('./lifecycle.js' as string)) as unknown as {
-    snapshotMemories: (ids: string[], project?: string, limit?: number) => Promise<MemorySnapshot[]>;
+    snapshotMemories: (ids: string[], project?: string, limit?: number, tenant?: string) => Promise<MemorySnapshot[]>;
     trashAndDelete: (
       snapshot: MemorySnapshot,
       fromProject: string | undefined,
       provenance: TrashProvenance,
+      tenant?: string,
     ) => Promise<{ trashId: string | null; deleted: boolean }>;
   };
 }
 
-export async function addMemory(text: string, project?: string, opts?: AddMemoryOpts): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; reason?: string; score?: number }[]> {
+export async function addMemory(text: string, project?: string, opts?: AddMemoryOpts, tenant: string = MASTER_TENANT): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; reason?: string; score?: number }[]> {
   // Forget-blocklist: a forgotten memory must not be re-extracted through
   // any save path (chat, index, bundle). First check — before Mem0 is touched.
-  if (!opts?.skipBlocklistCheck && await isBlocklisted(text)) {
+  if (!opts?.skipBlocklistCheck && await isBlocklisted(text, tenant)) {
     console.log(`[mem0] Blocked re-save of forgotten memory: ${text.slice(0, 80)}...`);
     incrementMetric('memoriesBlocked');
     return [{ id: 'blocked', memory: text, action: 'NOOP', superseded: [], reason: 'forgotten memory (blocklist)', score: 0 }];
@@ -115,7 +118,7 @@ Original: ${text}`
   const m = getClient();
   const result = await m.add(
     [{ role: 'user', content: enrichedText }],
-    { userId: userId(project), ...(opts?.inferFalse ? { infer: false } : {}), ...(opts?.metadata ? { metadata: opts.metadata } : {}) }
+    { userId: userId(project, tenant), ...(opts?.inferFalse ? { infer: false } : {}), ...(opts?.metadata ? { metadata: opts.metadata } : {}) }
   );
 
   incrementMetric('memoriesAdded');
@@ -132,7 +135,8 @@ Original: ${text}`
     graphrag.queueGraphIngest(
       enrichedText,
       project,
-      mapped.map(m => m.id).filter(id => id && id !== 'unknown')
+      mapped.map(m => m.id).filter(id => id && id !== 'unknown'),
+      tenant
     );
   }
   invalidateMem0Cache(project).catch(() => {});
@@ -174,16 +178,17 @@ function detectLanguageHint(text: string): string | undefined {
 export async function addMemoryWithConflictCheck(
   text: string,
   project?: string,
-  opts?: AddMemoryOpts
+  opts?: AddMemoryOpts,
+  tenant: string = MASTER_TENANT
 ): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; conflictsWith?: { id: string; snippet: string; score: number }[]; reason?: string; score?: number }[]> {
   if (opts?.skipConflictCheck) {
-    return addMemory(text, project, opts);
+    return addMemory(text, project, opts, tenant);
   }
 
   // Search for similar existing memories
   let similarMemories: { id: string; memory: string; score: number }[] = [];
   try {
-    const results = await searchMemory(text, project, 5);
+    const results = await searchMemory(text, project, 5, tenant);
     similarMemories = results
       .filter(r => (r.score ?? 0) > 0.5)
       .map(r => ({ id: r.id, memory: r.memory, score: r.score ?? 0 }));
@@ -240,11 +245,11 @@ export async function addMemoryWithConflictCheck(
   // Snapshot doomed memories BEFORE saving — audit trail needs full texts.
   const { snapshotMemories, trashAndDelete } = await lifecycleHelpers();
   const doomed = classification.supersedes.length > 0
-    ? await snapshotMemories(classification.supersedes, project)
+    ? await snapshotMemories(classification.supersedes, project, 100, tenant)
     : [];
 
   // Save the new memory first — only supersede old ones if save succeeded
-  const result = await addMemory(text, project, opts);
+  const result = await addMemory(text, project, opts, tenant);
 
   if (doomed.length > 0 && result[0] && result[0].id !== 'rejected') {
     const newId = result[0].id;
@@ -255,7 +260,7 @@ export async function addMemoryWithConflictCheck(
           reason: classification.reason,
           trigger: `conflict_check:${classification.action}`,
           replacedById: newId,
-        });
+        }, tenant);
         trashIds[snap.id] = trashId;
         if (deleted) {
           console.log(`[mem0] Superseded memory ${snap.id} (trash: ${trashId})`);

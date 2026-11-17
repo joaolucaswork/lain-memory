@@ -10,6 +10,7 @@
     "mcp": "bun run src/mcp.ts",
     "smoke": "bun run scripts/smoke-mcp.ts",
     "smoke:live": "bun run scripts/smoke-mcp.ts --live",
+    "smoke:tenant": "bun run scripts/smoke-tenant.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/"
   },

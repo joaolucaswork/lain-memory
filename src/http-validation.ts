@@ -150,6 +150,10 @@ export const routeSchemas: Record<string, z.ZodType> = {
     project,
   }),
   '/api/pgs/stats': z.object({ project }),
+  '/api/tenant/signup': z.object({
+    name: z.string().trim().min(1).max(40),
+  }),
+  '/api/tenant/data': z.object({}).catchall(z.unknown()),
 };
 
 export interface ValidationIssue {

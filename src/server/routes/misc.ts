@@ -10,19 +10,23 @@ import { extractSeed, listSeeds } from '../../seed-extraction.js';
 import { PGSEngine } from '../../pgs/index.js';
 import { createPGSProviders } from '../../pgs/llm-provider.js';
 import { PGS_SESSIONS_DIR } from '../../workspace.js';
-import { json, type Handler } from '../http.js';
+import { json, tenantOf, type Handler } from '../http.js';
 
 export const handleSeedExtract: Handler = async (data) => {
   // Chunked fact/entity extraction from raw text or PDFs into seed files.
+  const tenant = tenantOf(data);
   const input = {
     type: data.type,
     source: data.source,
     rawText: data.rawText,
     project: data.project,
     phone: data.phone,
+    tenant,
   };
   try {
     const output = await extractSeed(input);
+    const { recordTenantProject } = await import('../../tenants.js');
+    await recordTenantProject(tenant, data.project);
     return json({
       success: true,
       id: output.id,
@@ -39,25 +43,27 @@ export const handleSeedExtract: Handler = async (data) => {
 };
 
 export const handleSeedList: Handler = async (data) => {
-  return json(listSeeds(data.project));
+  return json(listSeeds(data.project, tenantOf(data)));
 };
 
 export const handlePgsExecute: Handler = async (data) => {
   // Partition → route → sweep → synthesize over the local GraphRAG.
   if (!data.query) return json({ error: 'query required' });
-  const pgsGraph = await cachedGetGraphForPGS(data.project);
+  const tenant = tenantOf(data);
+  const pgsGraph = await cachedGetGraphForPGS(data.project, tenant);
   if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
   const providers = createPGSProviders();
   const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
   const result = await pgsEngine.execute(data.query, pgsGraph, {
     mode: data.mode,
-    sessionId: data.sessionId,
+    // Tenant-namespaced session so two tenants never share sweep coverage.
+    sessionId: data.sessionId ? `${tenant}:${data.sessionId}` : tenant,
   });
   return json(result);
 };
 
 export const handlePgsStats: Handler = async (data) => {
-  const pgsGraph = await cachedGetGraphForPGS(data.project);
+  const pgsGraph = await cachedGetGraphForPGS(data.project, tenantOf(data));
   const providers = createPGSProviders();
   const pgsEngine = new PGSEngine({ ...providers, sessionsDir: PGS_SESSIONS_DIR });
   const partitions = pgsEngine.partition(pgsGraph);
