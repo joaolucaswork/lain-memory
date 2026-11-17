@@ -1,7 +1,7 @@
 // server/src/contradiction-detector.ts
 
 import { createHash } from 'crypto';
-import { getRedis, isRedisAvailable } from './redis.js';
+import { TtlCache } from './lib/ttl-cache.js';
 
 export type MemoryActionType = 'ADD' | 'UPDATE' | 'DELETE' | 'NOOP';
 
@@ -17,27 +17,25 @@ export interface SimilarMemory {
   score: number;
 }
 
-// ─── Redis Cache ───
+// ─── In-memory Cache ───
 
-const CACHE_PREFIX = 'cache:contradiction:';
 const CACHE_TTL = 3600;
+const contradictionCache = new TtlCache<MemoryAction>({ maxEntries: 500 });
 
 function hashText(text: string): string {
   return createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 async function cacheGet<T>(key: string): Promise<T | null> {
-  if (!isRedisAvailable()) return null;
   try {
-    const cached = await getRedis().get(`${CACHE_PREFIX}${key}`);
-    if (cached !== null) return JSON.parse(cached);
-  } catch {}
-  return null;
+    return (contradictionCache.get(key) as T | null) ?? null;
+  } catch { return null; }
 }
 
 async function cacheSet(key: string, value: unknown): Promise<void> {
-  if (!isRedisAvailable()) return;
-  getRedis().set(`${CACHE_PREFIX}${key}`, JSON.stringify(value), 'EX', CACHE_TTL).catch(() => {});
+  try {
+    contradictionCache.set(key, value as MemoryAction, CACHE_TTL);
+  } catch { /* non-critical */ }
 }
 
 function buildCacheKey(newMemory: string, similarMemories: SimilarMemory[], language?: string, bundleMode?: boolean): string {
@@ -70,7 +68,7 @@ export async function classifyMemoryAction(
     }
   }
 
-  // Check Redis cache before calling LLM
+  // Check in-memory cache before calling LLM
   const cacheKey = buildCacheKey(newMemory, similarMemories, language, bundleMode);
   const cached = await cacheGet<MemoryAction>(cacheKey);
   if (process.env.LAIN_BENCH === '1') {

@@ -1,7 +1,7 @@
 /**
  * User-state writes: feedback, importance, touch (mem0 split M4).
  *
- * Authority: src/memory-state.ts (Qdrant payload, Redis L2). This module is
+ * Authority: src/memory-state.ts (Qdrant payload). This module is
  * the mem0-side façade — thin wrappers plus the heuristic post-save and the
  * vote side effects. mem0.ts re-exports everything; importers are unchanged.
  *
@@ -10,7 +10,7 @@
  * pulls in the Mem0 client chain.
  */
 
-import { getRedis, isRedisAvailable } from '../redis.js';
+import { TtlCache } from '../lib/ttl-cache.js';
 import {
   FEEDBACK_DEFAULTS as STATE_FEEDBACK_DEFAULTS,
   IMPORTANCE_DEFAULT as STATE_IMPORTANCE_DEFAULT,
@@ -31,7 +31,7 @@ import type {
 
 // ─── Importance Scoring (Poignancy) ───
 
-// Authority: src/memory-state.ts (Qdrant payload, Redis L2). Re-exported
+// Authority: src/memory-state.ts (Qdrant payload). Re-exported
 // here so existing import sites keep working.
 export const IMPORTANCE_DEFAULT = STATE_IMPORTANCE_DEFAULT;
 
@@ -83,7 +83,6 @@ export async function getMemoryImportance(memoryId: string): Promise<number | nu
  * Cap at 1.0.
  */
 export async function reinforceMemoryImportance(memoryId: string): Promise<void> {
-  if (!isRedisAvailable()) return;
   try {
     const current = await getMemoryImportance(memoryId);
     if (current === null) return; // not yet scored — don't set 0.5+0.05 as if it were scored
@@ -95,17 +94,17 @@ export async function reinforceMemoryImportance(memoryId: string): Promise<void>
 // ─── Relevance Boost (touch on retrieval) ───
 
 const TOUCH_TTL = 30 * 24 * 60 * 60; // 30 days
+const touchCache = new TtlCache<number>({ maxEntries: 2000 });
 
 /**
  * Record that a memory was accessed/used.
- * Stores last-access timestamp in Redis. When computing age decay,
+ * Stores last-access timestamp in-memory. When computing age decay,
  * this effectively "refreshes" the memory's recency.
  * Also reinforces importance score.
  */
 export async function touchMemoryTimestamp(memoryId: string): Promise<void> {
-  if (!isRedisAvailable()) return;
   try {
-    await getRedis().set(`mem0:touch:${memoryId}`, Date.now().toString(), 'EX', TOUCH_TTL);
+    touchCache.set(`touch:${memoryId}`, Date.now(), TOUCH_TTL);
     // Fire-and-forget: reinforce importance on access
     reinforceMemoryImportance(memoryId).catch(() => {});
   } catch { /* non-critical */ }
@@ -113,19 +112,17 @@ export async function touchMemoryTimestamp(memoryId: string): Promise<void> {
 
 /**
  * Get the last access timestamp for a memory (if touched).
- * Returns null if never accessed or Redis unavailable.
+ * Returns null when never accessed in this process.
  */
-export async function getMemoryTouchTimestamp(memoryId: string): Promise<number | null> {
-  if (!isRedisAvailable()) return null;
+export function getMemoryTouchTimestamp(memoryId: string): number | null {
   try {
-    const ts = await getRedis().get(`mem0:touch:${memoryId}`);
-    return ts ? parseInt(ts, 10) : null;
+    return touchCache.get(`touch:${memoryId}`);
   } catch { return null; }
 }
 
 // ─── Memory Feedback (user votes: ✓ confirm / 🕐 archive) ───
 // Fase 0 of per-memory quick actions (replaces like/dislike).
-// Authority: src/memory-state.ts (Qdrant payload, Redis L2). Absent state =
+// Authority: src/memory-state.ts (Qdrant payload). Absent state =
 // neutral defaults, so existing ranking behavior is unchanged until the
 // first vote. Re-exported here so existing import sites keep working.
 
@@ -197,7 +194,7 @@ async function invalidateRecallCache(): Promise<void> {
       invalidateMem0Cache: (project?: string) => Promise<void>;
     };
     await read.invalidateMem0Cache().catch(() => {});
-  } catch { /* read module not yet extracted (pre-M5) or Redis down — non-critical */ }
+  } catch { /* read module not yet extracted (pre-M5) — non-critical */ }
 }
 
 /**

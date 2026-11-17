@@ -1,22 +1,20 @@
-import { getRedis, isRedisAvailable } from './redis.js';
+/**
+ * Single-instance lock (no-op wrapper).
+ * WHY: after Redis removal there is no cross-process mutex. The maintenance,
+ * graph and outbox sweeps already run in-process; keep the call sites unchanged
+ * so a future Upstash/distributed lock can be swapped back locally.
+ */
 import { INSTANCE_ID } from './workspace.js';
 
 const lockOwner = INSTANCE_ID || 'default';
+void lockOwner;
 
 export async function withDistributedLock(
   key: string,
   ttlMs: number,
   fn: () => Promise<void>
 ): Promise<void> {
-  if (!isRedisAvailable()) { await fn(); return; }
-  const redis = getRedis();
-  const lockKey = `lock:${key}`;
-  const acquired = await redis.set(lockKey, lockOwner, 'PX', ttlMs, 'NX');
-  if (!acquired) return;
-  try {
-    await fn();
-  } finally {
-    const current = await redis.get(lockKey);
-    if (current === lockOwner) await redis.del(lockKey);
-  }
+  void key;
+  void ttlMs;
+  await fn();
 }

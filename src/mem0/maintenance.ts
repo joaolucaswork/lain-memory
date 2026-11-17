@@ -6,7 +6,6 @@
  * weekly cleanup → graph reconcile → backfill → sweep).
  */
 
-import { getRedis, isRedisAvailable } from '../redis.js';
 import { listProjects } from '../workspace.js';
 import { withDistributedLock } from '../distributed-lock.js';
 import { isMem0Configured } from './config.js';
@@ -25,7 +24,7 @@ import type { ContradictionSweepReport } from './types.js';
 const BACKFILL_PROJECTS = [undefined] as const;
 
 /**
- * Score up to `maxToScore` memories that are missing importance scores in Redis.
+ * Score up to `maxToScore` memories that are missing importance scores.
  * Called periodically by the maintenance loop to ensure all memories are scored.
  * Returns the number of memories scored.
  */
@@ -62,7 +61,7 @@ export async function backfillImportanceScores(maxToScore = 50): Promise<number>
 // ─── Rotating contradiction sweep (paraphrase hygiene) ───
 // Replaces the old "always the 20 most recent globals" window with a
 // round-robin cursor: each tick processes the next slice of one scope
-// (global, then each project), persisting progress in Redis.
+// (global, then each project), persisting progress in-memory.
 
 export function getContradictionFetchLimit(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.LAIN_CONTRADICTION_FETCH;
@@ -99,46 +98,21 @@ function contradictionScopeKey(scope: string | undefined): string {
 }
 
 export async function getContradictionCursor(scope: string | undefined): Promise<number> {
-  const key = `mem0:contradiction_cursor:${contradictionScopeKey(scope)}`;
-  if (isRedisAvailable()) {
-    try {
-      const raw = await getRedis().get(key);
-      const n = raw === null ? 0 : parseInt(raw, 10);
-      return Number.isNaN(n) || n < 0 ? 0 : n;
-    } catch { /* fall through to fallback */ }
-  }
   return contradictionCursorFallback.get(contradictionScopeKey(scope)) ?? 0;
 }
 
 export async function setContradictionCursor(scope: string | undefined, cursor: number): Promise<void> {
   const safe = Math.max(0, Math.floor(cursor));
   contradictionCursorFallback.set(contradictionScopeKey(scope), safe);
-  if (isRedisAvailable()) {
-    try {
-      await getRedis().set(`mem0:contradiction_cursor:${contradictionScopeKey(scope)}`, String(safe));
-    } catch { /* non-critical */ }
-  }
 }
 
 async function getContradictionScopeIdx(mod: number): Promise<number> {
   if (mod <= 0) return 0;
-  if (isRedisAvailable()) {
-    try {
-      const raw = await getRedis().get('mem0:contradiction_scope_idx');
-      const n = raw === null ? 0 : parseInt(raw, 10);
-      return Number.isNaN(n) || n < 0 ? 0 : n % mod;
-    } catch { /* fall through */ }
-  }
   return contradictionScopeIdxFallback % mod;
 }
 
 async function setContradictionScopeIdx(idx: number): Promise<void> {
   contradictionScopeIdxFallback = Math.max(0, Math.floor(idx));
-  if (isRedisAvailable()) {
-    try {
-      await getRedis().set('mem0:contradiction_scope_idx', String(contradictionScopeIdxFallback));
-    } catch { /* non-critical */ }
-  }
 }
 
 /** Process one slice of one scope. Never throws on per-memory errors. */
@@ -340,7 +314,7 @@ export function startMemoryMaintenance(): void {
         console.error('[graphrag] Maintenance reconcile error:', err);
       }
 
-      // ── Importance backfill: score memories missing importance in Redis ──
+      // ── Importance backfill: score memories missing importance scores ──
       try {
         const backfillStart = Date.now();
         const scored = await backfillImportanceScores(50);

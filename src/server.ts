@@ -58,7 +58,6 @@ import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { parseBody, validateRoute } from './http-validation.js';
-import { connectRedis } from './redis.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
@@ -185,7 +184,6 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 }
 
 async function boot(): Promise<void> {
-  await connectRedis(); // non-fatal: helpers degrade to defaults without it
   await initGraph();
   startMemoryMaintenance();
   startDedupSweep();

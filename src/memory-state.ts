@@ -1,11 +1,7 @@
 /**
- * Memory State — user decisions live here (Qdrant payload), Redis is L2 only.
+ * Memory State — user decisions live here (Qdrant payload, Qdrant-only).
  *
- * Issue #8: feedback (confidence, last_confirmed_at, status, kind, sensitive,
- * correct_count, title) + importance used to live ONLY in Redis (TTL 1y).
- * Flushing Redis wiped archives, titles, confirmations and forgets.
- *
- * Now the authority is the Qdrant point payload:
+ * Authority is the Qdrant point payload:
  *   - `lain_feedback`    → MemoryFeedback object
  *   - `lain_importance`  → number
  * (two top-level keys instead of one nested `lain_state` because Qdrant
@@ -15,17 +11,11 @@
  * Reads also accept the legacy nested `lain_state: { feedback, importance }`
  * shape, so a future migration or manual payload stays readable.
  *
- * Redis keeps the same `mem0:feedback:<id>` / `mem0:importance:<id>` keys as
- * a best-effort L2 cache (same TTLs as before). It is NEVER the only copy:
- * every read falls through to Qdrant, every write goes to Qdrant first and
- * throws on failure (fail-hard — /api/memory/feedback surfaces 500).
- *
  * Reads never throw (defaults on any failure). Writes throw on Qdrant
  * failure, including voting on a point that does not exist (Not Found).
  */
 
 import { QdrantClient } from '@qdrant/js-client-rest';
-import { getRedis, isRedisAvailable } from './redis.js';
 import { INSTANCE_ID } from './workspace.js';
 
 // ─── Types (moved from mem0.ts — re-exported there for compat) ───
@@ -98,19 +88,6 @@ export function parseStateSnapshot(raw: unknown): StateSnapshot | null {
     : null;
   if (isDefaultState(feedback, importance)) return null;
   return { feedback, importance };
-}
-
-// L2 cache keys/TTLs (same names as the old Redis-only store, so the
-// migration script and any lingering keys keep working as cache).
-const FEEDBACK_L2_TTL = 365 * 24 * 60 * 60; // 1 year
-const IMPORTANCE_L2_TTL = 365 * 24 * 60 * 60; // 1 year
-
-function feedbackKey(memoryId: string): string {
-  return `mem0:feedback:${memoryId}`;
-}
-
-function importanceKey(memoryId: string): string {
-  return `mem0:importance:${memoryId}`;
 }
 
 export function sanitizeFeedback(parsed: Partial<MemoryFeedback>): MemoryFeedback {
@@ -209,42 +186,7 @@ export function extractStateFromMetadata(metadata: unknown): ExtractedState {
   return out;
 }
 
-// ─── L2 (Redis) helpers — best-effort, never throw ───
-
-async function l2GetFeedback(id: string): Promise<MemoryFeedback | null> {
-  if (!isRedisAvailable()) return null;
-  try {
-    const raw = await getRedis().get(feedbackKey(id));
-    if (!raw) return null;
-    return sanitizeFeedback(JSON.parse(raw) as Partial<MemoryFeedback>);
-  } catch { return null; }
-}
-
-async function l2SetFeedback(id: string, fb: MemoryFeedback): Promise<void> {
-  if (!isRedisAvailable()) return;
-  try {
-    await getRedis().set(feedbackKey(id), JSON.stringify(fb), 'EX', FEEDBACK_L2_TTL);
-  } catch { /* best-effort */ }
-}
-
-async function l2GetImportance(id: string): Promise<number | null> {
-  if (!isRedisAvailable()) return null;
-  try {
-    const val = await getRedis().get(importanceKey(id));
-    if (val === null) return null;
-    const score = parseFloat(val);
-    return isNaN(score) ? null : score;
-  } catch { return null; }
-}
-
-async function l2SetImportance(id: string, score: number): Promise<void> {
-  if (!isRedisAvailable()) return;
-  try {
-    await getRedis().set(importanceKey(id), score.toString(), 'EX', IMPORTANCE_L2_TTL);
-  } catch { /* best-effort */ }
-}
-
-// ─── Qdrant reads — never throw; unanswered ids degrade to L2/defaults ───
+// ─── Qdrant reads — never throw; unanswered ids degrade to defaults ───
 
 interface QdrantState {
   feedback: MemoryFeedback | null;
@@ -298,7 +240,7 @@ export interface QdrantStateRead {
 }
 
 /**
- * Qdrant-only state read (no L2, no metadata). For migrations and audits
+ * Qdrant-only state read (no metadata). For migrations and audits
  * that must distinguish "Qdrant has no state" from "a cache has state".
  * Never throws; unreachable ids degrade as answered:false.
  */
@@ -324,7 +266,7 @@ export interface MemoryState {
 
 /**
  * Batch state fetch. Preloaded mem0 `metadata` (from get/getAll/search) is
- * free — no I/O. Then L2, then one Qdrant retrieve for the rest. Never throws.
+ * free — no I/O, then one Qdrant retrieve for the rest. Never throws.
  */
 export async function getManyState(
   ids: string[],
@@ -348,61 +290,29 @@ export async function getManyState(
     if (st.importance !== null) { out.get(id)!.importance = st.importance; hasIm.add(id); }
   }
 
-  // 2. Qdrant for the rest (authority first — a stale L2 must never shadow
-  // it, e.g. after a write with Redis down followed by a reconnect).
+  // 2. Qdrant for the rest (authority).
   const needQ = uniq.filter((id) => !hasFb.has(id) || !hasIm.has(id));
   // answeredByQdrant tracks ids Qdrant confirmed (point found or missing),
-  // so step 4 can tell "unscored" apart from "backend unreachable".
+  // so step 3 can tell "unscored" apart from "backend unreachable".
   const answeredByQdrant = new Set<string>();
   if (needQ.length > 0) {
     const qmap = await qdrantRetrieve(needQ);
-    const l2Writes: Array<Promise<void>> = [];
     for (const id of needQ) {
       const q = qmap.get(id);
-      if (!q || !q.answered) continue; // Qdrant unreachable — L2 next
+      if (!q || !q.answered) continue; // Qdrant unreachable — degrade below
       answeredByQdrant.add(id);
       if (q.feedback && !hasFb.has(id)) {
         out.get(id)!.feedback = q.feedback;
         hasFb.add(id);
-        l2Writes.push(l2SetFeedback(id, q.feedback));
       }
       if (q.importance !== null && !hasIm.has(id)) {
         out.get(id)!.importance = q.importance;
         hasIm.add(id);
-        l2Writes.push(l2SetImportance(id, q.importance));
       }
     }
-    if (l2Writes.length > 0) await Promise.allSettled(l2Writes);
   }
 
-  // 3. L2 only for ids Qdrant could not answer (fallback, never authority).
-  const needL2 = uniq.filter((id) => !hasFb.has(id) || !hasIm.has(id));
-  if (needL2.length > 0 && isRedisAvailable()) {
-    try {
-      const pipe = getRedis().pipeline();
-      for (const id of needL2) {
-        pipe.get(feedbackKey(id));
-        pipe.get(importanceKey(id));
-      }
-      const rows = await pipe.exec();
-      needL2.forEach((id, i) => {
-        try {
-          const rawFb = rows?.[i * 2]?.[1] as string | null;
-          const rawIm = rows?.[i * 2 + 1]?.[1] as string | null;
-          if (rawFb && !hasFb.has(id)) {
-            out.get(id)!.feedback = sanitizeFeedback(JSON.parse(rawFb) as Partial<MemoryFeedback>);
-            hasFb.add(id);
-          }
-          if (rawIm !== null && !hasIm.has(id)) {
-            const score = parseFloat(rawIm);
-            if (!isNaN(score)) { out.get(id)!.importance = score; hasIm.add(id); }
-          }
-        } catch { /* keep current */ }
-      });
-    } catch { /* degrade to defaults below */ }
-  }
-
-  // 4. Final defaults: unscored-but-confirmed stays null; unreachable
+  // 3. Final defaults: unscored-but-confirmed stays null; unreachable
   // backends degrade importance to the neutral default (old semantics).
   for (const id of uniq) {
     if (!hasIm.has(id) && !answeredByQdrant.has(id)) {
@@ -467,7 +377,7 @@ function withIdLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
 
 // ─── Public writes — fail-hard (throw on Qdrant failure) ───
 
-/** Authoritative feedback read for merge: Qdrant first, then L2, then defaults. Never throws. */
+/** Authoritative feedback read for merge: Qdrant, then defaults. Never throws. */
 async function readFeedbackAuthoritative(id: string): Promise<MemoryFeedback> {
   if (isQueryableId(id)) {
     try {
@@ -477,16 +387,16 @@ async function readFeedbackAuthoritative(id: string): Promise<MemoryFeedback> {
         if (st.feedback) return st.feedback;
       }
     } catch {
-      // Transport error — fall through to L2.
+      // Transport error — defaults below.
     }
   }
-  return (await l2GetFeedback(id)) ?? { ...FEEDBACK_DEFAULTS };
+  return { ...FEEDBACK_DEFAULTS };
 }
 
 /**
  * Merge patch into stored feedback (creates with defaults when absent).
- * Writes Qdrant first (throws on failure, incl. missing point), then L2
- * best-effort. Never returns silently-unstored data.
+ * Writes Qdrant (throws on failure, incl. missing point).
+ * Never returns silently-unstored data.
  */
 export async function setFeedback(memoryId: string, patch: Partial<MemoryFeedback>): Promise<MemoryFeedback> {
   return withIdLock(memoryId, async () => {
@@ -500,7 +410,6 @@ export async function setFeedback(memoryId: string, patch: Partial<MemoryFeedbac
     } catch (err) {
       throw new Error(`memory-state: Qdrant setPayload(feedback) failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
     }
-    await l2SetFeedback(memoryId, next);
     return next;
   });
 }
@@ -517,14 +426,11 @@ export async function setImportance(memoryId: string, score: number): Promise<vo
   } catch (err) {
     throw new Error(`memory-state: Qdrant setPayload(importance) failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  await l2SetImportance(memoryId, score);
 }
 
 /**
  * Persist extractor relevance 1-5 (the "already rated" marker the backfill
- * uses to skip). Qdrant-only on purpose: the single reader is the backfill
- * skip-check via readQdrantState, no L2 involved. Throws on invalid input
- * or Qdrant failure (fail-hard).
+ * uses to skip). Throws on invalid input or Qdrant failure (fail-hard).
  */
 export async function setRelevance(memoryId: string, relevance: number): Promise<void> {
   if (sanitizeRelevance(relevance) === null) {
@@ -543,7 +449,7 @@ export async function setRelevance(memoryId: string, relevance: number): Promise
 /**
  * Clear a memory's importance score (rollback path — restores the unscored
  * null state). Feedback is untouched. Swallows Not Found; throws on other
- * Qdrant errors. L2 eviction is best-effort.
+ * Qdrant errors.
  */
 export async function clearImportance(memoryId: string): Promise<void> {
   if (isQueryableId(memoryId)) {
@@ -558,17 +464,11 @@ export async function clearImportance(memoryId: string): Promise<void> {
       }
     }
   }
-  if (isRedisAvailable()) {
-    try {
-      await getRedis().del(importanceKey(memoryId));
-    } catch { /* best-effort */ }
-  }
 }
 
 /**
  * Remove a memory's state (forget / trash / policy path — issue #10 caller).
  * Swallows Not Found (idempotent delete); throws on other Qdrant errors.
- * L2 eviction is best-effort.
  */
 export async function deleteState(memoryId: string): Promise<void> {
   if (isQueryableId(memoryId)) {
@@ -582,10 +482,5 @@ export async function deleteState(memoryId: string): Promise<void> {
         throw new Error(`memory-state: Qdrant deletePayload failed for ${memoryId}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-  }
-  if (isRedisAvailable()) {
-    try {
-      await getRedis().del(feedbackKey(memoryId), importanceKey(memoryId));
-    } catch { /* best-effort */ }
   }
 }

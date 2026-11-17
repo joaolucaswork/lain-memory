@@ -15,7 +15,6 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { connectRedis } from './redis.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -404,7 +403,6 @@ async function handleTool(name: string, args: Record<string, any>): Promise<Tool
 }
 
 async function main(): Promise<void> {
-  await connectRedis(); // non-fatal: helpers degrade to defaults without it
   await initGraph();
   startMemoryMaintenance();
   startDedupSweep();

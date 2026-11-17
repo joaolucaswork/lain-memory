@@ -2,14 +2,13 @@
  * Recall pipeline (mem0 split M5).
  *
  * Read path: search, shared recall pipeline (touch-boost + signals +
- * archived filter + rank), Redis-backed cached search, cache invalidation,
+ * archived filter + rank), in-memory cached search, cache invalidation,
  * and list. Depends on config (client), scoring (rank), and state
  * (signals, touch) — never the reverse.
  */
 
-import { getRedis, isRedisAvailable } from '../redis.js';
+import { TtlCache } from '../lib/ttl-cache.js';
 import { getManyState } from '../memory-state.js';
-import { INSTANCE_ID } from '../workspace.js';
 import { incrementMetric } from '../mem-metrics.js';
 import { getClient, userId } from './config.js';
 import { applyAgeDecayToResults } from './scoring.js';
@@ -92,29 +91,26 @@ export async function rankRecallResults<
 >(results: T[], query: string): Promise<RankedMemory[]> {
   // Boost recently-accessed memories by using touch timestamp as virtual updated_at
   let boostedResults: T[] = results;
-  if (isRedisAvailable()) {
-    try {
-      boostedResults = await Promise.all(
-        results.map(async (r) => {
-          const touchTs = await getMemoryTouchTimestamp(r.id);
-          if (touchTs) {
-            const touchDate = new Date(touchTs).toISOString();
-            // Use touch timestamp if more recent than actual updated_at
-            const currentUpdated = r.updated_at ? new Date(r.updated_at).getTime() : 0;
-            if (touchTs > currentUpdated) {
-              return { ...r, updated_at: touchDate };
-            }
+  try {
+    boostedResults = await Promise.all(
+      results.map(async (r) => {
+        const touchTs = getMemoryTouchTimestamp(r.id);
+        if (touchTs) {
+          const touchDate = new Date(touchTs).toISOString();
+          // Use touch timestamp if more recent than actual updated_at
+          const currentUpdated = r.updated_at ? new Date(r.updated_at).getTime() : 0;
+          if (touchTs > currentUpdated) {
+            return { ...r, updated_at: touchDate };
           }
-          return r;
-        })
-      );
-    } catch {
-      // Boost failed — use original results
-    }
+        }
+        return r;
+      })
+    );
+  } catch {
+    // Boost failed — use original results
   }
 
   // Fetch importance + feedback from memory-state (Qdrant payload authority,
-  // Redis L2). Archived memories are dropped here — every recall path
   // excludes them. State rides free on mem0 metadata when present, so this
   // is usually zero extra round-trips. Never throws — degrades to defaults.
   type Enriched<U> = U & { importance: number | null; confidence: number; last_confirmed_at: string | null; status: FeedbackStatus; kind: FeedbackKind; title: string | null };
@@ -150,9 +146,10 @@ export async function rankRecallResults<
   return applyAgeDecayToResults(withSignals, queryTerms);
 }
 
-// ─── Redis-backed Mem0 Cache ───
+// ─── In-memory Mem0 Cache ───
 
 const MEM0_CACHE_TTL = 300; // 5 minutes
+const recallCache = new TtlCache<RankedMemory[]>({ maxEntries: 500 });
 
 function mem0CacheKey(query: string, project?: string): string {
   const normalized = `${query}:${project || ''}`.toLowerCase().trim();
@@ -164,23 +161,20 @@ function mem0CacheKey(query: string, project?: string): string {
 }
 
 /**
- * Search memory with Redis cache. Falls back to direct API call if Redis unavailable.
- * Cache hit: ~0.5ms vs API call: ~200-500ms.
+ * Search memory with in-memory cache. Cache hit: ~0.5ms vs API call: ~200-500ms.
  */
 export async function cachedSearchMemory(query: string, project?: string, limit: number = 10): Promise<RankedMemory[]> {
   const key = mem0CacheKey(query, project);
 
   // Try cache first
-  if (isRedisAvailable()) {
-    try {
-      const cached = await getRedis().get(key);
-      if (cached) {
-        incrementMetric('cacheHits');
-        return JSON.parse(cached);
-      }
-    } catch (err) {
-      // Cache read failed — fall through to API
+  try {
+    const cached = recallCache.get(key);
+    if (cached) {
+      incrementMetric('cacheHits');
+      return cached;
     }
+  } catch {
+    // Cache read failed — fall through to API
   }
   incrementMetric('cacheMisses');
 
@@ -194,8 +188,10 @@ export async function cachedSearchMemory(query: string, project?: string, limit:
   }
 
   // Cache the result
-  if (isRedisAvailable()) {
-    getRedis().set(key, JSON.stringify(withDecay), 'EX', MEM0_CACHE_TTL).catch(() => {});
+  try {
+    recallCache.set(key, withDecay, MEM0_CACHE_TTL);
+  } catch {
+    // Non-critical
   }
 
   return withDecay;
@@ -203,26 +199,13 @@ export async function cachedSearchMemory(query: string, project?: string, limit:
 
 /**
  * Invalidate Mem0 cache for a project when memories change (add/delete/consolidate).
- * Uses key prefix scan to clear all cached queries for the project.
+ * Single-instance: clears the whole recall cache.
  */
 export async function invalidateMem0Cache(project?: string): Promise<void> {
-  if (!isRedisAvailable()) return;
+  void project;
   try {
-    // SCAN needs explicit keyPrefix in match; returned keys include prefix so strip before del
-    const p = INSTANCE_ID ? `lain:${INSTANCE_ID}:` : 'lain:';
-    const stream = getRedis().scanStream({ match: `${p}cache:mem0:*`, count: 100 });
-    const keysToDelete: string[] = [];
-    for await (const keys of stream) {
-      keysToDelete.push(...(keys as string[]));
-    }
-    if (keysToDelete.length > 0) {
-      const pipeline = getRedis().pipeline();
-      for (const k of keysToDelete) {
-        pipeline.del(k.slice(p.length));
-      }
-      await pipeline.exec();
-    }
-  } catch (err) {
+    recallCache.clear();
+  } catch {
     // Non-critical — cache will expire naturally
   }
 }
