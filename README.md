@@ -144,7 +144,18 @@ WantedBy=multi-user.target
 ```
 `systemctl daemon-reload && systemctl enable --now lain-memory`.
 6. **Firewall (Hetzner Cloud → Firewalls).** Inbound: 22 (ideally your IP only), 80, 443. Never expose 3341/6333 — both bind `127.0.0.1` already.
-7. **TLS.** Point your domain's A record at the server IP and reverse-proxy `127.0.0.1:3341` with Caddy. Without a domain, keep the ports firewalled and use the bearer token.
+7. **TLS.** Point your domain's A record at the server IP and reverse-proxy `127.0.0.1:3341` with Caddy (auto-HTTPS, e.g. `api.<domain>`):
+```bash
+# https://caddyserver.com/docs/install#debian-ubuntu-raspbian
+apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+apt update && apt install -y caddy
+printf 'api.<domain> {\n\treverse_proxy 127.0.0.1:3341\n}\n' > /etc/caddy/Caddyfile
+systemctl reload caddy
+curl -s -H "Authorization: Bearer $LAIN_API_KEY" https://api.<domain>/health
+```
+Without a domain, keep the ports firewalled and use the bearer token over SSH tunnel.
 8. **Backup.** Enable server Backups (~€1.1/mo) or snapshot before changes; Qdrant separately via the snapshot API (`POST /collections/<name>/snapshots`).
 
 ## MCP (stdio) — any harness
