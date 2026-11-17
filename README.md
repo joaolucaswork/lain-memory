@@ -71,7 +71,7 @@ Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant), an OpenAI-
 
 - Without flags it **checks** prerequisites (Bun, Docker + Compose) and fails with instructions when missing.
 - With `--install-missing` it **installs** them: Bun via the official script; Docker Desktop via Homebrew (macOS) or `get.docker.com` on apt-based Linux. Other platforms print manual steps.
-- Then: starts Qdrant+Redis, creates `.env` (never overwrites) + workspace dir, `bun install`, MCP smoke test (`--live` write-path proof when an LLM key exists), and prints harness configs.
+- Then: starts Qdrant, creates `.env` (never overwrites) + workspace dir, `bun install`, MCP smoke test (`--live` write-path proof when an LLM key exists), and prints harness configs.
 
 Windows (PowerShell nativo):
 
@@ -94,6 +94,58 @@ bun run smoke                 # stdio MCP self-check (12 tools)
 Supervised: `bun run start` (ou via seu process manager a partir de `ecosystem.config.cjs`).
 
 > `LAIN_INSTANCE_ID` suffixes the Qdrant collection and graph file — instances sharing a workspace must use the same one.
+
+## VPS deploy (Hetzner CX23 or any Ubuntu VPS)
+
+Validated on a CX23 (2 vCPU, 4GB RAM, 40GB — €5.99/mo): Qdrant idles at ~750MiB RAM with ~380M on disk, Bun at ~150MB. No Redis — single `docker compose` service (Qdrant) + Bun on the host.
+
+1. **SSH key first.** Create the server with your public key checked, or add it under Security → SSH keys and **Rebuild** with the key selected (unchecked = key not injected, back to password). Test: `ssh root@<ip>` with no password prompt. If the host was rebuilt, clear the stale key locally: `ssh-keygen -R <ip>`.
+2. **Base.**
+```bash
+apt update && apt upgrade -y
+apt install -y ca-certificates curl gnupg python3 make g++ unzip
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+apt update && apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+curl -fsSL https://bun.sh/install | bash
+export PATH="$HOME/.bun/bin:$PATH"
+```
+(`python3/make/g++` build a transitive native dep; `unzip` is required by the Bun installer. Ghostty users: `export TERM=xterm-256color` before using `nano`.)
+3. **Code + env.**
+```bash
+git clone https://github.com/joaolucaswork/lain-memory.git /opt/lain-memory
+cd /opt/lain-memory
+cp .env.example .env   # LAIN_API_KEY=$(openssl rand -hex 32), LAIN_WORKSPACE_DIR, LLM keys
+mkdir -p /root/lain-memory-workspace
+```
+LLM resolution: `LAIN_LLM_*` wins, `AI_GATEWAY_*` fallback, then `LAIN_OPENAI_API_KEY`. Copy the same block you use locally.
+4. **Up + verify.**
+```bash
+docker compose up -d          # Qdrant :6333 (bound to 127.0.0.1)
+bun install && bun run typecheck
+bun run smoke                 # tool list; smoke:live proves remember→recall→forget
+curl -s -H "Authorization: Bearer $LAIN_API_KEY" localhost:3341/health
+```
+5. **Service** (`/etc/systemd/system/lain-memory.service`):
+```ini
+[Unit]
+Description=lain-memory
+After=docker.service network-online.target
+Requires=docker.service
+[Service]
+WorkingDirectory=/opt/lain-memory
+Environment=PATH=/root/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.bun/bin/bun run src/server.ts
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+```
+`systemctl daemon-reload && systemctl enable --now lain-memory`.
+6. **Firewall (Hetzner Cloud → Firewalls).** Inbound: 22 (ideally your IP only), 80, 443. Never expose 3341/6333 — both bind `127.0.0.1` already.
+7. **TLS.** Point your domain's A record at the server IP and reverse-proxy `127.0.0.1:3341` with Caddy. Without a domain, keep the ports firewalled and use the bearer token.
+8. **Backup.** Enable server Backups (~€1.1/mo) or snapshot before changes; Qdrant separately via the snapshot API (`POST /collections/<name>/snapshots`).
 
 ## MCP (stdio) — any harness
 
