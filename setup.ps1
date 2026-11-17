@@ -8,7 +8,7 @@
 .DESCRIPTION
   1. checks prerequisites (bun, docker + compose) — or installs them via
      winget with -InstallMissing (needs admin for Docker Desktop)
-  2. starts Qdrant + Redis (docker compose up -d) and waits for Qdrant
+  2. starts Qdrant (docker compose up -d) and waits for Qdrant
   3. creates .env from .env.example (never overwrites yours)
   4. creates the workspace dir (LAIN_WORKSPACE_DIR, ~ expanded)
   5. bun install
@@ -77,7 +77,7 @@ docker compose version 2>&1 | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "docker compose plugin not found — update Docker Desktop" }
 
 # ── 2. data stack ────────────────────────────────────────────────────────────
-Info "starting Qdrant + Redis..."
+Info "starting Qdrant..."
 docker compose up -d
 if ($LASTEXITCODE -ne 0) { Fail "docker compose up failed" }
 Info "waiting for Qdrant :6333..."

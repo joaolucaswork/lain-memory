@@ -63,7 +63,7 @@ Short version: mem0 = what was said, every day. Graph = bonus for connections an
 
 ## Quickstart
 
-Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant + Redis), an OpenAI-compatible LLM endpoint.
+Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant), an OpenAI-compatible LLM endpoint.
 
 ```bash
 ./setup.sh [--install-missing]   # macOS/Linux
@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1 [-InstallMissing]
 Then edit `.env` (workspace dir + LLM keys) and re-run the setup script. Without keys, only `tools/list` is verified — run `bun run smoke:live` afterwards to prove the write path (remember→recall→forget, zero residue) against real Qdrant+LLM. Manual equivalent:
 
 ```bash
-docker compose up -d          # Qdrant :6333 + Redis :6379
+docker compose up -d          # Qdrant :6333
 cp .env.example .env          # set LAIN_WORKSPACE_DIR + LLM keys
 bun install && bun run dev    # :3341
 curl localhost:3341/health
@@ -93,7 +93,7 @@ bun run smoke                 # stdio MCP self-check (12 tools)
 
 Supervised: `bun run start` (ou via seu process manager a partir de `ecosystem.config.cjs`).
 
-> `LAIN_INSTANCE_ID` suffixes the Qdrant collection, graph file and Redis prefix — instances sharing a workspace must use the same one.
+> `LAIN_INSTANCE_ID` suffixes the Qdrant collection and graph file — instances sharing a workspace must use the same one.
 
 ## MCP (stdio) — any harness
 
@@ -147,26 +147,18 @@ All file state lives under `LAIN_WORKSPACE_DIR` (default `~/lain-memory-workspac
     └── pgs-sessions/         # resumable PGS sessions
 ```
 
-The dir must exist before boot (the server refuses to start otherwise — `./setup.sh` creates it). Vector memories live separately in Qdrant (`./data/qdrant`); Redis holds cache only. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
+The dir must exist before boot (the server refuses to start otherwise — `./setup.sh` creates it). Vector memories live separately in Qdrant (`./data/qdrant`). Caches are in-memory TTL. To start fresh, point `LAIN_WORKSPACE_DIR` at an empty dir and restart — Qdrant data is unaffected.
 
 ### Where user state lives (post-#8–#11)
 
 | What | Where | Notes |
 |------|-------|-------|
-| Memory text + `lain_feedback` / `lain_importance` / `lain_relevance` payload | Qdrant (`mem0` or `mem0-${LAIN_INSTANCE_ID}`) | Authority for votes, titles, importance, extractor ratings. No TTL. Survives Redis loss. |
+| Memory text + `lain_feedback` / `lain_importance` / `lain_relevance` payload | Qdrant (`mem0` or `mem0-${LAIN_INSTANCE_ID}`) | Authority for votes, titles, importance, extractor ratings. No TTL. |
 | Forget blocklist | `$WORKSPACE/.knowledge/forget-blocklist.json` | Authority. Atomic writes. Fail-closed on read error. |
 | Graph + seeds + PGS sessions | `$WORKSPACE/.knowledge/` | As above. |
-| Recall cache, touch timestamps, state L2 | Redis | Pure cache — safe to drop at any time. Rebuilds on its own. |
+| Recall cache, touch timestamps | in-memory TTL | Lost on restart, rebuilds on its own. |
 
 `/api/memory/feedback` is fail-hard: if the vote cannot be persisted (Qdrant down, unknown id) it answers 500 instead of a silent success.
-
-Migrating a pre-#11 Redis (one-shot, idempotent, deletes nothing):
-
-```bash
-bun run migrate:state -- --dry-run   # report only: counts + ids with no Qdrant point
-bun run migrate:state                # copy feedback/importance/blocklist (Qdrant wins ties)
-docker volume rm lain-memory-redis   # optional afterwards: Redis rebuilds as pure cache
-```
 
 ### How recall ranks
 
@@ -178,7 +170,7 @@ docker volume rm lain-memory-redis   # optional afterwards: Redis rebuilds as pu
 - `importance`: chat memories use the extractor (`relevance` 1–5 → 0.2 / 0.35 / 0.5 / 0.7 / 0.85); everything else uses the `scoreImportance` regex — dates, money, decision language (`decidiu`, `vai usar`), errors. No project, vendor, health, or personal bonuses; those are the extractor's job. Stored in memory-state (Qdrant `lain_importance`).
 - `confidence`: 0.5 default; ✓ confirm sets 1.0 (and floors importance at 0.85). Archived memories are excluded before ranking.
 - `termBoost`: up to +0.1 for exact query-term matches (terms ≥ 3 chars).
-- Recalled memories get a touch timestamp (30d TTL): the next recall uses it as virtual `updated_at` (use refreshes recency) and bumps importance +0.05. `cached` recalls serve from Redis (5min TTL); votes invalidate the cache.
+- Recalled memories get a touch timestamp (30d TTL): the next recall uses it as virtual `updated_at` (use refreshes recency) and bumps importance +0.05. `cached` recalls serve from in-memory TTL (5min); votes invalidate the cache.
 - `LAIN_MIN_RECALL_SCORE` (default `0.356`) drops low-score hits after ranking.
 
 `kind` (`fact` = stable, `state` = transient) comes from the extractor on chat saves and from a regex on other paths; it drives the decay half-life above. `sensitive` (mental health, crisis, grief, substance use) comes from the extractor; it travels in the payload and has no automated consumer yet.
@@ -202,9 +194,9 @@ All via env (see [.env.example](./.env.example)):
 | `LAIN_WORKSPACE_DIR` | `~/lain-memory-workspace` | Own workspace (graph, seeds, PGS sessions; `~` expanded, dir must exist) |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6333` | Vector backend |
 | `LAIN_LLM_BASE_URL` / `LAIN_LLM_API_KEY` / `LAIN_LLM_MODEL` / `LAIN_EMBED_MODEL` | gateway defaults | Unified LLM contract (`LAIN_LLM_*` → `AI_GATEWAY_*` → OpenAI). `LAIN_LLM_MODEL` drives chat and Mem0 extraction (Mem0 uses the `openai_structured` provider so non-OpenAI models honor the extraction format) |
-| `LAIN_REDIS_ENABLED` / `LAIN_REDIS_HOST` / `LAIN_REDIS_PORT` | `true` / `127.0.0.1` / `6379` | Cache (all paths degrade without it) |
+
 | `LAIN_GRAPHRAG_ENABLED` / `_MAX_CONTEXT_NODES` / `_MAX_DEPTH` | `false` / `10` / `3` | GraphRAG tuning |
-| `LAIN_INSTANCE_ID` | empty | Suffixes collection, graph file, Redis prefix |
+| `LAIN_INSTANCE_ID` | empty | Suffixes collection and graph file |
 | `LAIN_MIN_RECALL_SCORE` | `0.356` | Recall keep threshold |
 | `LAIN_MEMORY_REAPER_ENABLED` / `_DRY_RUN` | — / `false` | Stale-memory expiry |
 | `LAIN_PENDING_MERGE_ENABLED` | `false` | Auto-merge pending-review UPDATE queue in consolidate (item 2) |
@@ -220,7 +212,7 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (required). 
 | Path | Body | Description |
 |------|------|-------------|
 | `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim, with a short display `title` (ideal 3, max 6 words) plus extractor-rated `relevance`/`kind`/`sensitive` (→ importance in memory-state), all in the same extractor call |
-| `/api/memory/recall` | `{ query, project?, limit?, cached?, debug? }` | Ranked search (`cached` = Redis-backed, `debug: true` pins `adjustedScore` + `importance` on every hit). Each hit carries `adjustedScore`, `importance`, `confidence`, `last_confirmed_at`, `status`, `kind`, `title` |
+| `/api/memory/recall` | `{ query, project?, limit?, cached?, debug? }` | Ranked search (`cached` = in-memory, `debug: true` pins `adjustedScore` + `importance` on every hit). Each hit carries `adjustedScore`, `importance`, `confidence`, `last_confirmed_at`, `status`, `kind`, `title` |
 | `/api/memory/list` | `{ project?, limit? }` | List memories (each item carries `confidence`, `last_confirmed_at`, `status`, `kind`, `title`) |
 | `/api/memory/forget` | `{ memory_id, project }` (`global` for global scope) | Trash copy (7d undo) → hard delete → forget-blocklist |
 | `/api/memory/restore` | `{ memory_id, project }` (trash copy id) | Undo a forget within 7d, only in the original scope; lifts the blocklist entry |
@@ -291,6 +283,6 @@ bun run typecheck   # tsc --noEmit
 bun test src/
 ```
 
-Notes: `@qdrant/js-client-rest` pinned to `1.18.0` (`1.19` breaks `client.search`). Back up Qdrant via the **snapshot API**, not by copying `./data/qdrant` live. Redis is cache-only — safe to drop.
+Notes: `@qdrant/js-client-rest` pinned to `1.18.0` (`1.19` breaks `client.search`). Back up Qdrant via the **snapshot API**, not by copying `./data/qdrant` live.
 
 Non-goals: channels, agent lifecycle, session side-effects, MCP proxying — this server owns persistence and retrieval only.

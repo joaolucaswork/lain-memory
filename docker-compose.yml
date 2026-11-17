@@ -1,25 +1,9 @@
-# lain-memory data stack: Qdrant (vectors) + Redis (cache).
-# Qdrant uses a repo-local bind mount (visible, rsync-able); Redis uses a
-# named volume (cache only — safe to drop, rebuilds on its own).
+# lain-memory data stack: Qdrant (vectors).
+# Qdrant uses a repo-local bind mount (visible, rsync-able).
 # Back up Qdrant via the snapshot API, not by copying the bind dir live.
+# No Redis: caches are in-memory TTL (see src/lib/ttl-cache.ts).
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: lain-redis
-    restart: unless-stopped
-    ports:
-      - '127.0.0.1:6379:6379'
-    command: redis-server --appendonly yes
-    volumes:
-      - lain-memory-redis:/data
-    healthcheck:
-      test: ['CMD-SHELL', 'redis-cli set __hc__ $(date +%s%N) PX 2000 && redis-cli get __hc__ | grep -q . && redis-cli del __hc__']
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
   qdrant:
     image: qdrant/qdrant:v1.17.1
     container_name: lain-qdrant
@@ -37,9 +21,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
-
-volumes:
-  lain-memory-redis:
-    # Explicit name: without this, compose prefixes the volume with the
-    # project name (lain-memory_lain-memory-redis), orphaning manual ops.
-    name: lain-memory-redis

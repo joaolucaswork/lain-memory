@@ -8,7 +8,7 @@
 #   1. checks prerequisites (bun, docker + compose) — or installs them
 #      with --install-missing (macOS: brew/curl; Debian/Ubuntu: apt/official
 #      scripts; otherwise prints instructions)
-#   2. starts Qdrant + Redis (docker compose up -d) and waits for Qdrant
+#   2. starts Qdrant (docker compose up -d) and waits for Qdrant
 #   3. creates .env from .env.example (never overwrites yours)
 #   4. creates the workspace dir (LAIN_WORKSPACE_DIR, `~` expanded)
 #   5. bun install
@@ -78,7 +78,7 @@ done
 docker compose version >/dev/null 2>&1 || fail "docker compose plugin not found — update Docker Desktop / docker-compose-plugin"
 
 # ── 2. data stack ────────────────────────────────────────────────────────────
-info "starting Qdrant + Redis..."
+info "starting Qdrant..."
 docker compose up -d >/dev/null || fail "docker compose up failed"
 info "waiting for Qdrant :6333..."
 for _ in $(seq 1 30); do
