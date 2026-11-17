@@ -9,8 +9,6 @@ import {
   addMemory,
   addMemoryWithConflictCheck,
   applyMemoryFeedback,
-  deleteMemory,
-  deleteState,
   restoreFromTrash,
   snapshotMemories,
   trashAndDelete,
@@ -50,29 +48,25 @@ export const handleForget: Handler = async (data) => {
   // ✕ Esquecer: trash copy (7d undo) → hard delete → blocklist.
   // Delete always succeeds when the id exists; trash+blocklist are
   // best-effort (snapshot may miss project-scoped ids without `project`).
-  const snapshots = await snapshotMemories([data.memory_id], data.project, 500);
+  const project = data.project === 'global' ? undefined : data.project;
+  const snapshots = await snapshotMemories([data.memory_id], project, 500);
   const snap = snapshots[0];
-  if (snap && !snap.missing && snap.memory) {
-    const { trashId, deleted } = await trashAndDelete(snap, data.project, {
-      reason: 'user forget vote',
-      trigger: 'api/memory/forget',
-    });
-    if (deleted) {
-      await addToBlocklist(snap.memory);
-      return json({ success: true, trashId, blocked: true });
-    }
-    return json({ error: 'could not archive before delete — original preserved' }, 500);
+  if (!snap || snap.missing || !snap.memory) {
+    return json({ error: 'memory not found in scope' }, 404);
   }
-  await deleteMemory(data.memory_id);
-  // No snapshot existed (id already gone from this scope's listing) —
-  // still evict state leftovers (L2). Best-effort.
-  await deleteState(data.memory_id).catch((err) =>
-    console.error(`[lain-memory] forget state cleanup failed for ${data.memory_id}:`, err instanceof Error ? err.message : err));
-  return json({ success: true, trashId: null, blocked: false });
+  const { trashId, deleted } = await trashAndDelete(snap, project, {
+    reason: 'user forget vote',
+    trigger: 'api/memory/forget',
+  });
+  if (deleted) {
+    await addToBlocklist(snap.memory);
+    return json({ success: true, trashId, blocked: true, project: data.project ?? 'global' });
+  }
+  return json({ error: 'could not archive before delete — original preserved' }, 500);
 };
 
 export const handleRestore: Handler = async (data) => {
-  const result = await restoreFromTrash(data.memory_id);
+  const result = await restoreFromTrash(data.memory_id, data.project);
   if (!result.restored) {
     const gone = result.reason === 'restore window expired (7d)';
     return json({ error: result.reason ?? 'restore failed' }, gone ? 410 : 404);
@@ -83,6 +77,11 @@ export const handleRestore: Handler = async (data) => {
 export const handleFeedback: Handler = async (data) => {
   const kind = data.kind === 'state' || data.kind === 'fact' ? data.kind : undefined;
   try {
+    const project = data.project === 'global' ? undefined : data.project;
+    const [snapshot] = await snapshotMemories([data.id], project, 500);
+    if (!snapshot || snapshot.missing || !snapshot.memory) {
+      return json({ error: 'memory not found in scope' }, 404);
+    }
     const feedback = await applyMemoryFeedback(data.id, data.action, kind ? { kind } : undefined);
     return json({ id: data.id, ...feedback });
   } catch (err) {
@@ -94,6 +93,11 @@ export const handleFeedback: Handler = async (data) => {
 };
 
 export const handleUpdate: Handler = async (data) => {
+  const project = data.project === 'global' ? undefined : data.project;
+  const [snapshot] = await snapshotMemories([data.id], project, 500);
+  if (!snapshot || snapshot.missing || !snapshot.memory) {
+    return json({ error: 'memory not found in scope' }, 404);
+  }
   const updated = await updateMemory(data.id, data.memory, data.project);
   return json(updated);
 };

@@ -160,18 +160,18 @@ describe('setMemoryFeedback — title', () => {
 });
 
 describe('/api/memory/feedback — validation', () => {
-  it('accepts confirm/archive/unarchive with optional kind', () => {
+  it('accepts confirm/archive/unarchive with explicit project and optional kind', () => {
     for (const action of ['confirm', 'archive', 'unarchive']) {
-      const r = validateRoute('/api/memory/feedback', { id: 'abc', action });
+      const r = validateRoute('/api/memory/feedback', { id: 'abc', action, project: 'diario' });
       expect(r.ok).toBe(true);
     }
-    const r = validateRoute('/api/memory/feedback', { id: 'abc', action: 'confirm', kind: 'state' });
+    const r = validateRoute('/api/memory/feedback', { id: 'abc', action: 'confirm', kind: 'state', project: 'diario' });
     expect(r.ok).toBe(true);
   });
 
   it('rejects bad action, bad kind, missing id', () => {
-    expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'forget' }).ok).toBe(false);
-    expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'confirm', kind: 'mood' }).ok).toBe(false);
+    expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'forget', project: 'diario' }).ok).toBe(false);
+    expect(validateRoute('/api/memory/feedback', { id: 'abc', action: 'confirm', kind: 'mood', project: 'diario' }).ok).toBe(false);
     expect(validateRoute('/api/memory/feedback', { action: 'confirm' }).ok).toBe(false);
   });
 });

@@ -213,7 +213,7 @@ All via env (see [.env.example](./.env.example)):
 
 ## API
 
-Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped when key empty). `GET` for health/stats/nodes/metrics, `POST` otherwise. Errors: `{ error: string }`.
+Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (required). `GET` for health/stats/nodes/metrics, `POST` otherwise. Errors: `{ error: string }`.
 
 ### Memory
 
@@ -222,12 +222,12 @@ Base `http://localhost:3341`, `Authorization: Bearer $LAIN_API_KEY` (skipped whe
 | `/api/memory/remember` | `{ text, project?, mode?, assistant?, date?, skipQualityCheck? }` | Save with conflict check (`atomic`/`bundle`/`index`/`raw`). `chat` extracts durable user facts from a turn (`text` = user, `assistant` = model reply, not stored) and saves each verbatim, with a short display `title` (ideal 3, max 6 words) plus extractor-rated `relevance`/`kind`/`sensitive` (→ importance in memory-state), all in the same extractor call |
 | `/api/memory/recall` | `{ query, project?, limit?, cached?, debug? }` | Ranked search (`cached` = Redis-backed, `debug: true` pins `adjustedScore` + `importance` on every hit). Each hit carries `adjustedScore`, `importance`, `confidence`, `last_confirmed_at`, `status`, `kind`, `title` |
 | `/api/memory/list` | `{ project?, limit? }` | List memories (each item carries `confidence`, `last_confirmed_at`, `status`, `kind`, `title`) |
-| `/api/memory/forget` | `{ memory_id, project? }` | Trash copy (7d undo) → hard delete → forget-blocklist |
-| `/api/memory/restore` | `{ memory_id }` (trash copy id) | Undo a forget within 7d; lifts the blocklist entry |
-| `/api/memory/feedback` | `{ id, action: confirm\|archive\|unarchive, kind? }` | User vote: ✓ confirm (confidence 1.0 + importance floor), 🕐 archive (hidden from recall), ↩ unarchive |
+| `/api/memory/forget` | `{ memory_id, project }` (`global` for global scope) | Trash copy (7d undo) → hard delete → forget-blocklist |
+| `/api/memory/restore` | `{ memory_id, project }` (trash copy id) | Undo a forget within 7d, only in the original scope; lifts the blocklist entry |
+| `/api/memory/feedback` | `{ id, project, action: confirm\|archive\|unarchive, kind? }` | User vote, only in the requested scope: ✓ confirm (confidence 1.0 + importance floor), 🕐 archive (hidden from recall), ↩ unarchive |
 | `/api/memory/add` | `{ text, project?, opts? }` | Direct add, no conflict check |
 | `/api/memory/context` | `{ message, project?, charBudget?, limits? }` | Spawn-context composition |
-| `/api/memory/update` | `{ id, memory, project? }` | Update preserving native ID |
+| `/api/memory/update` | `{ id, memory, project }` | Update preserving native ID, only in the requested scope |
 | `/api/memory/consolidate` | `{ project? }` | Dedup/merge pass |
 | `/api/memory/scan` | `{ project }` | Clean stale memories |
 | `/api/memory/resolve-entities` | `{ threshold? }` (default `0.75`) | Entity resolution |
@@ -267,7 +267,7 @@ curl -s localhost:3341/api/memory/list -X POST -H 'Content-Type: application/jso
 curl -s localhost:3341/api/memory/add -X POST -H 'Content-Type: application/json' -H "$KEY" \
   -d '{"text":"<texto restaurado>","opts":{"skipQualityCheck":true}}'
 curl -s localhost:3341/api/memory/forget -X POST -H 'Content-Type: application/json' -H "$KEY" \
-  -d '{"memory_id":"<trash_id>"}'
+  -d '{"memory_id":"<trash_id>","project":"trash"}'
 ```
 
 ### Graph / Seeds / PGS

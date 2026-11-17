@@ -62,9 +62,15 @@ describe('validateRoute', () => {
 
   test('forget exige memory_id; scan exige project', () => {
     expect(validateRoute('/api/memory/forget', {}).ok).toBe(false);
-    expect(validateRoute('/api/memory/forget', { memory_id: 'abc' }).ok).toBe(true);
+    expect(validateRoute('/api/memory/forget', { memory_id: 'abc' }).ok).toBe(false);
+    expect(validateRoute('/api/memory/forget', { memory_id: 'abc', project: 'global' }).ok).toBe(true);
     expect(validateRoute('/api/memory/scan', {}).ok).toBe(false);
     expect(validateRoute('/api/memory/scan', { project: 'lain' }).ok).toBe(true);
+  });
+
+  test('restore e feedback exigem escopo explícito', () => {
+    expect(validateRoute('/api/memory/restore', { memory_id: 'trash-1', project: 'diario' }).ok).toBe(true);
+    expect(validateRoute('/api/memory/feedback', { id: 'memory-1', action: 'confirm', project: 'diario' }).ok).toBe(true);
   });
 
   test('remove-nodes exige ids não-vazio (máx 500)', () => {

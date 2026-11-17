@@ -249,7 +249,7 @@ export const RESTORE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
  * trash copy, and lift the blocklist entry. FAIL-CLOSED: the trash copy is
  * deleted only after the re-save is confirmed.
  */
-export async function restoreFromTrash(trashId: string): Promise<RestoreResult> {
+export async function restoreFromTrash(trashId: string, expectedProject?: string): Promise<RestoreResult> {
   let found;
   try {
     const all = await getMemories(TRASH_PROJECT, 500);
@@ -267,6 +267,10 @@ export async function restoreFromTrash(trashId: string): Promise<RestoreResult> 
   const fromProject = typeof meta.deleted_from === 'string' && meta.deleted_from !== 'global'
     ? meta.deleted_from
     : undefined;
+  const requestedProject = expectedProject === 'global' ? undefined : expectedProject;
+  if (expectedProject !== undefined && requestedProject !== fromProject) {
+    return { id: null, restored: false, reason: 'trash item outside requested scope' };
+  }
   const originalId = typeof meta.original_id === 'string' ? meta.original_id : undefined;
   let savedId: string | null = null;
   try {

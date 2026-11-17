@@ -135,14 +135,15 @@ describe('addMemory respects blocklist', () => {
 });
 
 describe('forget/restore — validation', () => {
-  it('forget accepts optional project', () => {
-    expect(validateRoute('/api/memory/forget', { memory_id: 'abc' }).ok).toBe(true);
+  it('forget requires an explicit project', () => {
+    expect(validateRoute('/api/memory/forget', { memory_id: 'abc' }).ok).toBe(false);
     expect(validateRoute('/api/memory/forget', { memory_id: 'abc', project: 'diario' }).ok).toBe(true);
     expect(validateRoute('/api/memory/forget', {}).ok).toBe(false);
   });
 
-  it('restore requires memory_id', () => {
-    expect(validateRoute('/api/memory/restore', { memory_id: 'abc' }).ok).toBe(true);
+  it('restore requires memory_id and project', () => {
+    expect(validateRoute('/api/memory/restore', { memory_id: 'abc' }).ok).toBe(false);
+    expect(validateRoute('/api/memory/restore', { memory_id: 'abc', project: 'global' }).ok).toBe(true);
     expect(validateRoute('/api/memory/restore', {}).ok).toBe(false);
   });
 });

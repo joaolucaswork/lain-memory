@@ -14,6 +14,7 @@ import { z } from 'zod';
 export const MAX_BODY_BYTES = 1_000_000;
 
 const project = z.string().trim().min(1).max(100).optional();
+const requiredProject = z.string().trim().min(1).max(100);
 const limit = (max: number, def?: number) => {
   const s = z.coerce.number().int().min(1).max(max);
   return def !== undefined ? s.default(def).optional() : s.optional();
@@ -54,12 +55,13 @@ export const routeSchemas: Record<string, z.ZodType> = {
     debug: z.boolean().optional(),
   }),
   '/api/memory/list': z.object({ project, limit: limit(500) }),
-  '/api/memory/forget': z.object({ memory_id: z.string().min(1).max(200), project }),
-  '/api/memory/restore': z.object({ memory_id: z.string().min(1).max(200) }),
+  '/api/memory/forget': z.object({ memory_id: z.string().min(1).max(200), project: requiredProject }),
+  '/api/memory/restore': z.object({ memory_id: z.string().min(1).max(200), project: requiredProject }),
   '/api/memory/feedback': z.object({
     id: z.string().min(1).max(200),
     action: z.enum(['confirm', 'archive', 'unarchive']),
     kind: z.enum(['fact', 'state']).optional(),
+    project: requiredProject,
   }),
   '/api/memory/add': z.object({
     text: text(50000),
@@ -85,7 +87,7 @@ export const routeSchemas: Record<string, z.ZodType> = {
   '/api/memory/update': z.object({
     id: z.string().min(1).max(200),
     memory: text(50000),
-    project,
+    project: requiredProject,
   }),
   '/api/memory/consolidate': z.object({ project }),
   '/api/memory/scan': z.object({ project: z.string().trim().min(1).max(100) }),
