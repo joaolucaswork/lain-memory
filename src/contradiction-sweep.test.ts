@@ -68,7 +68,7 @@ describe('contradiction sweep env', () => {
   });
 });
 
-describe('contradiction cursor fallback (no Redis in tests)', () => {
+describe('contradiction cursor (in-memory)', () => {
   it('round-trips in-memory cursor', async () => {
     await setContradictionCursor('test-scope-cursor', 42);
     expect(await getContradictionCursor('test-scope-cursor')).toBe(42);

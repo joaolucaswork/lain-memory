@@ -4,7 +4,6 @@ import {
   rankRecallResults,
   setMemoryFeedback,
 } from './mem0.js';
-import { connectRedis, getRedis, isRedisAvailable } from './redis.js';
 import { newTestPoint, deleteTestPoints } from './test-points.js';
 
 const feedbackIds: string[] = [];
@@ -15,17 +14,15 @@ const fbId = async (tag: string) => {
 };
 
 beforeAll(async () => {
-  await connectRedis();
-  if (!isRedisAvailable()) throw new Error('Redis required for memory-ranking tests');
+  // Qdrant must answer (feedback authority) — fail fast otherwise.
+  await newTestPoint('rank-probe').then(async (id) => {
+    feedbackIds.push(id);
+    await deleteTestPoints([id]);
+  }).catch(() => { throw new Error('Qdrant required for memory-ranking tests'); });
 });
 
 afterAll(async () => {
   await deleteTestPoints(feedbackIds).catch(() => {});
-  if (!isRedisAvailable()) return;
-  const r = getRedis();
-  for (const id of feedbackIds) {
-    await r.del(`mem0:feedback:${id}`).catch(() => {});
-  }
 });
 
 describe('heuristicKind', () => {

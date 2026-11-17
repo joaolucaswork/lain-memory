@@ -22,7 +22,6 @@ import {
   withRetry,
   type MemoryFeedback,
 } from '../src/mem0.js';
-import { connectRedis, isRedisAvailable } from '../src/redis.js';
 import { runFastLlmJson } from '../src/llm-client.js';
 import { buildTitlePrompt, isTitleCandidate, normalizeChatTitle } from '../src/chat-extract.js';
 
@@ -35,9 +34,6 @@ const CONCURRENCY = Math.max(1, Number(process.argv.find((a) => a.startsWith('--
 const TITLE_MAX_TOKENS = 1024;
 
 type Item = { id: string; memory: string } & MemoryFeedback;
-
-await connectRedis();
-if (!isRedisAvailable()) throw new Error('[backfill] Redis unavailable — titles would be silently dropped');
 
 const items = (await getMemories(PROJECT, LIMIT)) as Item[];
 console.log(`[backfill] project=${PROJECT} listed=${items.length} mode=${WRITE ? 'WRITE' : 'dry-run'}`);

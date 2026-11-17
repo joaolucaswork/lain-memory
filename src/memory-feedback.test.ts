@@ -11,7 +11,6 @@ import {
   persistHeuristicState,
   FEEDBACK_DEFAULTS,
 } from './mem0.js';
-import { connectRedis, disconnectRedis, getRedis, isRedisAvailable } from './redis.js';
 import { clearImportance, readQdrantState } from './memory-state.js';
 import { validateRoute } from './http-validation.js';
 import { newTestPoint, deleteTestPoints } from './test-points.js';
@@ -24,9 +23,7 @@ const newId = async () => {
 };
 
 beforeAll(async () => {
-  await connectRedis();
-  if (!isRedisAvailable()) throw new Error('Redis required for memory-feedback tests');
-  // Qdrant must answer (it is the authority now) — fail fast otherwise.
+  // Qdrant must answer (it is the authority) — fail fast otherwise.
   await newTestPoint('fb-probe').then(async (id) => {
     ids.push(id);
     await deleteTestPoints([id]);
@@ -35,10 +32,6 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await deleteTestPoints(ids).catch(() => {});
-  if (!isRedisAvailable()) return;
-  const r = getRedis();
-  const keys = ids.flatMap((id) => [`mem0:feedback:${id}`, `mem0:importance:${id}`, `mem0:touch:${id}`]);
-  if (keys.length > 0) await r.del(...keys).catch(() => {});
 });
 
 describe('getMemoryFeedback — defaults', () => {
@@ -207,36 +200,27 @@ describe('getManyMemoryFeedback + attachFeedback', () => {
   });
 });
 
-describe('memory-state — Qdrant authority (issue #8)', () => {
-  it('survives an L2 eviction (flush equivalent): falls through to Qdrant', async () => {
+describe('memory-state — Qdrant authority', () => {
+  it('reads persist via Qdrant payload', async () => {
     const id = await newId();
-    await setMemoryFeedback(id, { confidence: 1.0, title: 'sobrevive flush' });
+    await setMemoryFeedback(id, { confidence: 1.0, title: 'sobrevive restart' });
     await setMemoryImportance(id, 0.9);
-    // Evict exactly this id's L2 entries (same code path as a full flush,
-    // without wiping other tests' keys).
-    await getRedis().del(`mem0:feedback:${id}`, `mem0:importance:${id}`);
     expect((await getMemoryFeedback(id)).confidence).toBe(1.0);
-    expect((await getMemoryFeedback(id)).title).toBe('sobrevive flush');
+    expect((await getMemoryFeedback(id)).title).toBe('sobrevive restart');
     expect(await getMemoryImportance(id)).toBe(0.9);
   });
 
-  it('works with Redis unavailable (Qdrant authority)', async () => {
+  it('merges writes without resetting state', async () => {
     const id = await newId();
     await setMemoryFeedback(id, { confidence: 1.0 });
-    await disconnectRedis();
-    try {
-      // Reads degrade to Qdrant, not to defaults.
-      expect((await getMemoryFeedback(id)).confidence).toBe(1.0);
-      // Writes go to Qdrant (L2 skipped), merging — not resetting — state.
-      const next = await setMemoryFeedback(id, { kind: 'state' });
-      expect(next.kind).toBe('state');
-      expect(next.confidence).toBe(1.0);
-      // Confirmed-missing importance reads null (not the unreachable default).
-      expect(await getMemoryImportance(id)).toBeNull();
-    } finally {
-      const { connectRedis: reconnect } = await import('./redis.js');
-      await reconnect();
-    }
+    // Reads come from Qdrant, not defaults.
+    expect((await getMemoryFeedback(id)).confidence).toBe(1.0);
+    // Writes merge — not resetting — state.
+    const next = await setMemoryFeedback(id, { kind: 'state' });
+    expect(next.kind).toBe('state');
+    expect(next.confidence).toBe(1.0);
+    // Confirmed-missing importance reads null (not the unreachable default).
+    expect(await getMemoryImportance(id)).toBeNull();
     expect((await getMemoryFeedback(id)).kind).toBe('state');
   });
 
