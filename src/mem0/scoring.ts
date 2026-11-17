@@ -53,6 +53,12 @@ export function scoreActionability(text: string): number {
   if (/\b(?:token|bearer|api[_-]?key|authorization|header)\b/i.test(text) && /[:='"]\s*\S+/.test(text)) score++;
   // +1 complete example (curl command, code snippet, or full config)
   if (/\bcurl\b.*https?:\/\//i.test(text) || /```[\s\S]*```/.test(text) || /\{[^}]*"[\w]+"[^}]*:[^}]*\}/.test(text)) score++;
+  // +1 frontend implementation detail (concrete file + code-splitting primitive).
+  // WHY: API-centric signals above (URL + method + auth + curl) cap a frontend
+  // plan at 1 by construction. A file ref paired with a real tech primitive
+  // (React.lazy/Suspense/manualChunks) is the frontend equivalent of actionable
+  // detail — counts as neutral (2), not vague (1), not complete (4+).
+  if (/[A-Za-z0-9_-]+\.(?:tsx|ts|jsx|js)\b/.test(text) && /\b(?:React\.lazy|Suspense|manualChunks|prefetch|code splitting|lazy\b|bundle)\b/i.test(text)) score++;
 
   return Math.min(score, 5);
 }
@@ -355,6 +361,11 @@ export function scoreMemoryQuality(text: string): number {
   if (/\d+/.test(text)) score += 1;
   // +1 longer content (more specific)
   if (text.length > 60) score += 1;
+  // +1 concrete file reference (App.tsx, not prose)
+  if (/[A-Za-z0-9_-]+\.(?:tsx|ts|jsx|js|css|json|md)\b/.test(text)) score += 1;
+  // +1 scoped validation (route + build/typecheck/validar).
+  // WHY: routes + validation verbs scope the plan the way a date does.
+  if (/\s\/[a-z0-9_.-]+/.test(text) && /\b(?:build|typecheck|validar|navega)/i.test(text)) score += 1;
   // +1 structured prefix like [Seed:] or [Project:]
   if (/^\[.+?\]/.test(text)) score += 1;
   // -2 too short + no specifics
@@ -362,7 +373,11 @@ export function scoreMemoryQuality(text: string): number {
 
   // Actionability bonus/penalty for technical memories (Patch 8)
   const actionability = scoreActionability(text);
-  const hasContext = /\b(decided|chose|fixed|resolved|configured|implemented|completed|designed|because|due to|after|on \d{1,2}\s+\w+ \d{4})\b/i.test(text);
+  // PT-BR + plan markers count as context: porque/pois/decidiu/plano/critério/
+  // validar/sucesso/após carry the same "not a vague reference" signal as
+  // because/decided/after. WHY: the original EN-only list penalized PT-BR
+  // implementation plans that stated scope + success criteria in prose.
+  const hasContext = /\b(decided|decidiu|decidimos|chose|fixed|resolved|configured|implemented|completed|designed|because|porque|pois|due to|after|ap[oó]s|plano|criterio|critério|validar|sucesso)\b|on \d{1,2}\s+\w+ \d{4}/i.test(text);
   if (actionability === 1 && !hasContext) score -= 2;  // Vague technical reference without context
   else if (actionability >= 4) score += 2;             // Complete with auth/example
   // actionability 2-3: neutral (has some detail but not complete)
