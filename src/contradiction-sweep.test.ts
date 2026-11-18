@@ -1,4 +1,4 @@
-import { describe, it, expect, mock } from 'bun:test';
+import { describe, it, expect, mock, afterAll } from 'bun:test';
 
 import * as realMem0aiOssNs from 'mem0ai/oss';
 const realMem0aiOss = { ...realMem0aiOssNs };
@@ -9,6 +9,13 @@ mock.module('mem0ai/oss', () => ({
   OpenAILLM: class MockOpenAILLM {},
   OpenAIEmbedder: class MockOpenAIEmbedder {},
 }));
+
+// Restore the real module when done: mock.module leaks across test files in
+// one bun process, and a later file (mem0-gateway.test.ts) needs the real
+// OpenAIEmbedder prototype. Same pattern as the other mem0*.test.ts files.
+afterAll(() => {
+  mock.module('mem0ai/oss', () => realMem0aiOss);
+});
 
 const mem0 = await import('./mem0.js');
 const {
