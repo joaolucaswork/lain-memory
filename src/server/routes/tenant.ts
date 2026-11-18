@@ -18,6 +18,7 @@ import {
   getTenantProjects,
   MASTER_TENANT,
   deleteTenantBlocklistFile,
+  resetTenantName,
   resetTenantProjects,
   normalizeTenant,
   upsertTenantForSub,
@@ -117,6 +118,37 @@ export const handleTenantMcpToken: Handler = async (data) => {
   }
 };
 
+/**
+ * Canonical display name (profile edit).
+ * GET → {name} (who the agent should call them; null = unknown).
+ * POST {name} → validates + updates ONLY rec.name. The slug never changes
+ * (it is the isolation identity). Master has no record → 400.
+ */
+export const handleTenantProfileGet: Handler = async (data) => {
+  const tenant = normalizeTenant(data.tenant) || tenantOf(data);
+  if (!tenant || tenant === MASTER_TENANT) {
+    return json({ error: 'tenant only' }, 400);
+  }
+  const { getTenantDisplayName } = await import('../../tenants.js');
+  return json({ ok: true, tenant, name: await getTenantDisplayName(tenant) });
+};
+
+export const handleTenantProfileUpdate: Handler = async (data) => {
+  const tenant = normalizeTenant(data.tenant) || tenantOf(data);
+  if (!tenant || tenant === MASTER_TENANT) {
+    return json({ error: 'tenant only — master has no tenant record' }, 400);
+  }
+  try {
+    const { updateTenantName } = await import('../../tenants.js');
+    const updated = await updateTenantName(tenant, (data as Record<string, unknown>).name);
+    return json({ ok: true, ...updated });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const status = msg.includes('unknown tenant') ? 404 : 400;
+    return json({ error: msg }, status);
+  }
+};
+
 export const handleTenantWipe: Handler = async (data) => {
   const tenant = normalizeTenant(data.tenant) || tenantOf(data);
   if (tenant === MASTER_TENANT) {
@@ -177,6 +209,7 @@ export const handleTenantWipe: Handler = async (data) => {
   }
   try {
     await resetTenantProjects(t);
+    await resetTenantName(t);
     await invalidateMem0Cache();
     await invalidateGraphCache();
   } catch (err) {

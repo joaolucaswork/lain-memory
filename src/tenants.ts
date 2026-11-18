@@ -347,6 +347,73 @@ export async function getTenantProjects(tenant: string): Promise<string[]> {
   }
 }
 
+/**
+ * Display-name validation shared by create/link/profile-update.
+ * Same contract as the BFF profile: 2–40 chars, no C0/DEL controls, no
+ * double quotes (prompt-quoting safety). Never throws — 400s, not 500s.
+ */
+export function sanitizeTenantDisplayName(rawName: unknown): { ok: true; name: string } | { ok: false; error: string } {
+  if (typeof rawName !== 'string') return { ok: false, error: 'name is required (min 2 characters)' };
+  const name = rawName.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/"/g, '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (name.length < 2) return { ok: false, error: 'name is required (min 2 characters)' };
+  return { ok: true, name };
+}
+
+/** Canonical display name for a tenant (null when unknown — never throws). */
+export async function getTenantDisplayName(tenantSlug: string): Promise<string | null> {
+  const t = normalizeTenant(tenantSlug);
+  if (!t || t === MASTER_TENANT) return null;
+  const file = getTenantsPath();
+  try {
+    return await withFileLock(file, () => loadTenantsSync()[t]?.name ?? null);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rename a tenant's DISPLAY name only (profile edit).
+ * The slug is the isolation identity (Qdrant user_id, graph scope, session
+ * dir) and NEVER changes here — renaming the slug would orphan every scope.
+ * Master has no record (400 upstream). Throws on unknown tenant/validation.
+ */
+export async function updateTenantName(tenantSlug: string, rawName: unknown): Promise<{ tenant: string; name: string }> {
+  const t = normalizeTenant(tenantSlug);
+  if (!t || t === MASTER_TENANT) throw new Error('master has no tenant record');
+  const clean = sanitizeTenantDisplayName(rawName);
+  if (!clean.ok) throw new Error(clean.error);
+  const file = getTenantsPath();
+  let renamed = false;
+  await withFileLock(file, () => {
+    const records = loadTenantsSync();
+    const rec = records[t];
+    if (!rec) throw new Error(`unknown tenant '${t}'`);
+    rec.name = clean.name;
+    saveTenantsSync(records);
+    renamed = true;
+  });
+  if (!renamed) throw new Error(`unknown tenant '${t}'`);
+  return { tenant: t, name: clean.name };
+}
+
+/** Reset the display name to the slug (wipe flow: name is PII, record stays). */
+export async function resetTenantName(tenantSlug: string): Promise<void> {
+  const t = normalizeTenant(tenantSlug);
+  if (!t || t === MASTER_TENANT) return;
+  const file = getTenantsPath();
+  try {
+    await withFileLock(file, () => {
+      const records = loadTenantsSync();
+      if (records[t]) {
+        records[t].name = t;
+        saveTenantsSync(records);
+      }
+    });
+  } catch (err) {
+    console.error('[tenants] resetTenantName failed:', err instanceof Error ? err.message : err);
+  }
+}
+
 /** Clear the project registry (wipe flow keeps the tenant + key). */
 export async function resetTenantProjects(tenant: string): Promise<void> {
   const t = normalizeTenant(tenant);

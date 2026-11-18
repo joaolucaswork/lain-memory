@@ -65,7 +65,7 @@ import {
   MASTER_TENANT,
   type TenantIdentity,
 } from './tenants.js';
-import { handleTenantLink, handleTenantMcpToken, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
+import { handleTenantLink, handleTenantMcpToken, handleTenantProfileGet, handleTenantProfileUpdate, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
 import { handleMcpOptions, handleMcpRequest } from './server/mcp-http.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
@@ -91,13 +91,14 @@ const GET_ROUTES = new Set([
   '/health',
   '/api/health',
   '/api/tenant/whoami',
+  '/api/tenant/profile',
   '/api/memory/metrics',
   '/api/memory/contradictions',
   '/api/graph/stats',
   '/api/graph/nodes',
 ]);
 
-async function route(path: string, data: Record<string, any>): Promise<Response> {
+async function route(path: string, data: Record<string, any>, method: string): Promise<Response> {
   const needMem0 = path.startsWith('/api/memory/') && !path.includes('resolve-entities');
   if (needMem0 && !isMem0Configured()) {
     return json({ error: 'MEM0_API_KEY not configured' }, 500);
@@ -203,6 +204,9 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/tenant/mcp-token':
       return handleTenantMcpToken(data);
 
+    case '/api/tenant/profile':
+      return method === 'GET' ? handleTenantProfileGet(data) : handleTenantProfileUpdate(data);
+
     case '/api/tenant/whoami':
       return handleTenantWhoami(data);
 
@@ -270,7 +274,7 @@ async function boot(): Promise<void> {
         const validated = validateRoute(url.pathname, Object.fromEntries(url.searchParams));
         if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
         try {
-          return await route(url.pathname, withTenant(validated.data));
+          return await route(url.pathname, withTenant(validated.data), req.method);
         } catch (err) {
           console.error(`[lain-memory] route ${url.pathname} failed:`, err);
           return json({ error: 'internal error' }, 500);
@@ -279,7 +283,7 @@ async function boot(): Promise<void> {
       // Tenant wipe is a DELETE with no body (LGPD elimination).
       if (req.method === 'DELETE' && url.pathname === '/api/tenant/data') {
         try {
-          return await route(url.pathname, { tenant: tenant?.tenant ?? MASTER_TENANT, clientIp });
+          return await route(url.pathname, { tenant: tenant?.tenant ?? MASTER_TENANT, clientIp }, req.method);
         } catch (err) {
           console.error(`[lain-memory] route ${url.pathname} failed:`, err);
           return json({ error: 'internal error' }, 500);
@@ -291,7 +295,7 @@ async function boot(): Promise<void> {
       const validated = validateRoute(url.pathname, body.data);
       if (!validated.ok) return json({ error: 'invalid request', issues: validated.issues }, 400);
       try {
-        return await route(url.pathname, withTenant(validated.data));
+        return await route(url.pathname, withTenant(validated.data), req.method);
       } catch (err) {
         // Never leak internals (stacks, paths, backend messages) to callers.
         console.error(`[lain-memory] route ${url.pathname} failed:`, err);

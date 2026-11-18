@@ -18,13 +18,17 @@ import {
   createTenant,
   findTenantByKey,
   findTenantBySub,
+  getTenantDisplayName,
   getTenantProjects,
   hashTenantKey,
   mintTenantKey,
   normalizeTenant,
   recordTenantProject,
+  resetTenantName,
   resetTenantProjects,
+  sanitizeTenantDisplayName,
   slugifyTenantName,
+  updateTenantName,
   upsertTenantForSub,
   validateTenantSlug,
 } from './tenants.js';
@@ -196,6 +200,47 @@ describe('supabase sub linking', () => {
   it('mint refuses master and unknown tenants', async () => {
     await expect(mintTenantKey('lucas')).rejects.toThrow();
     await expect(mintTenantKey('nope')).rejects.toThrow();
+  });
+});
+
+describe('canonical display name', () => {
+  it('sanitiza igual ao BFF (controles viram espaço, aspas caem)', () => {
+    expect(sanitizeTenantDisplayName('  Ana  ')).toEqual({ ok: true, name: 'Ana' });
+    expect(sanitizeTenantDisplayName('a').ok).toBe(false);
+    expect(sanitizeTenantDisplayName(null).ok).toBe(false);
+    expect(sanitizeTenantDisplayName('Ana\n"admin"')).toEqual({ ok: true, name: 'Ana admin' });
+    const long = sanitizeTenantDisplayName('x'.repeat(50));
+    expect(long.ok && (long as { name: string }).name.length).toBe(40);
+  });
+
+  it('update troca só o nome: slug, key e dados intactos', async () => {
+    const created = await createTenant('Beto');
+    const updated = await updateTenantName(created.tenant, 'Roberto');
+    expect(updated).toEqual({ tenant: created.tenant, name: 'Roberto' });
+    // Slug é identidade: não mudou; a key antiga continua válida.
+    expect(await getTenantDisplayName(created.tenant)).toBe('Roberto');
+    expect(await findTenantByKey(created.apiKey)).toEqual({ tenant: created.tenant, isMaster: false });
+  });
+
+  it('update recusa master, desconhecido e nome inválido', async () => {
+    await expect(updateTenantName('lucas', 'X')).rejects.toThrow();
+    await expect(updateTenantName('nope', 'Ana')).rejects.toThrow();
+    const created = await createTenant('Carol');
+    await expect(updateTenantName(created.tenant, 'x')).rejects.toThrow();
+    expect(await getTenantDisplayName(created.tenant)).toBe('Carol');
+  });
+
+  it('reset volta o nome para o slug (wipe: nome é PII, registro fica)', async () => {
+    const created = await createTenant('Daniel');
+    await updateTenantName(created.tenant, 'Dan');
+    await resetTenantName(created.tenant);
+    expect(await getTenantDisplayName(created.tenant)).toBe(created.tenant);
+    expect(await findTenantByKey(created.apiKey)).toEqual({ tenant: created.tenant, isMaster: false });
+  });
+
+  it('get retorna null para master e desconhecido', async () => {
+    expect(await getTenantDisplayName('lucas')).toBeNull();
+    expect(await getTenantDisplayName('nope')).toBeNull();
   });
 
   it('suffixes slug on collision with a legacy tenant', async () => {
