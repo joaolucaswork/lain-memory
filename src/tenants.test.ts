@@ -17,12 +17,14 @@ import {
   checkTenantRateLimit,
   createTenant,
   findTenantByKey,
+  findTenantBySub,
   getTenantProjects,
   hashTenantKey,
   normalizeTenant,
   recordTenantProject,
   resetTenantProjects,
   slugifyTenantName,
+  upsertTenantForSub,
   validateTenantSlug,
 } from './tenants.js';
 import { userId } from './mem0/config.js';
@@ -146,6 +148,39 @@ describe('tenant store', () => {
     expect(await getTenantProjects('lucas')).toEqual([]);
     await resetTenantProjects(tenant);
     expect(await getTenantProjects(tenant)).toEqual([]);
+  });
+});
+
+describe('supabase sub linking', () => {
+  it('creates a tenant on first link and finds it by sub', async () => {
+    const linked = await upsertTenantForSub('sub-123', 'ana@example.com', 'Ana');
+    expect(linked.created).toBe(true);
+    expect(linked.tenant).toBe('ana');
+    const found = await findTenantBySub('sub-123');
+    expect(found?.tenant).toBe('ana');
+    expect(found?.email).toBe('ana@example.com');
+  });
+
+  it('rotates the key on re-login (old cookie dies)', async () => {
+    const first = await upsertTenantForSub('sub-456', 'beto@example.com', 'Beto');
+    const second = await upsertTenantForSub('sub-456', 'beto@example.com', 'Beto');
+    expect(second.created).toBe(false);
+    expect(second.tenant).toBe(first.tenant);
+    expect(second.apiKey).not.toBe(first.apiKey);
+    expect(await findTenantByKey(first.apiKey)).toBeNull();
+    expect(await findTenantByKey(second.apiKey)).toEqual({ tenant: first.tenant, isMaster: false });
+  });
+
+  it('suffixes slug on collision with a legacy tenant', async () => {
+    await createTenant('Carol');
+    const linked = await upsertTenantForSub('sub-789', 'carol@example.com', 'Carol');
+    expect(linked.created).toBe(true);
+    expect(linked.tenant).toBe('carol-2');
+  });
+
+  it('unknown sub resolves to null', async () => {
+    expect(await findTenantBySub('sub-nope')).toBeNull();
+    expect(await findTenantBySub('')).toBeNull();
   });
 });
 

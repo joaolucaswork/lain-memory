@@ -20,6 +20,7 @@ import {
   deleteTenantBlocklistFile,
   resetTenantProjects,
   normalizeTenant,
+  upsertTenantForSub,
   TENANT_MEMORY_CAP,
 } from '../../tenants.js';
 import { getBlocklistPath } from '../../forget-blocklist.js';
@@ -62,6 +63,26 @@ export const handleTenantSignup: Handler = async (data) => {
     // Duplicate slug → 409 so the demo UI can prompt for another name.
     const status = msg.includes('already taken') ? 409 : 400;
     return json({ error: msg }, status);
+  }
+};
+
+/**
+ * Link a Supabase Auth user to a tenant (find-or-create + key rotation).
+ * MASTER bearer only — the BFF calls this after validating the Supabase
+ * access token server-side. Never open: it mints tenant keys.
+ */
+export const handleTenantLink: Handler = async (data) => {
+  if (data.isMaster !== true) return json({ error: 'master only' }, 403);
+  const sub = typeof data.sub === 'string' ? data.sub.trim() : '';
+  const email = typeof data.email === 'string' ? data.email.trim() : undefined;
+  const name = typeof data.name === 'string' ? data.name.trim().slice(0, 40) : '';
+  if (!sub) return json({ error: 'sub is required' }, 400);
+  try {
+    const linked = await upsertTenantForSub(sub, email, name || (email ?? 'user'));
+    return json({ tenant: linked.tenant, apiKey: linked.apiKey, created: linked.created });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return json({ error: msg }, 400);
   }
 };
 

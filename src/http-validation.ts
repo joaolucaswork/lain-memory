@@ -153,6 +153,11 @@ export const routeSchemas: Record<string, z.ZodType> = {
   '/api/tenant/signup': z.object({
     name: z.string().trim().min(1).max(40),
   }),
+  '/api/tenant/link': z.object({
+    sub: z.string().trim().min(1).max(200),
+    email: z.string().trim().max(160).optional(),
+    name: z.string().trim().max(40).optional(),
+  }),
   '/api/tenant/data': z.object({}).catchall(z.unknown()),
 };
 

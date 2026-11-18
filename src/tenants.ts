@@ -42,6 +42,10 @@ export interface TenantRecord {
   createdAt: string;
   /** Mem0 project scopes this tenant has written to (for wipe enumeration). */
   projects: string[];
+  /** Supabase Auth user id linked to this tenant (null = legacy name-only demo tenant). */
+  supabaseSub?: string;
+  /** Login email (display + future password-reset; never a secret). */
+  email?: string;
 }
 
 type TenantFile = Record<string, TenantRecord>;
@@ -187,6 +191,78 @@ export async function createTenant(displayName: string): Promise<{ tenant: strin
     saveTenantsSync(records);
   });
   return { tenant: slug, apiKey };
+}
+
+/**
+ * Find a tenant record by linked Supabase Auth user id. Null when unlinked.
+ * Never throws (lookup is best-effort; callers fail closed on null).
+ */
+export async function findTenantBySub(sub: string): Promise<TenantRecord | null> {
+  if (!sub) return null;
+  const file = getTenantsPath();
+  try {
+    return await withFileLock(file, () => {
+      const records = loadTenantsSync();
+      for (const rec of Object.values(records)) {
+        if (rec.supabaseSub === sub) return rec;
+      }
+      return null;
+    });
+  } catch (err) {
+    console.error('[tenants] findTenantBySub failed — failing closed:', err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+/**
+ * Find-or-create a tenant for a Supabase Auth user (called by the BFF after
+ * validating the access token — master bearer only).
+ *
+ * The apiKey ROTATES on every call: only the hash persists, so a fresh key
+ * is issued per login and older cookies for the same tenant stop working
+ * (single active session per tenant in the MVP). Returns created=true only
+ * for brand-new tenants.
+ */
+export async function upsertTenantForSub(
+  sub: string,
+  email: string | undefined,
+  displayName: string
+): Promise<{ tenant: string; apiKey: string; created: boolean }> {
+  if (!sub || sub.length > 200) throw new Error('sub is required (max 200 chars)');
+  const cleanEmail = (email ?? '').trim().slice(0, 160);
+  const apiKey = `lm_${randomBytes(24).toString('hex')}`;
+  const file = getTenantsPath();
+  let result: { tenant: string; apiKey: string; created: boolean };
+  await withFileLock(file, () => {
+    const records = loadTenantsSync();
+    for (const rec of Object.values(records)) {
+      if (rec.supabaseSub === sub) {
+        rec.keyHash = hashTenantKey(apiKey);
+        if (cleanEmail) rec.email = cleanEmail;
+        saveTenantsSync(records);
+        result = { tenant: rec.tenant, apiKey, created: false };
+        return;
+      }
+    }
+    // New tenant: slug from display name (or email prefix), suffixed on collision.
+    const fallbackBase = slugifyTenantName(cleanEmail.split('@')[0] ?? '') || 'user';
+    const base = slugifyTenantName(displayName) || fallbackBase;
+    let slug = RESERVED_SLUGS.has(base) ? `${base}-user` : base;
+    for (let n = 2; records[slug] && n < 1000; n++) slug = `${base}-${n}`;
+    if (records[slug]) throw new Error(`name '${base}' is already taken`);
+    records[slug] = {
+      tenant: slug,
+      name: displayName.trim().slice(0, 40) || cleanEmail.split('@')[0]?.slice(0, 40) || slug,
+      keyHash: hashTenantKey(apiKey),
+      createdAt: new Date().toISOString(),
+      projects: [],
+      supabaseSub: sub,
+      ...(cleanEmail ? { email: cleanEmail } : {}),
+    };
+    saveTenantsSync(records);
+    result = { tenant: slug, apiKey, created: true };
+  });
+  return result!;
 }
 
 /** Record a project scope the tenant wrote to (best-effort, for wipe). */

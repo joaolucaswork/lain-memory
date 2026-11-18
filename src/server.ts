@@ -65,7 +65,7 @@ import {
   MASTER_TENANT,
   type TenantIdentity,
 } from './tenants.js';
-import { handleTenantSignup, handleTenantWipe } from './server/routes/tenant.js';
+import { handleTenantLink, handleTenantSignup, handleTenantWipe } from './server/routes/tenant.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
@@ -195,6 +195,9 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case SIGNUP_PATH:
       return handleTenantSignup(data);
 
+    case '/api/tenant/link':
+      return handleTenantLink(data);
+
     case '/api/tenant/data':
       return handleTenantWipe(data);
 
@@ -240,6 +243,7 @@ async function boot(): Promise<void> {
       }
       const withTenant = (data: Record<string, any>): Record<string, any> => {
         data.tenant = tenant?.tenant ?? MASTER_TENANT;
+        data.isMaster = tenant?.isMaster ?? false;
         data.clientIp = clientIp;
         return data;
       };
