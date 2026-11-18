@@ -29,30 +29,7 @@ import {
 import { invalidateMem0Cache, searchMemory } from './read.js';
 import type {
   AddMemoryOpts,
-  MemorySnapshot,
-  TrashProvenance,
 } from './types.js';
-
-/** Lifecycle helpers (M7). Lazy so write.ts never statically imports back. */
-async function lifecycleHelpers(): Promise<{
-  snapshotMemories: (ids: string[], project?: string, limit?: number, tenant?: string) => Promise<MemorySnapshot[]>;
-  trashAndDelete: (
-    snapshot: MemorySnapshot,
-    fromProject: string | undefined,
-    provenance: TrashProvenance,
-    tenant?: string,
-  ) => Promise<{ trashId: string | null; deleted: boolean }>;
-}> {
-  return (await import('./lifecycle.js' as string)) as unknown as {
-    snapshotMemories: (ids: string[], project?: string, limit?: number, tenant?: string) => Promise<MemorySnapshot[]>;
-    trashAndDelete: (
-      snapshot: MemorySnapshot,
-      fromProject: string | undefined,
-      provenance: TrashProvenance,
-      tenant?: string,
-    ) => Promise<{ trashId: string | null; deleted: boolean }>;
-  };
-}
 
 export async function addMemory(text: string, project?: string, opts?: AddMemoryOpts, tenant: string = MASTER_TENANT): Promise<{ id: string; event_id?: string; memory: string; action?: string; superseded?: string[]; reason?: string; score?: number }[]> {
   // Forget-blocklist: a forgotten memory must not be re-extracted through
@@ -243,7 +220,10 @@ export async function addMemoryWithConflictCheck(
     }));
   }
   // Snapshot doomed memories BEFORE saving — audit trail needs full texts.
-  const { snapshotMemories, trashAndDelete } = await lifecycleHelpers();
+  // Lazy import so write.ts never statically imports lifecycle back
+  // (lifecycle → write is the one-directional dependency). Literal path
+  // lets TypeScript infer the exported signatures.
+  const { snapshotMemories, trashAndDelete } = await import('./lifecycle.js');
   const doomed = classification.supersedes.length > 0
     ? await snapshotMemories(classification.supersedes, project, 100, tenant)
     : [];

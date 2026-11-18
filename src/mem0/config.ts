@@ -194,6 +194,11 @@ export function getClient(): Memory {
   return client;
 }
 
+/** Test-only: drop the singleton so mock Memory classes don't leak across test files. */
+export function __resetClientForTests(): void {
+  client = null;
+}
+
 export function userId(project?: string, tenant: string = MASTER_TENANT): string {
   // mem0 rejeita user_id com whitespace — sanitiza para projetos com espaço (ex "lain::latency fixes").
   // Multitenant: o tenant prefixa o user_id (`<tenant>` / `<tenant>:<projeto>`).

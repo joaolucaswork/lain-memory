@@ -152,9 +152,9 @@ export async function rankRecallResults<
 const MEM0_CACHE_TTL = 300; // 5 minutes
 const recallCache = new TtlCache<RankedMemory[]>({ maxEntries: 500 });
 
-function mem0CacheKey(query: string, project?: string, tenant: string = MASTER_TENANT): string {
+function mem0CacheKey(query: string, project?: string, tenant: string = MASTER_TENANT, limit: number = 10): string {
   const t = normalizeTenant(tenant) || MASTER_TENANT;
-  const normalized = `${t}:${query}:${project || ''}`.toLowerCase().trim();
+  const normalized = `${t}:${query}:${project || ''}:${limit}`.toLowerCase().trim();
   let hash = 0;
   for (let i = 0; i < normalized.length; i++) {
     hash = ((hash << 5) - hash + normalized.charCodeAt(i)) | 0;
@@ -166,7 +166,7 @@ function mem0CacheKey(query: string, project?: string, tenant: string = MASTER_T
  * Search memory with in-memory cache. Cache hit: ~0.5ms vs API call: ~200-500ms.
  */
 export async function cachedSearchMemory(query: string, project?: string, limit: number = 10, tenant: string = MASTER_TENANT): Promise<RankedMemory[]> {
-  const key = mem0CacheKey(query, project, tenant);
+  const key = mem0CacheKey(query, project, tenant, limit);
 
   // Try cache first
   try {
