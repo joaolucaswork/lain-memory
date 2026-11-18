@@ -65,7 +65,7 @@ import {
   MASTER_TENANT,
   type TenantIdentity,
 } from './tenants.js';
-import { handleTenantLink, handleTenantMcpToken, handleTenantProfileGet, handleTenantProfileUpdate, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
+import { handleTenantAccountDelete, handleTenantLink, handleTenantMcpToken, handleTenantProfileGet, handleTenantProfileUpdate, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
 import { handleMcpOptions, handleMcpRequest } from './server/mcp-http.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
@@ -213,6 +213,9 @@ async function route(path: string, data: Record<string, any>, method: string): P
     case '/api/tenant/data':
       return handleTenantWipe(data);
 
+    case '/api/tenant/account':
+      return handleTenantAccountDelete(data);
+
     case '/health':
     case '/api/health':
       return json({ ok: true, service: 'lain-memory', auth: 'bearer' });
@@ -280,8 +283,8 @@ async function boot(): Promise<void> {
           return json({ error: 'internal error' }, 500);
         }
       }
-      // Tenant wipe is a DELETE with no body (LGPD elimination).
-      if (req.method === 'DELETE' && url.pathname === '/api/tenant/data') {
+      // Tenant wipe / account delete are DELETEs with no body (LGPD elimination).
+      if (req.method === 'DELETE' && (url.pathname === '/api/tenant/data' || url.pathname === '/api/tenant/account')) {
         try {
           return await route(url.pathname, { tenant: tenant?.tenant ?? MASTER_TENANT, clientIp }, req.method);
         } catch (err) {

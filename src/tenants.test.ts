@@ -16,6 +16,7 @@ import {
   checkSignupAllowed,
   checkTenantRateLimit,
   createTenant,
+  deleteTenantRecord,
   findTenantByKey,
   findTenantBySub,
   getTenantDisplayName,
@@ -200,6 +201,25 @@ describe('supabase sub linking', () => {
   it('mint refuses master and unknown tenants', async () => {
     await expect(mintTenantKey('lucas')).rejects.toThrow();
     await expect(mintTenantKey('nope')).rejects.toThrow();
+  });
+});
+
+describe('account deletion', () => {
+  it('purges the record: key stops resolving, sub unlinks, slug is freed', async () => {
+    const linked = await upsertTenantForSub('sub-bye', 'bye@example.com', 'Bye');
+    const removed = await deleteTenantRecord(linked.tenant);
+    expect(removed.supabaseSub).toBe('sub-bye');
+    expect(await findTenantByKey(linked.apiKey)).toBeNull();
+    expect(await findTenantBySub('sub-bye')).toBeNull();
+    // Slug freed: re-linking the same identity reclaims it.
+    const relinked = await upsertTenantForSub('sub-bye', 'bye@example.com', 'Bye');
+    expect(relinked.created).toBe(true);
+    expect(relinked.tenant).toBe(linked.tenant);
+  });
+
+  it('refuses master and unknown tenants', async () => {
+    await expect(deleteTenantRecord('lucas')).rejects.toThrow();
+    await expect(deleteTenantRecord('nope')).rejects.toThrow();
   });
 });
 

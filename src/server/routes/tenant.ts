@@ -155,6 +155,60 @@ export const handleTenantWipe: Handler = async (data) => {
     return json({ error: 'master wipe is not supported — use forget/scan for lucas data' }, 403);
   }
   const t = tenant;
+  const wiped = await wipeTenantData(t);
+  try {
+    await resetTenantProjects(t);
+    await resetTenantName(t);
+    await invalidateMem0Cache();
+    await invalidateGraphCache();
+  } catch (err) {
+    wiped.errors.push(`cache/registry reset failed: ${err instanceof Error ? err.message : err}`);
+  }
+
+  return json({ success: true, tenant: t, ...wiped });
+};
+
+/**
+ * Full account deletion (LGPD): same data sweep as the wipe, then the
+ * tenant RECORD is purged (key ring, sub link, name). The slug is freed —
+ * a later signup/link may reclaim it. Returns `sub` so the BFF can also
+ * delete the Supabase Auth user. Master → 403.
+ */
+export const handleTenantAccountDelete: Handler = async (data) => {
+  const tenant = normalizeTenant(data.tenant) || tenantOf(data);
+  if (tenant === MASTER_TENANT) {
+    return json({ error: 'master account cannot be deleted via tenant route' }, 403);
+  }
+  const t = tenant;
+  const wiped = await wipeTenantData(t);
+  let sub: string | undefined;
+  try {
+    const { deleteTenantRecord } = await import('../../tenants.js');
+    sub = (await deleteTenantRecord(t)).supabaseSub;
+  } catch (err) {
+    wiped.errors.push(`record purge failed: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    await invalidateMem0Cache();
+    await invalidateGraphCache();
+  } catch (err) {
+    wiped.errors.push(`cache reset failed: ${err instanceof Error ? err.message : err}`);
+  }
+
+  return json({ success: true, tenant: t, sub, ...wiped });
+};
+
+/**
+ * Data sweep shared by wipe (record stays) and account delete (record goes).
+ * Best-effort per item; counts reported honestly. Never throws — errors
+ * accumulate in `errors` so a partial sweep is always reported, not lost.
+ */
+async function wipeTenantData(t: string): Promise<{
+  deletedMemories: number;
+  removedNodes: number;
+  purgedOutbox: number;
+  errors: string[];
+}> {
   let deletedMemories = 0;
   const errors: string[] = [];
 
@@ -207,14 +261,6 @@ export const handleTenantWipe: Handler = async (data) => {
   } catch (err) {
     errors.push(`blocklist wipe failed: ${err instanceof Error ? err.message : err}`);
   }
-  try {
-    await resetTenantProjects(t);
-    await resetTenantName(t);
-    await invalidateMem0Cache();
-    await invalidateGraphCache();
-  } catch (err) {
-    errors.push(`cache/registry reset failed: ${err instanceof Error ? err.message : err}`);
-  }
 
-  return json({ success: true, tenant: t, deletedMemories, removedNodes, purgedOutbox, errors });
-};
+  return { deletedMemories, removedNodes, purgedOutbox, errors };
+}

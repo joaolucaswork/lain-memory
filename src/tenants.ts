@@ -443,6 +443,28 @@ export async function deleteTenantBlocklistFile(path: string): Promise<void> {
   }
 }
 
+/**
+ * Full account removal: drops the tenant record (key ring, sub link, name,
+ * projects). The slug is freed — a later signup/link may reclaim it.
+ * Throws on master and unknown tenants. Returns the removed record so the
+ * caller can finish external cleanup (e.g. Supabase Auth user deletion).
+ */
+export async function deleteTenantRecord(tenantSlug: string): Promise<TenantRecord> {
+  const t = normalizeTenant(tenantSlug);
+  if (!t || t === MASTER_TENANT) throw new Error('master has no tenant record');
+  const file = getTenantsPath();
+  let removed: TenantRecord | null = null;
+  await withFileLock(file, () => {
+    const records = loadTenantsSync();
+    const rec = records[t];
+    if (!rec) throw new Error(`unknown tenant '${t}'`);
+    removed = rec;
+    delete records[t];
+    saveTenantsSync(records);
+  });
+  return removed!;
+}
+
 // ─── Rate limits (in-memory TTL, single-instance — same contract as TtlCache) ───
 
 const tenantMinuteBudget = new TtlCache<number>({ maxEntries: 5000 });

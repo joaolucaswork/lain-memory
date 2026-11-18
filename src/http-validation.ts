@@ -159,6 +159,7 @@ export const routeSchemas: Record<string, z.ZodType> = {
     name: z.string().trim().max(40).optional(),
   }),
   '/api/tenant/data': z.object({}).catchall(z.unknown()),
+  '/api/tenant/account': z.object({}).catchall(z.unknown()),
 };
 
 export interface ValidationIssue {
