@@ -281,6 +281,37 @@ export async function upsertTenantForSub(
   return result!;
 }
 
+/**
+ * Mint a fresh API key for an existing tenant (remote MCP per-account).
+ *
+ * WHY: raw `lm_...` keys live only in cookies/client configs — the store
+ * keeps hashes. A tenant that lost its key (or wants a dedicated MCP token)
+ * calls this with a STILL-VALID bearer; the current hash drops into the
+ * 5-key ring so existing sessions keep working. Master has no record —
+ * minting is a tenant-only op (master uses LAIN_API_KEY directly).
+ * Returns the plaintext key ONCE. Throws when the tenant is unknown.
+ */
+export async function mintTenantKey(tenantSlug: string): Promise<{ tenant: string; apiKey: string }> {
+  const t = normalizeTenant(tenantSlug);
+  if (!t || t === MASTER_TENANT) throw new Error('master uses LAIN_API_KEY directly');
+  const apiKey = `lm_${randomBytes(24).toString('hex')}`;
+  const file = getTenantsPath();
+  let minted = false;
+  await withFileLock(file, () => {
+    const records = loadTenantsSync();
+    const rec = records[t];
+    if (!rec) throw new Error(`unknown tenant '${t}'`);
+    const ring = Array.isArray(rec.pastKeyHashes) ? rec.pastKeyHashes : [];
+    ring.unshift(rec.keyHash);
+    rec.keyHash = hashTenantKey(apiKey);
+    rec.pastKeyHashes = ring.slice(0, KEY_RING_CAP - 1);
+    saveTenantsSync(records);
+    minted = true;
+  });
+  if (!minted) throw new Error(`unknown tenant '${t}'`);
+  return { tenant: t, apiKey };
+}
+
 /** Record a project scope the tenant wrote to (best-effort, for wipe). */
 export async function recordTenantProject(tenant: string, project: string | undefined): Promise<void> {
   const t = normalizeTenant(tenant);

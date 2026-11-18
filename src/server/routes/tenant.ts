@@ -95,6 +95,28 @@ export const handleTenantWhoami: Handler = async (data) => {
   return json({ tenant: normalizeTenant(data.tenant) || tenantOf(data) });
 };
 
+/**
+ * Mint a dedicated MCP token for this tenant (remote per-account MCP).
+ * Tenant bearer only (master uses LAIN_API_KEY directly → 400). The current
+ * key drops into the 5-key ring, so existing sessions/cookies keep working.
+ * Returns the plaintext key ONCE — store it in the MCP client config.
+ */
+export const handleTenantMcpToken: Handler = async (data) => {
+  const tenant = normalizeTenant(data.tenant) || tenantOf(data);
+  if (!tenant || tenant === MASTER_TENANT) {
+    return json({ error: 'tenant only — master uses LAIN_API_KEY directly' }, 400);
+  }
+  try {
+    const { mintTenantKey } = await import('../../tenants.js');
+    const minted = await mintTenantKey(tenant);
+    return json({ ok: true, tenant: minted.tenant, apiKey: minted.apiKey });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const status = msg.includes('unknown tenant') ? 404 : 400;
+    return json({ error: msg }, status);
+  }
+};
+
 export const handleTenantWipe: Handler = async (data) => {
   const tenant = normalizeTenant(data.tenant) || tenantOf(data);
   if (tenant === MASTER_TENANT) {

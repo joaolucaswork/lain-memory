@@ -65,7 +65,8 @@ import {
   MASTER_TENANT,
   type TenantIdentity,
 } from './tenants.js';
-import { handleTenantLink, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
+import { handleTenantLink, handleTenantMcpToken, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
+import { handleMcpOptions, handleMcpRequest } from './server/mcp-http.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
@@ -199,6 +200,9 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
     case '/api/tenant/link':
       return handleTenantLink(data);
 
+    case '/api/tenant/mcp-token':
+      return handleTenantMcpToken(data);
+
     case '/api/tenant/whoami':
       return handleTenantWhoami(data);
 
@@ -226,6 +230,17 @@ async function boot(): Promise<void> {
     hostname: BIND,
     async fetch(req, server) {
       const url = new URL(req.url);
+
+      // Remote MCP (Streamable HTTP, stateless JSON). Owns its auth (per-
+      // request bearer → tenant) + rate limit — BEFORE the generic gate.
+      // :3341 stays DROP; Caddy 443 → 127.0.0.1:3341 carries /mcp.
+      if (url.pathname === '/mcp' || url.pathname.startsWith('/mcp/')) {
+        if (req.method === 'OPTIONS') return handleMcpOptions();
+        if (req.method === 'GET' || req.method === 'POST' || req.method === 'DELETE') {
+          return handleMcpRequest(req);
+        }
+        return json({ error: 'method not allowed' }, 405);
+      }
 
       // Open signup (no key) with a strict per-IP budget. Everything else
       // needs a known bearer (master or tenant key).

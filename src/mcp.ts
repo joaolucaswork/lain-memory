@@ -45,9 +45,9 @@ import { rememberChatTurn } from './chat-extract.js';
 import { normalizeTenant, recordTenantProject, MASTER_TENANT } from './tenants.js';
 
 /** MCP tenant scope. Local stdio is single-user: master unless LAIN_TENANT is set (demo/testing). */
-const MCP_TENANT = normalizeTenant(process.env.LAIN_TENANT ?? '') || MASTER_TENANT;
+export const MCP_TENANT = normalizeTenant(process.env.LAIN_TENANT ?? '') || MASTER_TENANT;
 
-const TOOL_DEFINITIONS = [
+export const TOOL_DEFINITIONS = [
   {
     name: 'remember',
     description:
@@ -258,7 +258,7 @@ export function formatRememberResult(memories: RememberedRow[], project?: string
   return `Remembered${scope}:\n${summary}`;
 }
 
-async function handleTool(name: string, args: Record<string, any>, tenant: string = MCP_TENANT): Promise<ToolResult> {
+export async function handleTool(name: string, args: Record<string, any>, tenant: string = MCP_TENANT): Promise<ToolResult> {
   switch (name) {
     case 'remember': {
       if (args.mode === 'chat') {
@@ -428,6 +428,27 @@ async function handleTool(name: string, args: Record<string, any>, tenant: strin
   }
 }
 
+/**
+ * Build an MCP Server bound to ONE tenant (remote per-account: the bearer
+ * resolved per request closes over its slug — no cross-tenant leakage via
+ * a shared global).
+ */
+export function createMcpServer(tenant: string): Server {
+  const mcpServer = new Server({ name: 'lain-memory', version: '0.1.0' }, { capabilities: { tools: {} } });
+
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }));
+
+  mcpServer.setRequestHandler(CallToolRequestSchema, async request => {
+    try {
+      return await handleTool(request.params.name, (request.params.arguments ?? {}) as Record<string, any>, tenant);
+    } catch (e: unknown) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  });
+
+  return mcpServer;
+}
+
 async function main(): Promise<void> {
   await initGraph();
   startMemoryMaintenance();
@@ -435,17 +456,7 @@ async function main(): Promise<void> {
   startMemoryReaper();
   startBundleSweep();
 
-  const mcpServer = new Server({ name: 'lain-memory', version: '0.1.0' }, { capabilities: { tools: {} } });
-
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_DEFINITIONS }));
-
-  mcpServer.setRequestHandler(CallToolRequestSchema, async request => {
-    try {
-      return await handleTool(request.params.name, (request.params.arguments ?? {}) as Record<string, any>);
-    } catch (e: unknown) {
-      return err(e instanceof Error ? e.message : String(e));
-    }
-  });
+  const mcpServer = createMcpServer(MCP_TENANT);
 
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
@@ -453,7 +464,11 @@ async function main(): Promise<void> {
   console.error('[lain-memory MCP] ready (13 tools, in-process backends)');
 }
 
-main().catch(e => {
-  console.error('[lain-memory MCP] fatal boot error:', e);
-  process.exit(1);
-});
+// Guard: importing this module (remote /mcp per-request server) must NOT
+// spawn the stdio transport — only `bun run src/mcp.ts` does.
+if (import.meta.main) {
+  main().catch(e => {
+    console.error('[lain-memory MCP] fatal boot error:', e);
+    process.exit(1);
+  });
+}

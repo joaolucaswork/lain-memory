@@ -20,6 +20,7 @@ import {
   findTenantBySub,
   getTenantProjects,
   hashTenantKey,
+  mintTenantKey,
   normalizeTenant,
   recordTenantProject,
   resetTenantProjects,
@@ -181,6 +182,20 @@ describe('supabase sub linking', () => {
     }
     expect(await findTenantByKey(keys[0])).toBeNull();
     expect(await findTenantByKey(keys[5])).toEqual({ tenant: 'ring', isMaster: false });
+  });
+
+  it('mints a fresh MCP token, old session key keeps working', async () => {
+    const created = await createTenant('Mcp');
+    const minted = await mintTenantKey(created.tenant);
+    expect(minted.tenant).toBe(created.tenant);
+    expect(minted.apiKey).not.toBe(created.apiKey);
+    expect(await findTenantByKey(created.apiKey)).toEqual({ tenant: created.tenant, isMaster: false });
+    expect(await findTenantByKey(minted.apiKey)).toEqual({ tenant: created.tenant, isMaster: false });
+  });
+
+  it('mint refuses master and unknown tenants', async () => {
+    await expect(mintTenantKey('lucas')).rejects.toThrow();
+    await expect(mintTenantKey('nope')).rejects.toThrow();
   });
 
   it('suffixes slug on collision with a legacy tenant', async () => {
