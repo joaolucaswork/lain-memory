@@ -12,6 +12,9 @@ concurrency:
 jobs:
   verify:
     runs-on: [self-hosted, lain-memory]
+    env:
+      # Chave dummy: cobre o handshake MCP (sem backend) sem vazar segredo.
+      LAIN_API_KEY: ci-dummy-key
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
