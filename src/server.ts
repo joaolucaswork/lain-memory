@@ -65,7 +65,7 @@ import {
   MASTER_TENANT,
   type TenantIdentity,
 } from './tenants.js';
-import { handleTenantLink, handleTenantSignup, handleTenantWipe } from './server/routes/tenant.js';
+import { handleTenantLink, handleTenantSignup, handleTenantWhoami, handleTenantWipe } from './server/routes/tenant.js';
 
 const PORT = Number(process.env.LAIN_MEMORY_PORT ?? 3341);
 const BIND = process.env.LAIN_MEMORY_BIND ?? '127.0.0.1';
@@ -89,6 +89,7 @@ async function tenantFromRequest(req: Request): Promise<TenantIdentity | null> {
 const GET_ROUTES = new Set([
   '/health',
   '/api/health',
+  '/api/tenant/whoami',
   '/api/memory/metrics',
   '/api/memory/contradictions',
   '/api/graph/stats',
@@ -197,6 +198,9 @@ async function route(path: string, data: Record<string, any>): Promise<Response>
 
     case '/api/tenant/link':
       return handleTenantLink(data);
+
+    case '/api/tenant/whoami':
+      return handleTenantWhoami(data);
 
     case '/api/tenant/data':
       return handleTenantWipe(data);

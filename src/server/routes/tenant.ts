@@ -86,6 +86,15 @@ export const handleTenantLink: Handler = async (data) => {
   }
 };
 
+/**
+ * Who am I: resolve the bearer to its tenant slug (BFF session routing).
+ * Any known key works (master → `lucas`); unknown keys never reach here
+ * (dispatcher 401s first).
+ */
+export const handleTenantWhoami: Handler = async (data) => {
+  return json({ tenant: normalizeTenant(data.tenant) || tenantOf(data) });
+};
+
 export const handleTenantWipe: Handler = async (data) => {
   const tenant = normalizeTenant(data.tenant) || tenantOf(data);
   if (tenant === MASTER_TENANT) {

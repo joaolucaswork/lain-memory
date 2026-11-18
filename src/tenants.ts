@@ -38,7 +38,10 @@ const SIGNUP_MAX_PER_HOUR = 10;
 export interface TenantRecord {
   tenant: string;
   name: string;
+  /** Current key hash (rotated per login). */
   keyHash: string;
+  /** Previous key hashes still accepted (multi-device; capped). */
+  pastKeyHashes: string[];
   createdAt: string;
   /** Mem0 project scopes this tenant has written to (for wipe enumeration). */
   projects: string[];
@@ -143,6 +146,8 @@ export interface TenantIdentity {
 
 /**
  * Resolve the bearer key to a tenant. Master key → `lucas` (compat).
+ * Tenant keys match the current hash OR any hash in the rotation ring
+ * (multi-device: older cookies keep working until evicted).
  * Returns null for unknown keys (caller answers 401). Reads never throw —
  * a corrupt/unreadable file fails closed (null) so a broken store can't
  * leak one tenant's data into another's scope.
@@ -158,6 +163,9 @@ export async function findTenantByKey(key: string): Promise<TenantIdentity | nul
       const hash = hashTenantKey(key);
       for (const rec of Object.values(records)) {
         if (rec.keyHash === hash) return { tenant: rec.tenant, isMaster: false };
+        if (Array.isArray(rec.pastKeyHashes) && rec.pastKeyHashes.includes(hash)) {
+          return { tenant: rec.tenant, isMaster: false };
+        }
       }
       return null;
     });
@@ -185,6 +193,7 @@ export async function createTenant(displayName: string): Promise<{ tenant: strin
       tenant: slug,
       name: displayName.trim().slice(0, 40),
       keyHash: hashTenantKey(apiKey),
+      pastKeyHashes: [],
       createdAt: new Date().toISOString(),
       projects: [],
     };
@@ -218,11 +227,14 @@ export async function findTenantBySub(sub: string): Promise<TenantRecord | null>
  * Find-or-create a tenant for a Supabase Auth user (called by the BFF after
  * validating the access token — master bearer only).
  *
- * The apiKey ROTATES on every call: only the hash persists, so a fresh key
- * is issued per login and older cookies for the same tenant stop working
- * (single active session per tenant in the MVP). Returns created=true only
- * for brand-new tenants.
+ * The apiKey ROTATES on every call: only hashes persist, so a fresh key is
+ * issued per login. Previous keys stay valid in a small ring (multi-device;
+ * oldest evicted past RING_CAP). Returns created=true only for brand-new
+ * tenants. History continuity comes from the slug-stable session dir, not
+ * the key — rotation never orphans transcripts.
  */
+const KEY_RING_CAP = 5;
+
 export async function upsertTenantForSub(
   sub: string,
   email: string | undefined,
@@ -237,7 +249,10 @@ export async function upsertTenantForSub(
     const records = loadTenantsSync();
     for (const rec of Object.values(records)) {
       if (rec.supabaseSub === sub) {
+        const ring = Array.isArray(rec.pastKeyHashes) ? rec.pastKeyHashes : [];
+        ring.unshift(rec.keyHash);
         rec.keyHash = hashTenantKey(apiKey);
+        rec.pastKeyHashes = ring.slice(0, KEY_RING_CAP - 1);
         if (cleanEmail) rec.email = cleanEmail;
         saveTenantsSync(records);
         result = { tenant: rec.tenant, apiKey, created: false };
@@ -254,6 +269,7 @@ export async function upsertTenantForSub(
       tenant: slug,
       name: displayName.trim().slice(0, 40) || cleanEmail.split('@')[0]?.slice(0, 40) || slug,
       keyHash: hashTenantKey(apiKey),
+      pastKeyHashes: [],
       createdAt: new Date().toISOString(),
       projects: [],
       supabaseSub: sub,

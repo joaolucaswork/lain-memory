@@ -161,14 +161,26 @@ describe('supabase sub linking', () => {
     expect(found?.email).toBe('ana@example.com');
   });
 
-  it('rotates the key on re-login (old cookie dies)', async () => {
+  it('rotates the key on re-login, old cookie keeps working (ring)', async () => {
     const first = await upsertTenantForSub('sub-456', 'beto@example.com', 'Beto');
     const second = await upsertTenantForSub('sub-456', 'beto@example.com', 'Beto');
     expect(second.created).toBe(false);
     expect(second.tenant).toBe(first.tenant);
     expect(second.apiKey).not.toBe(first.apiKey);
-    expect(await findTenantByKey(first.apiKey)).toBeNull();
+    // History continuity: both keys resolve (multi-device), same slug.
+    expect(await findTenantByKey(first.apiKey)).toEqual({ tenant: first.tenant, isMaster: false });
     expect(await findTenantByKey(second.apiKey)).toEqual({ tenant: first.tenant, isMaster: false });
+  });
+
+  it('evicts the oldest key past the ring cap', async () => {
+    const keys: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const r = await upsertTenantForSub('sub-ring', 'ring@example.com', 'Ring');
+      expect(r.created).toBe(i === 0);
+      keys.push(r.apiKey);
+    }
+    expect(await findTenantByKey(keys[0])).toBeNull();
+    expect(await findTenantByKey(keys[5])).toEqual({ tenant: 'ring', isMaster: false });
   });
 
   it('suffixes slug on collision with a legacy tenant', async () => {
