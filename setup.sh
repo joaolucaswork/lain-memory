@@ -4,6 +4,7 @@
 #
 #   ./setup.sh [--install-missing] [--wire [--agent <name>]... [--plan] [--yes]]
 #   ./setup.sh --remote [--server <url>] [--name <n> | --key <lm_...>] [--agent <name>]... [--plan] [--yes]
+#   ./setup.sh --doctor [--remote [--server <url>] [--key <lm_...>]]
 #
 # What it does:
 #   1. checks prerequisites (bun, docker + compose) — or installs them
@@ -39,13 +40,40 @@ wire_backup() { # $1 = file; copies to file.bak-TS once per run
   info "backed up $1"
 }
 
+# ── agent wiring checks (shared by --wire/--remote/--doctor) ─────────────────
+opencode_has() { # $1 = name; single check (plan/skip)
+  opencode mcp list 2>/dev/null | grep -qE "(^|[[:space:]])$1([[:space:]]|$)"
+}
+opencode_await() { # $1 = name; retry (daemon pode demorar a ler o config novo)
+  for _ in $(seq 1 10); do
+    opencode_has "$1" && return 0
+    sleep 2
+  done
+  return 1
+}
+opencode_wired() {
+  opencode mcp list 2>/dev/null | grep -qE '(^|[[:space:]])(lain-memory|lain_memory)([[:space:]]|$)'
+}
+opencode_remote_wired() {
+  opencode mcp list 2>/dev/null | grep -qE '(^|[[:space:]])lain-remote([[:space:]]|$)'
+}
+claude_wired() {
+  # NOTE: `claude mcp get` prints "No MCP server named" on stderr and still
+  # exits 0 — so merge streams before grepping, or every check reads "wired".
+  ! claude mcp get lain-memory 2>&1 | grep -q "No MCP server named"
+}
+claude_remote_wired() {
+  ! claude mcp get lain-remote 2>&1 | grep -q "No MCP server named"
+}
+
 INSTALL_MISSING=0
-WIRE=0; PLAN=0; YES=0; AGENTS=""; REMOTE=0; SERVER_URL=""; ACCT_NAME=""; ACCT_KEY=""
+WIRE=0; PLAN=0; YES=0; AGENTS=""; REMOTE=0; DOCTOR=0; SERVER_URL=""; ACCT_NAME=""; ACCT_KEY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --install-missing) INSTALL_MISSING=1 ;;
     --wire) WIRE=1 ;;
     --remote) REMOTE=1 ;;
+    --doctor) DOCTOR=1 ;;
     --plan) PLAN=1 ;;
     --yes) YES=1 ;;
     --server)
@@ -76,16 +104,7 @@ for a in $AGENTS; do
   case "$a" in opencode|claude) ;; *) fail "setup: unknown --agent '$a' (use opencode|claude)" ;; esac
 done
 
-# ── remote account + wire (--remote) ─────────────────────────────────────────
-# WHY: o caminho para dummies não exige Docker/Qdrant/LLM key — só conta +
-# token + entrada MCP remota. Conta nova via signup aberto (rate-limitado por
-# IP); existente via --key. O token MCP dedicado vai literal no config do
-# agente (padrão dos MCPs hosted: Supermemory/Mem0 fazem igual); a chave da
-# conta fica só em ~/.config/lain/token (0600) para mints/rotation futuros.
-if [ "$REMOTE" = 1 ]; then
-command -v curl >/dev/null 2>&1 || fail "setup: --remote needs curl"
-SERVER="${SERVER_URL:-https://api.lainmemo.dev}"
-SERVER="${SERVER%/}"
+# ── shared HTTP helpers (remote + doctor; $SERVER set per-mode) ───────────────
 json_field() { # $1 = json, $2 = field — resposta do servidor é compacta
   printf '%s' "$1" | sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p"
 }
@@ -98,6 +117,17 @@ api_post() { # $1 = path, $2 = json body, [$3 = bearer]
       -H 'Content-Type: application/json' -d "$2"
   fi
 }
+
+# ── remote account + wire (--remote) ─────────────────────────────────────────
+# WHY: o caminho para dummies não exige Docker/Qdrant/LLM key — só conta +
+# token + entrada MCP remota. Conta nova via signup aberto (rate-limitado por
+# IP); existente via --key. O token MCP dedicado vai literal no config do
+# agente (padrão dos MCPs hosted: Supermemory/Mem0 fazem igual); a chave da
+# conta fica só em ~/.config/lain/token (0600) para mints/rotation futuros.
+if [ "$REMOTE" = 1 ] && [ "$DOCTOR" = 0 ]; then
+command -v curl >/dev/null 2>&1 || fail "setup: --remote needs curl"
+SERVER="${SERVER_URL:-https://api.lainmemo.dev}"
+SERVER="${SERVER%/}"
 # Conta: --key (existente) ou signup (nova). Em --plan nada é criado.
 if [ "$PLAN" = 1 ]; then
   TENANT="(preview — roda sem --plan para criar a conta)"
@@ -156,12 +186,6 @@ for a in $AGENTS; do
   command -v "$a" >/dev/null 2>&1 || fail "setup: --agent $a requested but '$a' not on PATH"
 done
 [ -n "$R_PLAN" ] || fail "setup: --remote found no agents (need opencode and/or claude on PATH, or pass --agent)"
-opencode_remote_wired() {
-  opencode mcp list 2>/dev/null | grep -qE '(^|[[:space:]])lain-remote([[:space:]]|$)'
-}
-claude_remote_wired() {
-  ! claude mcp get lain-remote 2>&1 | grep -q "No MCP server named"
-}
 echo "setup: remote wire plan ($SERVER/mcp, tenant $TENANT):"
 i=0
 for a in $R_PLAN; do
@@ -212,6 +236,79 @@ for a in ${AGENTS:-opencode claude}; do
 done
 echo "setup: remote OK — restart the agent(s) and ask: what do you remember about this project?"
 echo "Keys: account key in $LAIN_DIR/token (keep it); MCP token in the agent config (re-run --remote to rotate)"
+exit 0
+fi
+
+# ── doctor (--doctor): read-only health check, never changes anything ────────
+# Local (default): toolchain + Qdrant + .env + smoke list + wiring report.
+# Remoto (--doctor --remote [--server] [--key]): whoami + tools/list over /mcp.
+# Cada falha diz o comando exato que resolve; exit 1 lista todos os problemas.
+if [ "$DOCTOR" = 1 ]; then
+PROBLEMS=0
+problem() { echo "FAIL  $1 — $2"; PROBLEMS=$((PROBLEMS + 1)); }
+pass() { echo "PASS  $1"; }
+if [ "$REMOTE" = 1 ]; then
+  command -v curl >/dev/null 2>&1 || fail "setup: --doctor --remote needs curl"
+  SERVER="${SERVER_URL:-https://api.lainmemo.dev}"
+  SERVER="${SERVER%/}"
+  KEY="$ACCT_KEY"
+  if [ -z "$KEY" ] && [ -f "$HOME/.config/lain/token" ]; then
+    # shellcheck disable=SC1090
+    KEY=$(grep '^LAIN_API_KEY=' "$HOME/.config/lain/token" 2>/dev/null | cut -d= -f2-)
+  fi
+  [ -n "$KEY" ] || fail "setup: no key — rode ./setup.sh --remote primeiro ou passe --key lm_..."
+  WHOAMI_CODE=$(curl -sS -m 20 -o /tmp/doctor-whoami.json -w '%{http_code}' "$SERVER/api/tenant/whoami" -H "Authorization: Bearer $KEY" 2>/tmp/doctor-curl.err) || WHOAMI_CODE="CURL_FAIL"
+  case "$WHOAMI_CODE" in
+    200)
+      TENANT=$(sed -n 's/.*"tenant":"\([^"]*\)".*/\1/p' /tmp/doctor-whoami.json)
+      pass "whoami ($TENANT @ $SERVER)" ;;
+    401) problem "whoami" "chave rejeitada — rode ./setup.sh --remote --key ... (nova conta) ou --name ... para rotacionar" ;;
+    429) problem "whoami" "rate limit — aguarde um minuto e rode de novo" ;;
+    CURL_FAIL) problem "whoami" "servidor inalcançável ($SERVER): $(head -c 120 /tmp/doctor-curl.err) — confira rede/URL" ;;
+    *) problem "whoami" "HTTP $WHOAMI_CODE — $(head -c 160 /tmp/doctor-whoami.json)" ;;
+  esac
+  if [ "$WHOAMI_CODE" = 200 ]; then
+    TOOLS_JSON=$(curl -sS -m 20 -X POST "$SERVER/mcp" -H 'Content-Type: application/json' \
+      -H 'Accept: application/json, text/event-stream' -H "Authorization: Bearer $KEY" \
+      -d '{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}' 2>/dev/null || true)
+    NTOOLS=$(printf '%s' "$TOOLS_JSON" | grep -o '"name":"' | wc -l | tr -d ' ')
+    if [ "$NTOOLS" = 13 ]; then pass "tools/list remota (13 tools)";
+    else problem "tools/list" "surface incompleta ($NTOOLS!=13) — servidor desatualizado? rode ./setup.sh --remote de novo após o deploy" ; fi
+  fi
+  for a in opencode claude; do
+    command -v "$a" >/dev/null 2>&1 || continue
+    if [ "$a" = opencode ]; then opencode mcp list 2>/dev/null | grep -qE "(^|[[:space:]])lain-remote([[:space:]]|$)" && pass "opencode: lain-remote presente" || problem "opencode: lain-remote" "rode ./setup.sh --remote --agent opencode --yes";
+    else claude mcp get lain-remote 2>&1 | grep -q "No MCP server named" && problem "claude: lain-remote" "rode ./setup.sh --remote --agent claude --yes" || pass "claude: lain-remote presente"; fi
+  done
+else
+  command -v bun >/dev/null 2>&1 && pass "bun ($(command -v bun))" || problem "bun" "instale: curl -fsSL https://bun.sh/install | bash"
+  docker info >/dev/null 2>&1 && pass "docker daemon" || problem "docker" "abra o Docker Desktop e rode de novo"
+  docker compose version >/dev/null 2>&1 && pass "docker compose" || problem "docker compose" "atualize o Docker Desktop / docker-compose-plugin"
+  curl -sf -m 5 localhost:6333/collections >/dev/null 2>&1 && pass "Qdrant :6333" || problem "Qdrant" "rode neste repo: docker compose up -d"
+  if [ -f .env ]; then
+    WS_RAW="$(grep -E '^LAIN_WORKSPACE_DIR=' .env | tail -1 | cut -d= -f2- | xargs)"
+    WS_RAW="${WS_RAW%\"}"; WS_RAW="${WS_RAW#\"}"
+    WS_EVAL="${WS_RAW/#\~/$HOME}"
+    [ -n "$WS_RAW" ] && [ -d "$WS_EVAL" ] && pass ".env + workspace ($WS_EVAL)" || problem ".env/workspace" "edite LAIN_WORKSPACE_DIR no .env e crie o diretório"
+    KEY_OK=0
+    for v in LAIN_LLM_API_KEY OPENROUTER_API_KEY AI_GATEWAY_API_KEY LAIN_OPENAI_API_KEY OPENAI_API_KEY; do
+      val="$(grep -E "^${v}=" .env 2>/dev/null | tail -1 | cut -d= -f2- | xargs)"
+      val="${val%\"}"; val="${val#\"}"
+      case "$val" in ""|*placeholder*) ;; *) KEY_OK=1 ;; esac
+    done
+    [ "$KEY_OK" = 1 ] && pass "LLM key no .env" || echo "WARN  sem LLM key — write-path (remember/recall) não verificado; leitura/lista funcionam"
+  else
+    problem ".env" "rode ./setup.sh para criar a partir do .env.example"
+  fi
+  if bun run smoke >/dev/null 2>&1; then pass "smoke (13 tools over stdio)"; else problem "smoke" "rode bun run smoke para detalhes"; fi
+  for a in opencode claude; do
+    command -v "$a" >/dev/null 2>&1 || continue
+    if [ "$a" = opencode ]; then opencode_wired && pass "opencode: lain-memory presente" || echo "WARN  opencode sem lain-memory — rode ./setup.sh --wire --yes";
+    else claude_wired && pass "claude: lain-memory presente" || echo "WARN  claude sem lain-memory — rode ./setup.sh --wire --yes"; fi
+  done
+fi
+rm -f /tmp/doctor-whoami.json /tmp/doctor-curl.err
+if [ "$PROBLEMS" = 0 ]; then echo "doctor: OK"; else echo "doctor: FAIL ($PROBLEMS)"; exit 1; fi
 exit 0
 fi
 
@@ -354,24 +451,6 @@ fi
 # Usa os CLIs oficiais (opencode mcp add / claude mcp add); o arquivo nunca
 # é editado à mão aqui, então JSONC com comentários sobrevive intacto.
 if [ "$WIRE" = 1 ]; then
-opencode_has() { # $1 = name; single check (plan/skip)
-  opencode mcp list 2>/dev/null | grep -qE "(^|[[:space:]])$1([[:space:]]|$)"
-}
-opencode_await() { # $1 = name; retry (daemon pode demorar a ler o config novo)
-  for _ in $(seq 1 10); do
-    opencode_has "$1" && return 0
-    sleep 2
-  done
-  return 1
-}
-opencode_wired() {
-  opencode mcp list 2>/dev/null | grep -qE '(^|[[:space:]])(lain-memory|lain_memory)([[:space:]]|$)'
-}
-claude_wired() {
-  # NOTE: `claude mcp get` prints "No MCP server named" on stderr and still
-  # exits 0 — so merge streams before grepping, or every check reads "wired".
-  ! claude mcp get lain-memory 2>&1 | grep -q "No MCP server named"
-}
 wire_opencode() {
   OPENCODE_JSON="$HOME/.config/opencode/opencode.jsonc"
   wire_backup "$OPENCODE_JSON"
