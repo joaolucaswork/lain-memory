@@ -63,15 +63,30 @@ Short version: mem0 = what was said, every day. Graph = bonus for connections an
 
 ## Quickstart
 
-Requirements: [Bun](https://bun.sh) ≥ 1.x, Docker Compose (Qdrant), an OpenAI-compatible LLM endpoint.
+Pick a path. **Remote** (2 commands, no Docker/LLM key — memory lives on your
+account): fastest way to a working agent.
 
 ```bash
-./setup.sh [--install-missing]   # macOS/Linux
+git clone https://github.com/joaolucaswork/lain-memory && cd lain-memory
+./setup.sh --remote --yes   # creates account, mints token, wires OpenCode/Claude
+```
+
+`--remote` prompts for a display name (or `--name Ana` / `--key lm_...` for an
+existing account), stores the account key in `~/.config/lain/token` (`0600`),
+and writes the `lain-remote` MCP entry into every detected agent
+(`--agent opencode|claude` to limit, `--plan` to preview, `--server <url>` to
+point elsewhere). Verify anytime: `./setup.sh --doctor --remote`.
+
+**Local** (self-host: Docker + LLM key, data stays on your machine):
+
+```bash
+./setup.sh --wire --yes [--install-missing]   # macOS/Linux
 ```
 
 - Without flags it **checks** prerequisites (Bun, Docker + Compose) and fails with instructions when missing.
 - With `--install-missing` it **installs** them: Bun via the official script; Docker Desktop via Homebrew (macOS) or `get.docker.com` on apt-based Linux. Other platforms print manual steps.
-- Then: starts Qdrant, creates `.env` (never overwrites) + workspace dir, `bun install`, MCP smoke test (`--live` write-path proof when an LLM key exists), and prints harness configs.
+- Then: starts Qdrant, creates `.env` (never overwrites) + workspace dir, `bun install`, MCP smoke test (`--live` write-path proof when an LLM key exists), and `--wire` writes the `lain-memory` MCP entry into detected agents (backup timestamped, idempotent; `--plan` previews).
+- `./setup.sh --doctor` re-checks everything later with actionable errors.
 
 Windows (PowerShell nativo):
 
@@ -87,8 +102,9 @@ Then edit `.env` (workspace dir + LLM keys) and re-run the setup script. Without
 docker compose up -d          # Qdrant :6333
 cp .env.example .env          # set LAIN_WORKSPACE_DIR + LLM keys
 bun install && bun run dev    # :3341
-curl localhost:3341/health
-bun run smoke                 # stdio MCP self-check (12 tools)
+KEY=$(grep '^LAIN_API_KEY=' .env | cut -d= -f2-)
+curl -H "Authorization: Bearer $KEY" localhost:3341/api/health
+bun run smoke                 # stdio MCP self-check (13 tools)
 ```
 
 Supervised: `bun run start` (ou via seu process manager a partir de `ecosystem.config.cjs`).
@@ -169,9 +185,9 @@ Without a domain, keep the ports firewalled and use the bearer token over SSH tu
 
 ## MCP (stdio) — any harness
 
-Native MCP server with only the memory surface (12 tools: `remember`, `recall`, `forget`, `update_memory`, `list_memories`, `scan_memories`, `graph_query`, `graph_stats`, `pgs_query`, `pgs_stats`, `seed_extract`, `list_seeds`). In-process backends — no `:3341` hop, no session hooks (active-project / `[FLUSH:id]` were dropped; they belong to Lain's channel layer).
+Native MCP server with only the memory surface (13 tools: `remember`, `recall`, `forget`, `update_memory`, `list_memories`, `scan_memories`, `bundle_diario`, `graph_query`, `graph_stats`, `pgs_query`, `pgs_stats`, `seed_extract`, `list_seeds`). In-process backends — no `:3341` hop, no session hooks (active-project / `[FLUSH:id]` were dropped; they belong to Lain's channel layer).
 
-Transport is plain stdio (`bun run mcp`), so any MCP-compatible harness works. `./setup.sh` prints the exact snippets with your paths filled in; generically:
+Transport is plain stdio (`bun run mcp`), so any MCP-compatible harness works. Wire it with `./setup.sh --wire --yes` (OpenCode via `opencode mcp add`, Claude Code via `claude mcp add`, user scope); generically:
 
 - **OpenCode** (`~/.config/opencode/opencode.jsonc`):
 
@@ -320,6 +336,8 @@ master `LAIN_API_KEY` → `lucas` (legacy data byte-identical), per-tenant keys
 | Path | Auth | Body | Description |
 |------|------|------|-------------|
 | `POST /api/tenant/signup` | none (10/hour per IP) | `{ name }` (1–40 chars) | Creates `{ tenant, apiKey }`. Names slugify (`João` → `joao`); `lucas`/`admin`/`trash`/`global` reserved; duplicates → `409` |
+| `POST /api/tenant/mcp-token` | tenant key | — | Mints a dedicated MCP token (`{ ok, tenant, apiKey }`, returned once). Current key stays valid (5-key ring); master → `400` (uses `LAIN_API_KEY` directly) |
+| `POST/GET/DELETE /mcp` | tenant/MCP key | JSON-RPC | Remote MCP (Streamable HTTP, stateless, same 13-tool surface as stdio) |
 | `POST` or `DELETE /api/tenant/data` | tenant key | — | LGPD wipe: every memory scope + trash, tenant graph nodes, queued graph outbox entries, tenant blocklist, project registry. Master → `403` (use forget/scan for lucas data) |
 
 Budgets per tenant: **60 req/min** (`429` past it), **500 memories per scope**
