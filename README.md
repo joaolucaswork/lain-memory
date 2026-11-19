@@ -127,8 +127,11 @@ bun install && bun run typecheck
 bun run smoke                 # tool list; smoke:live proves remember→recall→forget
 curl -s -H "Authorization: Bearer $LAIN_API_KEY" localhost:3341/health
 ```
-5. **Service** (`/etc/systemd/system/lain-memory.service`):
+5. **Service** — blue-green, sem downtime (dois slots, flip no Caddy):
 ```ini
+# /etc/systemd/system/lain-memory.service (blue :3341) +
+# /etc/systemd/system/lain-memory-green.service (green :3342, mesmo conteúdo,
+# WorkingDirectory=/opt/lain-memory-green, Environment=LAIN_MEMORY_PORT=3342)
 [Unit]
 Description=lain-memory
 After=docker.service network-online.target
@@ -142,7 +145,13 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
-`systemctl daemon-reload && systemctl enable --now lain-memory`.
+Deploy (`/opt/deploy/lain-memory.sh`, via runner): atualiza o slot idle →
+health-check direto na porta → flip do alias `:3340` no Caddy (`reload` gracioso)
+→ drain 60s → para o antigo. O BFF e `api.<domain>` usam o alias
+(`http://127.0.0.1:3340`), nunca a porta direta. Rollback:
+`/opt/deploy/rollback-lain-memory.sh`. `lain-chat-web` segue o mesmo padrão
+(`:3336/:3337`, `lain-chat-demo{,-green}`, drain 90s p/ SSE). `lain-slots.service`
+sobe os slots live após boot (lê o Caddyfile).
 6. **Firewall (Hetzner Cloud → Firewalls).** Inbound: 22 (ideally your IP only), 80, 443. Never expose 3341/6333 — both bind `127.0.0.1` already.
 7. **TLS.** Point your domain's A record at the server IP and reverse-proxy `127.0.0.1:3341` with Caddy (auto-HTTPS, e.g. `api.<domain>`):
 ```bash
