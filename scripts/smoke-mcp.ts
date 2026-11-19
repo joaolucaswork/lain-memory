@@ -139,7 +139,7 @@ try {
       check(stats.includes('"nodes"'), 'live graph_stats reads the graph', stats);
     } finally {
       for (const id of markerIds) {
-        try { await callTool('forget', { memory_id: id }); }
+        try { await callTool('forget', { memory_id: id, project: LIVE_PROJECT }); }
         catch (e) { check(false, `live cleanup (forget ${id})`, e instanceof Error ? e.message : String(e)); }
       }
       if (markerIds.length > 0) {

@@ -2,7 +2,7 @@
 #
 # lain-memory setup — fresh-machine installer.
 #
-#   ./setup.sh [--install-missing]
+#   ./setup.sh [--install-missing] [--wire [--agent <name>]... [--plan] [--yes]]
 #
 # What it does:
 #   1. checks prerequisites (bun, docker + compose) — or installs them
@@ -15,6 +15,8 @@
 #   6. smoke-tests the MCP server over stdio (expects the 13 memory tools;
 #      live write-path test when an LLM key is configured)
 #   7. prints ready-to-paste configs for OpenCode / Claude Code / any MCP client
+#   8. with --wire: writes the MCP entry into the detected agents automatically
+#      (backup timestamped, idempotent, --plan previews, --yes skips prompt)
 #
 # What it does NOT do: set your LLM keys (edit .env afterwards), touch git,
 # start process-manager services, or migrate data (see README for Qdrant snapshots).
@@ -23,12 +25,27 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO"
 
 INSTALL_MISSING=0
-for arg in "$@"; do
-  case "$arg" in
+WIRE=0; PLAN=0; YES=0; AGENTS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --install-missing) INSTALL_MISSING=1 ;;
+    --wire) WIRE=1 ;;
+    --plan) PLAN=1 ;;
+    --yes) YES=1 ;;
+    --agent)
+      shift; [ $# -gt 0 ] || fail "--agent needs a value (opencode|claude)"
+      AGENTS="$AGENTS $1" ;;
+    --agent=*) AGENTS="$AGENTS ${1#--agent=}" ;;
     -h|--help) sed -n '2,17p' "$0" | sed 's/^# \?//'; exit 0 ;;
-    *) echo "setup: unknown flag $arg (try --help)" >&2; exit 2 ;;
+    *) fail "setup: unknown flag $1 (try --help)" ;;
   esac
+  shift
+done
+if [ "$PLAN" = 1 ] && [ "$WIRE" = 0 ]; then
+  fail "setup: --plan needs --wire (nothing else to preview)"
+fi
+for a in $AGENTS; do
+  case "$a" in opencode|claude) ;; *) fail "setup: unknown --agent '$a' (use opencode|claude)" ;; esac
 done
 
 fail() { echo "setup: ERROR: $1" >&2; exit 1; }
@@ -139,6 +156,7 @@ fi
 
 # ── 8. harness configs ───────────────────────────────────────────────────────
 BUN_BIN="$(command -v bun)"
+if [ "$WIRE" = 0 ]; then
 cat <<EOF
 
 setup: OK — paste one of these into your harness, then restart it.
@@ -166,3 +184,97 @@ seed_extract, list_seeds.
 HTTP API: bun run dev (health: curl -H "Authorization: Bearer \$LAIN_API_KEY" localhost:3341/api/health — /api/health exige bearer desde o multitenant)
 Remoto por tenant: POST /mcp + Authorization: Bearer <chave-do-tenant> (stateless, mesma surface do stdio; minte via POST /api/tenant/mcp-token)
 EOF
+fi
+
+# ── 9. wire agents (--wire) ─────────────────────────────────────────────────
+# WHY: colar JSON manualmente é o estágio que o mercado abandonou — todo
+# memory-MCP sério tem setup que escreve a entrada (Engram, ai-memory).
+# Usa os CLIs oficiais (opencode mcp add / claude mcp add); o arquivo nunca
+# é editado à mão aqui, então JSONC com comentários sobrevive intacto.
+if [ "$WIRE" = 1 ]; then
+WIRED_BACKUPS=""
+wire_backup() { # $1 = file; copies to file.bak-TS once per run
+  [ -f "$1" ] || return 0
+  case " $WIRED_BACKUPS " in *" $1 "*) return 0;; esac
+  cp "$1" "$1.bak-$(date +%F-%H%M%S)" || fail "cannot back up $1"
+  WIRED_BACKUPS="$WIRED_BACKUPS $1"
+  info "backed up $1"
+}
+opencode_wired() {
+  opencode mcp list 2>/dev/null | grep -qE '(^|[[:space:]])(lain-memory|lain_memory)([[:space:]]|$)'
+}
+claude_wired() {
+  # NOTE: `claude mcp get` prints "No MCP server named" on stderr and still
+  # exits 0 — so merge streams before grepping, or every check reads "wired".
+  ! claude mcp get lain-memory 2>&1 | grep -q "No MCP server named"
+}
+wire_opencode() {
+  OPENCODE_JSON="$HOME/.config/opencode/opencode.jsonc"
+  wire_backup "$OPENCODE_JSON"
+  opencode mcp add --global lain-memory --env "LAIN_WORKSPACE_DIR=$WS" -- "$BUN_BIN" run --cwd "$REPO" mcp \
+    || fail "opencode mcp add failed"
+  opencode_wired || fail "opencode mcp add reported ok but lain-memory not in mcp list"
+  info "opencode: lain-memory wired (global, stdio)"
+}
+wire_claude() {
+  CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+  wire_backup "$CLAUDE_JSON"
+  claude mcp add -s user lain-memory -e "LAIN_WORKSPACE_DIR=$WS" -- "$BUN_BIN" run --cwd "$REPO" mcp \
+    || fail "claude mcp add failed"
+  claude_wired || fail "claude mcp add reported ok but lain-memory not found"
+  info "claude: lain-memory wired (user scope, stdio)"
+}
+# Plan: requested (--agent) or detected (CLI on PATH).
+WIRE_PLAN=""
+for a in opencode claude; do
+  case " $AGENTS " in
+    *" $a "*) WIRE_PLAN="$WIRE_PLAN $a:requested" ;;
+    *)
+      if [ -z "$AGENTS" ] && command -v "$a" >/dev/null 2>&1; then
+        WIRE_PLAN="$WIRE_PLAN $a:detected"
+      fi ;;
+  esac
+done
+for a in $AGENTS; do
+  command -v "$a" >/dev/null 2>&1 || fail "setup: --agent $a requested but '$a' not on PATH"
+done
+[ -n "$WIRE_PLAN" ] || fail "setup: --wire found no agents (need opencode and/or claude on PATH, or pass --agent)"
+echo "setup: wire plan (stdio, WS=$WS):"
+i=0
+for entry in $WIRE_PLAN; do
+  a="${entry%%:*}"; how="${entry##*:}"
+  i=$((i + 1))
+  if [ "$a" = opencode ] && opencode_wired; then st="already wired — skip"
+  elif [ "$a" = claude ] && claude_wired; then st="already wired — skip"
+  else st="will add lain-memory ($how)"
+  fi
+  echo "  $i. $a: $st"
+done
+if [ "$PLAN" = 1 ]; then echo "setup: --plan, changing nothing"; exit 0; fi
+if [ "$YES" = 0 ] && [ -z "$AGENTS" ]; then
+  if [ -t 0 ]; then
+    printf 'setup: apply? [Y=all, numbers e.g. 1 2, n=skip]: '
+    read -r ans
+    case "$ans" in
+      Y|y|"") ;;
+      N|n) echo "setup: wiring skipped"; exit 0 ;;
+      *) AGENTS="$(for n in $ans; do
+            n2=0; for entry in $WIRE_PLAN; do
+              n2=$((n2 + 1)); [ "$n2" = "$n" ] && echo "${entry%%:*}"
+            done
+          done)"
+          [ -n "$AGENTS" ] || fail "setup: no valid numbers (nothing changed)" ;;
+    esac
+  else
+    fail "setup: --wire needs --yes (or --agent) when stdin is not a terminal"
+  fi
+fi
+for a in ${AGENTS:-opencode claude}; do
+  case " $WIRE_PLAN " in *" $a:"*) ;; *) continue ;; esac
+  if [ "$a" = opencode ] && opencode_wired; then info "opencode: already wired — skip"; continue; fi
+  if [ "$a" = claude ] && claude_wired; then info "claude: already wired — skip"; continue; fi
+  "wire_$a"
+done
+echo "setup: wire OK — restart the agent(s) and ask: what do you remember about this project?"
+echo "NOTE: default MCP timeout applies; if remember/pgs time out, set mcp.servers.lain-memory.timeout to 120000 in opencode.jsonc"
+fi
