@@ -3,8 +3,8 @@
 /**
  * lain-memory MCP Server (stdio).
  *
- * Exposes ONLY the memory surface (12 tools: 6 memory + 2 graph + 2 PGS +
- * 2 seeds). Calls the in-process backends directly — no HTTP round-trip to
+ * Exposes ONLY the memory surface (13 tools: 6 memory + bundle_diario + 2 graph
+ * + 2 PGS + 2 seeds). Calls the in-process backends directly — no HTTP round-trip to
  * :3341, no auth header, no session side-effects.
  *
  * Dropped on purpose (stays in lain/server while it lives there):

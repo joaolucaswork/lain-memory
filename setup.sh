@@ -12,7 +12,7 @@
 #   3. creates .env from .env.example (never overwrites yours)
 #   4. creates the workspace dir (LAIN_WORKSPACE_DIR, `~` expanded)
 #   5. bun install
-#   6. smoke-tests the MCP server over stdio (expects the 12 memory tools;
+#   6. smoke-tests the MCP server over stdio (expects the 13 memory tools;
 #      live write-path test when an LLM key is configured)
 #   7. prints ready-to-paste configs for OpenCode / Claude Code / any MCP client
 #
@@ -93,7 +93,7 @@ done
 # ── 3. .env ──────────────────────────────────────────────────────────────────
 if [ ! -f .env ]; then
   cp .env.example .env
-  info "created .env from .env.example — EDIT IT (workspace + LLM keys)"
+  info "created .env from .env.example — EDIT IT (LAIN_API_KEY + workspace + LLM keys)"
 else
   info ".env exists — leaving untouched"
 fi
@@ -115,8 +115,11 @@ info "installing dependencies..."
 bun install --silent || fail "bun install failed"
 
 # ── 6. usable LLM key? (warn only; gates the live write-path test) ───────────
+# WHY: mesma ordem de precedência de src/llm-client.ts (LAIN_LLM_API_KEY vence;
+# OPENROUTER_API_KEY/AI_GATEWAY_API_KEY/LAIN_OPENAI_API_KEY/OPENAI_API_KEY caem
+# como fallback). Se adicionar uma chave nova lá, adicione aqui também.
 KEY_OK=0
-for v in LAIN_LLM_API_KEY AI_GATEWAY_API_KEY LAIN_OPENAI_API_KEY OPENAI_API_KEY; do
+for v in LAIN_LLM_API_KEY OPENROUTER_API_KEY AI_GATEWAY_API_KEY LAIN_OPENAI_API_KEY OPENAI_API_KEY; do
   val="$(grep -E "^${v}=" .env 2>/dev/null | tail -1 | cut -d= -f2- | xargs)"
   val="${val%\"}"; val="${val#\"}"
   case "$val" in ""|*placeholder*) ;; *) KEY_OK=1 ;; esac
@@ -131,7 +134,7 @@ if [ "$KEY_OK" = 1 ]; then
 else
   info "smoke-testing the MCP server (tool list only)..."
   bun run smoke || fail "MCP smoke test failed"
-  warn "no usable LLM key in .env — write-path tools (remember/recall/seed/pgs) are unverified. Set one of LAIN_LLM_API_KEY, AI_GATEWAY_API_KEY (+ base URL), LAIN_OPENAI_API_KEY, OPENAI_API_KEY, then run: bun run smoke:live"
+  warn "no usable LLM key in .env — write-path tools (remember/recall/seed/pgs) are unverified. Set one of LAIN_LLM_API_KEY, OPENROUTER_API_KEY, AI_GATEWAY_API_KEY (+ base URL), LAIN_OPENAI_API_KEY, OPENAI_API_KEY, then run: bun run smoke:live"
 fi
 
 # ── 8. harness configs ───────────────────────────────────────────────────────
@@ -157,8 +160,9 @@ setup: OK — paste one of these into your harness, then restart it.
       "args": ["run", "--cwd", "$REPO", "mcp"],
       "env": { "LAIN_WORKSPACE_DIR": "$WS" } }
 
-Tools exposed (12): remember, recall, forget, update_memory, list_memories,
-scan_memories, graph_query, graph_stats, pgs_query, pgs_stats, seed_extract,
-list_seeds.
-HTTP API still available via: bun run dev  (health: curl localhost:3341/health)
+Tools exposed (13): remember, recall, forget, update_memory, list_memories,
+scan_memories, bundle_diario, graph_query, graph_stats, pgs_query, pgs_stats,
+seed_extract, list_seeds.
+HTTP API: bun run dev (health: curl -H "Authorization: Bearer \$LAIN_API_KEY" localhost:3341/api/health — /api/health exige bearer desde o multitenant)
+Remoto por tenant: POST /mcp + Authorization: Bearer <chave-do-tenant> (stateless, mesma surface do stdio; minte via POST /api/tenant/mcp-token)
 EOF
