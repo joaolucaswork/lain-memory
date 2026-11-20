@@ -21,28 +21,33 @@ const lockMap = new Map<string, Promise<void>>();
  * Concurrent callers queue up and execute one at a time, in order.
  */
 export function withFileLock<T>(filePath: string, fn: () => T | Promise<T>): Promise<T> {
-  // Chain onto any existing lock for this path
+  // Chain onto any existing lock for this path. `cur` resolves only after
+  // THIS holder's fn() settles, so queued callers truly serialize async work.
   const prev = lockMap.get(filePath) ?? Promise.resolve();
 
   let releaseLock!: () => void;
-  const lockAcquired = new Promise<void>(resolve => { releaseLock = resolve; });
+  const cur = new Promise<void>(resolve => { releaseLock = resolve; });
+  lockMap.set(filePath, prev.then(() => cur));
 
-  // Queue: wait for prev, acquire, run fn, release
-  const next = prev.then(() => lockAcquired);
-  lockMap.set(filePath, next);
-
-  // Start execution immediately after prev resolves
-  const result = prev.then(async () => {
-    releaseLock(); // Signal that lock is acquired (unblocks `next`)
+  const result = (async () => {
+    await prev;
     try {
       return await fn();
     } finally {
-      // Clean up map if nothing is queued behind us
-      if (lockMap.get(filePath) === next) {
-        lockMap.delete(filePath);
+      releaseLock();
+      // Clean up map if nothing queued behind us.
+      if (lockMap.get(filePath)) {
+        // Peek: if the stored tail already resolved, no one is waiting.
+        // We cannot synchronously know — chain a cleanup that only deletes
+        // when the tail is still ours.
+        const tail = lockMap.get(filePath)!;
+        void tail.then(() => {
+          // If no newer tail replaced us, drop the entry.
+          if (lockMap.get(filePath) === tail) lockMap.delete(filePath);
+        });
       }
     }
-  });
+  })();
 
   return result;
 }
