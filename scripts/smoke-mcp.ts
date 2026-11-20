@@ -41,6 +41,8 @@ function send(obj: unknown): void {
   child.stdin.write(JSON.stringify(obj) + '\n');
 }
 
+const stdoutNoise: string[] = [];
+
 async function readResponse(id: number, timeoutMs = 60_000): Promise<any> {
   const reader = child.stdout.getReader();
   const decoder = new TextDecoder();
@@ -59,7 +61,10 @@ async function readResponse(id: number, timeoutMs = 60_000): Promise<any> {
         try {
           const obj = JSON.parse(t);
           if (obj?.id === id) return obj;
-        } catch { /* stdio noise — ignore */ }
+        } catch {
+          // stdout é 100% JSON-RPC puro — qualquer linha não-JSON é regressão.
+          stdoutNoise.push(t);
+        }
       }
     }
   } finally {
@@ -98,6 +103,8 @@ try {
   console.log(`tools: ${names.length} (${names.join(', ')})`);
   check(missing.length === 0 && names.length === EXPECTED.length, 'tools/list exposes the 13 memory tools',
     missing.length > 0 ? `missing: ${missing.join(', ')}` : '');
+  check(stdoutNoise.length === 0, 'stdout is 100% JSON-RPC pure (no log noise)',
+    stdoutNoise.length > 0 ? `noise: ${stdoutNoise[0].slice(0, 160)}` : '');
 
   if (process.argv.includes('--live')) {
     // Pre-check: Qdrant reachable? (same env the server uses)
@@ -191,6 +198,8 @@ try {
       check(false, 'live cleanup (graph nodes)', e instanceof Error ? e.message : String(e));
     }
   }
+  check(stdoutNoise.length === 0, 'stdout stays 100% JSON-RPC pure after all calls',
+    stdoutNoise.length > 0 ? `noise: ${stdoutNoise[0].slice(0, 160)}` : '');
 }
 
 if (failures.length > 0) {
