@@ -83,7 +83,29 @@ export async function ingestExtracted(
   const sourceIds = opts?.sourceIds;
   const tenant = opts?.tenant ?? MASTER_TENANT;
 
-  for (const entity of entities) {
+  // Per-tenant graph cap (second defense layer; the HTTP handler already
+  // 429s). Truncate rather than drop: keep the first N entities that fit.
+  let effectiveEntities = entities;
+  if (tenant !== MASTER_TENANT) {
+    const { TENANT_GRAPH_NODE_CAP } = await import('../tenants.js');
+    const { normalizeTenant } = await import('../tenants.js');
+    const base = `tn-${normalizeTenant(tenant)}`;
+    let owned = 0;
+    getGraph().forEachNode((key) => {
+      const idx = key.indexOf('::');
+      const scope = idx <= 0 ? null : key.slice(0, idx);
+      if (scope === base || (scope && scope.startsWith(`${base}--`))) owned++;
+    });
+    const remaining = TENANT_GRAPH_NODE_CAP - owned;
+    if (remaining <= 0) {
+      throw new Error(`graph node cap reached (${TENANT_GRAPH_NODE_CAP} nodes) — remove nodes before ingesting more`);
+    }
+    if (effectiveEntities.length > remaining) {
+      effectiveEntities = effectiveEntities.slice(0, remaining);
+    }
+  }
+
+  for (const entity of effectiveEntities) {
     if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
     upsertEntity(entity.name, entity.type as EntityType, entity.description, project, sourceIds, tenant);
   }
