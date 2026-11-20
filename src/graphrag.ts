@@ -17,9 +17,12 @@ export type {
   RelationshipAttrs,
 } from './graphrag/types.js';
 export {
+  __setGraphForTests,
+  __setPersistEnabledForTests,
   getStats,
   initGraph,
   isGraphEnabled,
+  isNodeOwnedByTenant,
   isNodeVisibleToProject,
   nodeProject,
   normalizeProject,
