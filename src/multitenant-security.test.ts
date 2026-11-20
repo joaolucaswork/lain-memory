@@ -30,6 +30,7 @@ import {
   assertSafePublicUrl,
   deleteTenantSeeds,
   extractSeed,
+  isPrivateIP,
 } from './seed-extraction.js';
 import {
   __setGraphForTests,
@@ -57,6 +58,11 @@ import {
   enforceTenantCap,
   enforceTenantGraphCap,
   findTenantByKey,
+  getTenantDisplayName,
+  getTenantProjects,
+  mintTenantKey,
+  recordTenantProject,
+  updateTenantName,
   upsertTenantForSub,
 } from './tenants.js';
 import { routeSchemas, validateRoute } from './http-validation.js';
@@ -71,6 +77,7 @@ import { handleGraphAutoclean, handleGraphIngest, handleGraphSync } from './serv
 import { handleAdd, handleBundle, handleRemember, stripReservedMetadata } from './server/routes/memory-write.js';
 import { handlePgsExecute } from './server/routes/misc.js';
 import { handleTenantAccountDelete } from './server/routes/tenant.js';
+import { ingestExtracted } from './graphrag/ingest.js';
 import { handleTool } from './mcp.js';
 import { deleteTenantPgsSessions } from './pgs/session.js';
 
@@ -175,6 +182,14 @@ describe('1. seed_extract LFI/SSRF', () => {
     }
   });
 
+  it('isPrivateIP covers the full fe80::/10 link-local range (fe80–febf)', () => {
+    expect(isPrivateIP('fe80::1')).toBe(true);
+    expect(isPrivateIP('fe9a::1')).toBe(true);
+    expect(isPrivateIP('febf:ffff::1')).toBe(true);
+    expect(isPrivateIP('fec0::1')).toBe(false); // site-local, outside /10
+    expect(isPrivateIP('fe7f::1')).toBe(false); // just below the range
+  });
+
   it("non-master type:'text' + rawText still works", async () => {
     const out = await extractSeed({
       type: 'text',
@@ -195,8 +210,7 @@ describe('1. seed_extract LFI/SSRF', () => {
       .rejects.not.toThrow(/master-only/);
   });
 
-  it('master full local extraction works end-to-end (stubbed chunk/save)', async () => {
-    const dir = freshTmp('seedfile');
+  it('master full local extraction works end-to-end (stubbed chunk/save)', async () => {    const dir = freshTmp('seedfile');
     const file = join(dir, 'note.txt');
     writeFileSync(file, 'Lucas decided to migrate the billing service to Postgres in Q3.');
     const out = await extractSeed({ type: 'txt', source: file, tenant: 'lucas' });
@@ -325,8 +339,8 @@ describe('4. quotas on every write path', () => {
     for (let i = 0; i < 500; i++) {
       upsertEntity(`node-${i}`, 'Other', undefined, undefined, undefined, 'ana');
     }
-    expect((await enforceTenantGraphCap('ana', 1)).ok).toBe(false);
-    expect((await enforceTenantGraphCap('lucas', 100000)).ok).toBe(true);
+    expect((await enforceTenantGraphCap('ana', [{ name: 'one-more' }])).ok).toBe(false);
+    expect((await enforceTenantGraphCap('lucas', [{ name: 'x' }])).ok).toBe(true);
     const res = await handleGraphIngest({
       tenant: 'ana',
       isMaster: false,
@@ -334,9 +348,56 @@ describe('4. quotas on every write path', () => {
       relationships: [],
     });
     expect(res.status).toBe(429);
-    // Master ingest path stays open (graph write itself is covered by the
-    // in-memory singleton; here we only assert the gate does not 429).
-    __setGetMemoriesForTests(async () => []);
+  });
+
+  it('relationships-only payloads cannot bypass the graph cap', async () => {
+    // 499 owned nodes + entities:[] with 2 brand-new relationship endpoints
+    // = 501 > 500 → must 429 at the pre-check (not ingest, not queue).
+    for (let i = 0; i < 499; i++) {
+      upsertEntity(`capnode-${i}`, 'Other', undefined, undefined, undefined, 'ana');
+    }
+    const rels = [{ subject: 'brand-new-a', predicate: 'USES', object: 'brand-new-b' }];
+    expect((await enforceTenantGraphCap('ana', [], rels)).ok).toBe(false);
+    const res = await handleGraphIngest({
+      tenant: 'ana',
+      isMaster: false,
+      entities: [],
+      relationships: rels,
+    });
+    expect(res.status).toBe(429);
+    const g = getGraph();
+    expect(g.hasNode('tn-ana::brand-new-a')).toBe(false);
+    expect(g.hasNode('tn-ana::brand-new-b')).toBe(false);
+    // Same endpoints already in the graph → no new nodes → allowed.
+    // (Fresh budget check on a graph where the endpoints pre-exist.)
+    __setGraphForTests(new Graph({ type: 'directed', multi: true }));
+    for (let i = 0; i < 498; i++) {
+      upsertEntity(`capnode-${i}`, 'Other', undefined, undefined, undefined, 'ana');
+    }
+    upsertEntity('brand-new-a', 'Other', undefined, undefined, undefined, 'ana');
+    upsertEntity('brand-new-b', 'Other', undefined, undefined, undefined, 'ana');
+    // 500 owned + 0 incoming = exactly at cap → allowed (not over).
+    expect((await enforceTenantGraphCap('ana', [], rels)).ok).toBe(true);
+  });
+
+  it('ingestExtracted throws (never queues) when the tenant graph is full', async () => {
+    for (let i = 0; i < 500; i++) {
+      upsertEntity(`full-${i}`, 'Other', undefined, undefined, undefined, 'ana');
+    }
+    await expect(
+      ingestExtracted([{ name: 'overflow', type: 'Other', description: '' }], [], undefined, { tenant: 'ana' }),
+    ).rejects.toThrow(/graph node cap reached/);
+    // Cap errors must surface as 429, never `queued: true`. Simulate the
+    // race (pre-check passed, ingest threw) by stubbing the handler path:
+    // a full graph + entities-only payload is rejected before queueing.
+    const res = await handleGraphIngest({
+      tenant: 'ana',
+      isMaster: false,
+      entities: [{ name: 'overflow', type: 'Other', description: '' }],
+      relationships: [],
+    });
+    expect(res.status).toBe(429);
+    expect(await res.json()).not.toHaveProperty('queued');
   });
 
   it('stripReservedMetadata removes internal keys for non-master only', () => {
@@ -443,6 +504,38 @@ describe('6. LGPD wipe, tombstone, fail-closed delete', () => {
     await expect(createTenant('Wipe Me')).rejects.toThrow(/already taken/);
     const relinked = await upsertTenantForSub('sub-wipe-1', 'w@example.com', 'Wipe Me');
     expect(relinked.tenant).not.toBe(created.tenant);
+  });
+
+  it('tombstoned tenants are inert for every internal use', async () => {
+    const created = await createTenant('Ghost Town');
+    await deleteTenantRecord(created.tenant);
+    // No new keys, no renames, no display name, no project tracking.
+    await expect(mintTenantKey(created.tenant)).rejects.toThrow(/unknown tenant/);
+    await expect(updateTenantName(created.tenant, 'Someone')).rejects.toThrow(/unknown tenant/);
+    expect(await getTenantDisplayName(created.tenant)).toBeNull();
+    await recordTenantProject(created.tenant, 'diario'); // must not throw…
+    expect(await getTenantProjects(created.tenant)).toEqual([]); // …nor record
+  });
+
+  it('failed save invalidates the cache (no dirty in-memory mutation)', async () => {
+    const { chmodSync } = await import('node:fs');
+    const created = await createTenant('Cache Check');
+    await recordTenantProject(created.tenant, 'p1'); // persisted baseline
+    expect(await getTenantProjects(created.tenant)).toEqual(['p1']);
+    // Read-only dir: load succeeds (cache/disk), mutation happens, the
+    // atomic write fails → saveTenantsSync must drop the cache.
+    chmodSync(tmpRoot, 0o555);
+    try {
+      await recordTenantProject(created.tenant, 'p2'); // internally caught
+    } finally {
+      chmodSync(tmpRoot, 0o755);
+    }
+    // Disk still has only p1; a stale cache would report [p1, p2].
+    expect(await getTenantProjects(created.tenant)).toEqual(['p1']);
+    // And the store is still writable after the failure.
+    await recordTenantProject(created.tenant, 'p3');
+    expect(await getTenantProjects(created.tenant)).toEqual(['p1', 'p3']);
+    expect((await findTenantByKey(created.apiKey))?.tenant).toBe(created.tenant);
   });
 
   it('account delete is fail-closed: errors keep the record (500, retry safe)', async () => {
