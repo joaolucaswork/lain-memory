@@ -42,7 +42,7 @@ import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { rememberChatTurn } from './chat-extract.js';
-import { normalizeTenant, recordTenantProject, MASTER_TENANT } from './tenants.js';
+import { normalizeTenant, recordTenantProject, enforceTenantCap, checkExpensiveOpAllowed, MASTER_TENANT } from './tenants.js';
 
 /** MCP tenant scope. Local stdio is single-user: master unless LAIN_TENANT is set (demo/testing). */
 export const MCP_TENANT = normalizeTenant(process.env.LAIN_TENANT ?? '') || MASTER_TENANT;
@@ -261,6 +261,8 @@ export function formatRememberResult(memories: RememberedRow[], project?: string
 export async function handleTool(name: string, args: Record<string, any>, tenant: string = MCP_TENANT): Promise<ToolResult> {
   switch (name) {
     case 'remember': {
+      const cap = await enforceTenantCap(tenant, args.project);
+      if (!cap.ok) return err(cap.error);
       if (args.mode === 'chat') {
         const memories = await rememberChatTurn({
           user: args.text,
@@ -341,6 +343,10 @@ export async function handleTool(name: string, args: Record<string, any>, tenant
     }
 
     case 'bundle_diario': {
+      if (!args.dry_run) {
+        const cap = await enforceTenantCap(tenant, 'diario');
+        if (!cap.ok) return err(cap.error);
+      }
       const { runBundleSweep } = await import('./bundle-sweep.js');
       const result = await runBundleSweep(args.dry_run ? { dryRun: true, tenant } : { tenant });
       await recordTenantProject(tenant, 'diario');
@@ -358,6 +364,7 @@ export async function handleTool(name: string, args: Record<string, any>, tenant
 
     case 'pgs_query': {
       if (!args.query) return err('query required');
+      if (!checkExpensiveOpAllowed(tenant, 'pgs_query')) return err('expensive op rate limit exceeded (5 req/min)');
       const pgsGraph = await cachedGetGraphForPGS(undefined, tenant);
       if (pgsGraph.nodes.length === 0) return err('Graph is empty');
       const providers = createPGSProviders();
@@ -395,6 +402,9 @@ export async function handleTool(name: string, args: Record<string, any>, tenant
 
     case 'seed_extract': {
       try {
+        if (!checkExpensiveOpAllowed(tenant, 'seed_extract')) return err('expensive op rate limit exceeded (5 req/min)');
+        const cap = await enforceTenantCap(tenant, args.project);
+        if (!cap.ok) return err(cap.error);
         const output = await extractSeed({
           type: args.type,
           source: args.source,
