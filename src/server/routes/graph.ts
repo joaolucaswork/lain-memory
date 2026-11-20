@@ -58,17 +58,19 @@ export const handleGraphDump: Handler = async (data) => {
 
 export const handleGraphIngest: Handler = async (data) => {
   // Pre-extracted payload: applied directly (synchronous, no LLM).
-  // On failure the payload is queued durably and reported (Fase 3).
+  // On failure the payload is queued durably and reported (Fase 3) —
+  // EXCEPT quota errors, which are final: queueing would just defer the
+  // same 429 while letting the outbox grow unbounded.
   const tenant = tenantOf(data);
   const { enforceTenantGraphCap } = await import('../../tenants.js');
-  const incoming = (data.entities?.length ?? 0) + (data.relationships?.length ?? 0);
-  const gcap = await enforceTenantGraphCap(tenant, data.entities?.length ?? 0);
+  const gcap = await enforceTenantGraphCap(tenant, data.entities ?? [], data.relationships ?? [], data.project);
   if (!gcap.ok) return json({ error: gcap.error }, 429);
-  void incoming;
   try {
     await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds, tenant });
     return json({ success: true });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/graph node cap reached/.test(msg)) return json({ error: msg }, 429);
     try {
       appendGraphOutbox({
         entities: data.entities ?? [],
