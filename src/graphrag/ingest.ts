@@ -84,8 +84,10 @@ export async function ingestExtracted(
   const tenant = opts?.tenant ?? MASTER_TENANT;
 
   // Per-tenant graph cap (second defense layer; the HTTP handler already
-  // 429s). Truncate rather than drop: keep the first N entities that fit.
+  // 429s). Budgets BOTH entity nodes and relationship endpoints (which
+  // auto-create nodes below) — each unique new id counted once.
   let effectiveEntities = entities;
+  let effectiveRelationships = relationships;
   if (tenant !== MASTER_TENANT) {
     const { TENANT_GRAPH_NODE_CAP } = await import('../tenants.js');
     const { normalizeTenant } = await import('../tenants.js');
@@ -96,12 +98,42 @@ export async function ingestExtracted(
       const scope = idx <= 0 ? null : key.slice(0, idx);
       if (scope === base || (scope && scope.startsWith(`${base}--`))) owned++;
     });
-    const remaining = TENANT_GRAPH_NODE_CAP - owned;
-    if (remaining <= 0) {
+    const budget = TENANT_GRAPH_NODE_CAP - owned;
+    if (budget <= 0) {
       throw new Error(`graph node cap reached (${TENANT_GRAPH_NODE_CAP} nodes) — remove nodes before ingesting more`);
     }
-    if (effectiveEntities.length > remaining) {
-      effectiveEntities = effectiveEntities.slice(0, remaining);
+    // Claim each unique new id once; over-budget payload is dropped
+    // (fail-closed, no partial overflow). Existing nodes always pass.
+    const claimed = new Set<string>();
+    const claim = (id: string): boolean => {
+      if (!id || getGraph().hasNode(id) || claimed.has(id)) return true;
+      if (claimed.size >= budget) return false;
+      claimed.add(id);
+      return true;
+    };
+    const scopedOrNull = (rawName: unknown): string | null => {
+      if (typeof rawName !== 'string' || !rawName.trim()) return null;
+      try {
+        return scopedId(rawName, project, tenant);
+      } catch {
+        return null;
+      }
+    };
+    effectiveEntities = [];
+    for (const entity of entities) {
+      if (shouldRejectEntity(normalize(entity.name), entity.type)) continue;
+      const id = scopedOrNull(entity.name);
+      if (!id || !claim(id)) continue;
+      effectiveEntities.push(entity);
+    }
+    effectiveRelationships = [];
+    for (const rel of relationships) {
+      if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
+      const sId = scopedOrNull(rel.subject);
+      const tId = scopedOrNull(rel.object);
+      if (!sId || !tId) continue;
+      if (!claim(sId) || !claim(tId)) continue;
+      effectiveRelationships.push(rel);
     }
   }
 
@@ -110,7 +142,7 @@ export async function ingestExtracted(
     upsertEntity(entity.name, entity.type as EntityType, entity.description, project, sourceIds, tenant);
   }
 
-  for (const rel of relationships) {
+  for (const rel of effectiveRelationships) {
     if (shouldRejectRelationship(normalize(rel.subject), rel.predicate, normalize(rel.object))) continue;
     const sourceId = scopedId(rel.subject, project, tenant);
     const targetId = scopedId(rel.object, project, tenant);
