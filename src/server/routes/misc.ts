@@ -55,12 +55,12 @@ export const handleSeedList: Handler = async (data) => {
 
 export const handlePgsExecute: Handler = async (data) => {
   // Partition → route → sweep → synthesize over the local GraphRAG.
+  // NOTE: the expensive-op budget is enforced ONCE in the dispatcher
+  // (server.ts) for HTTP. Do NOT check here too — that would consume 2
+  // units per request and halve the effective 5 req/min. MCP has its own
+  // check in handleTool (different bucket, different entry point).
   if (!data.query) return json({ error: 'query required' });
   const tenant = tenantOf(data);
-  const { checkExpensiveOpAllowed } = await import('../../tenants.js');
-  if (!checkExpensiveOpAllowed(tenant, '/api/pgs/execute')) {
-    return json({ error: 'expensive op rate limit exceeded (5 req/min)' }, 429);
-  }
   const pgsGraph = await cachedGetGraphForPGS(data.project, tenant);
   if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
   const providers = createPGSProviders();
