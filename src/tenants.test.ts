@@ -205,16 +205,19 @@ describe('supabase sub linking', () => {
 });
 
 describe('account deletion', () => {
-  it('purges the record: key stops resolving, sub unlinks, slug is freed', async () => {
+  it('tombstones the record: key stops resolving, sub unlinks, slug stays reserved', async () => {
     const linked = await upsertTenantForSub('sub-bye', 'bye@example.com', 'Bye');
     const removed = await deleteTenantRecord(linked.tenant);
     expect(removed.supabaseSub).toBe('sub-bye');
     expect(await findTenantByKey(linked.apiKey)).toBeNull();
     expect(await findTenantBySub('sub-bye')).toBeNull();
-    // Slug freed: re-linking the same identity reclaims it.
+    // Tombstone: the slug is NEVER reusable (no orphan-data inheritance).
+    await expect(createTenant('Bye')).rejects.toThrow('already taken');
+    // Re-linking the same identity gets a suffixed slug, never the old one.
     const relinked = await upsertTenantForSub('sub-bye', 'bye@example.com', 'Bye');
     expect(relinked.created).toBe(true);
-    expect(relinked.tenant).toBe(linked.tenant);
+    expect(relinked.tenant).toBe(`${linked.tenant}-2`);
+    expect(relinked.tenant).not.toBe(linked.tenant);
   });
 
   it('refuses master and unknown tenants', async () => {
