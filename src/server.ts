@@ -52,13 +52,14 @@ import {
   handleSeedExtract,
   handleSeedList,
 } from './server/routes/misc.js';
-import { json } from './server/http.js';
+import { json, resolveClientIp } from './server/http.js';
 import { startMemoryMaintenance } from './mem0.js';
 import { startDedupSweep } from './dedup-sweep.js';
 import { startMemoryReaper } from './memory-reaper.js';
 import { startBundleSweep } from './bundle-sweep.js';
 import { parseBody, validateRoute } from './http-validation.js';
 import {
+  checkExpensiveOpAllowed,
   checkSignupAllowed,
   checkTenantRateLimit,
   findTenantByKey,
@@ -254,7 +255,8 @@ async function boot(): Promise<void> {
       let tenant: TenantIdentity | null = null;
       let clientIp = 'unknown';
       try {
-        clientIp = server.requestIP(req)?.address ?? 'unknown';
+        const direct = server.requestIP(req)?.address ?? 'unknown';
+        clientIp = resolveClientIp(req, direct);
       } catch { /* Bun without requestIP — signup budget falls back to shared */ }
       if (url.pathname === SIGNUP_PATH) {
         if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405);
@@ -265,6 +267,12 @@ async function boot(): Promise<void> {
         tenant = found;
         if (!checkTenantRateLimit(tenant.tenant)) {
           return json({ error: 'tenant rate limit exceeded (60 req/min)' }, 429);
+        }
+        // Expensive LLM endpoints: stricter 5 req/min per non-master tenant.
+        if (!tenant.isMaster && (url.pathname === '/api/pgs/execute' || url.pathname === '/api/seed/extract')) {
+          if (!checkExpensiveOpAllowed(tenant.tenant, url.pathname)) {
+            return json({ error: 'expensive op rate limit exceeded (5 req/min)' }, 429);
+          }
         }
       }
       const withTenant = (data: Record<string, any>): Record<string, any> => {
@@ -286,7 +294,7 @@ async function boot(): Promise<void> {
       // Tenant wipe / account delete are DELETEs with no body (LGPD elimination).
       if (req.method === 'DELETE' && (url.pathname === '/api/tenant/data' || url.pathname === '/api/tenant/account')) {
         try {
-          return await route(url.pathname, { tenant: tenant?.tenant ?? MASTER_TENANT, clientIp }, req.method);
+          return await route(url.pathname, withTenant({}), req.method);
         } catch (err) {
           console.error(`[lain-memory] route ${url.pathname} failed:`, err);
           return json({ error: 'internal error' }, 500);
