@@ -90,6 +90,10 @@ export const routeSchemas: Record<string, z.ZodType> = {
     project: requiredProject,
   }),
   '/api/memory/consolidate': z.object({ project }),
+  '/api/memory/bundle': z.object({
+    dry_run: z.boolean().optional(),
+    project,
+  }),
   '/api/memory/scan': z.object({ project: z.string().trim().min(1).max(100) }),
   '/api/memory/resolve-entities': z.object({
     threshold: z.coerce.number().min(0).max(1).optional(),
@@ -160,6 +164,11 @@ export const routeSchemas: Record<string, z.ZodType> = {
   }),
   '/api/tenant/data': z.object({}).catchall(z.unknown()),
   '/api/tenant/account': z.object({}).catchall(z.unknown()),
+  '/api/tenant/mcp-token': z.object({}).catchall(z.unknown()),
+  '/api/tenant/profile': z.object({
+    name: z.string().max(40).optional(),
+  }).catchall(z.unknown()),
+  '/api/tenant/whoami': z.object({}).catchall(z.unknown()),
 };
 
 export interface ValidationIssue {
@@ -179,6 +188,8 @@ export function validateRoute(
   data: unknown
 ): { ok: true; data: Record<string, any> } | { ok: false; issues: ValidationIssue[] } {
   const schema = routeSchemas[path];
+  // Unknown paths pass through (the router answers 404). Every KNOWN /api/*
+  // route must have an explicit schema (covered by the multitenant suite).
   if (!schema) return { ok: true, data: (data ?? {}) as Record<string, any> };
   const parsed = schema.safeParse(data ?? {});
   if (parsed.success) return { ok: true, data: parsed.data as Record<string, any> };
