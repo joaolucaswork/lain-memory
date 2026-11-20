@@ -16,6 +16,7 @@
 import { addMemoryWithConflictCheck, setMemoryFeedback, type FeedbackKind } from './mem0.js';
 import { setImportance as stateSetImportance, setRelevance as stateSetRelevance } from './memory-state.js';
 import { runFastLlmJson } from './llm-client.js';
+import { MASTER_TENANT, getTenantDisplayName } from './tenants.js';
 
 export const MAX_CHAT_FACTS = 5;
 export const MAX_CHAT_FACT_CHARS = 320;
@@ -110,13 +111,29 @@ export interface ChatMemoryResult {
 
 type JsonRunner = <T>(prompt: string, opts?: { maxTokens?: number; temperature?: number }) => Promise<T>;
 
-export function acceptChatFact(text: string): boolean {
+export function acceptChatFact(text: string, tenantName?: string | null): boolean {
   const t = text.trim().replace(/\s+/g, ' ');
   if (t.length < 12 || t.length > MAX_CHAT_FACT_CHARS) return false;
   if (GREETING.test(t)) return false;
   if (ASSISTANT_VOICE.test(t)) return false;
-  if (!USER_ANCHOR.test(t)) return false;
+  if (!USER_ANCHOR.test(t) && !tenantAnchorMatches(t, tenantName)) return false;
   return true;
+}
+
+function escapeAnchorRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Aceita o primeiro nome / nome completo do tenant como âncora válida (sem reescrever). */
+function tenantAnchorMatches(text: string, tenantName?: string | null): boolean {
+  const clean = (tenantName ?? '').trim().replace(/\s+/g, ' ');
+  if (!clean) return false;
+  const candidates = [clean, clean.split(' ')[0]].filter((p, i, a) => p && p.length >= 2 && a.indexOf(p) === i);
+  for (const p of candidates) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}_])${escapeAnchorRegExp(p)}(?![\\p{L}\\p{N}_])`, 'iu');
+    if (re.test(text)) return true;
+  }
+  return false;
 }
 
 /** Leading anchor the title must not repeat ("O usuário toma…" → "toma…"). */
@@ -185,7 +202,7 @@ export function normalizeChatTitle(raw: unknown, factText: string): string {
 }
 
 /** Drop assistant voice, plot dumps, greetings, and duplicates. Cap at 5. Accepts legacy plain-string items. */
-export function normalizeChatFactPairs(facts: unknown): ChatFact[] {
+export function normalizeChatFactPairs(facts: unknown, tenantName?: string | null): ChatFact[] {
   if (!Array.isArray(facts)) return [];
   const out: ChatFact[] = [];
   const seen = new Set<string>();
@@ -204,7 +221,7 @@ export function normalizeChatFactPairs(facts: unknown): ChatFact[] {
       continue;
     }
     const t = text.trim().replace(/\s+/g, ' ');
-    if (!acceptChatFact(t)) continue;
+    if (!acceptChatFact(t, tenantName)) continue;
     const key = t.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -316,7 +333,7 @@ Regras:
 - A data da conversa é quando foi dito, não quando aconteceu. Não use a data da conversa como data do evento sem indicação explícita da pessoa.
 - Quando a pessoa disser QUANDO aconteceu (relativo: "ontem", "semana passada", "há 5 meses", "3 dias depois"; ou absoluto: "em junho", "dia 10"), converta para data absoluta usando a Data da conversa como âncora e inclua no texto do fato (ex: "em junho/2026", "em 13/11/2026"). Sem quando explícito, não invente data nenhuma.
 - Cada fato é um objeto {"text","title","relevance","kind","sensitive"}.
-- "text": UMA frase curta, em português, sobre a pessoa, e deve conter "o usuário".
+- "text": UMA frase curta, em português, sobre a pessoa, e deve SEMPRE usar "o usuário" para se referir à pessoa (mesmo que o assistente a chame pelo nome próprio na conversa).
 - "text" precisa fazer sentido SOZINHO, sem ler a conversa. Teste: se o fato contiver pronome ou demonstrativo sem referente explícito ("isso", "essa mistura", "ele"), está errado — reescreva com o nome explícito.
 - "title": título curtíssimo do fato em português, ideal ${TITLE_IDEAL_WORDS} palavras, máximo ${TITLE_MAX_WORDS}. Primeira letra maiúscula. Sem "o usuário", sem aspas, sem ponto final. Substantivo na frente quando der.
 - ${CHAT_FACT_RATING_CRITERIA}
@@ -409,7 +426,15 @@ export async function extractChatFacts(
     maxTokens: 1536, // facts now carry title + relevance/kind/sensitive
     temperature: 0,
   });
-  return normalizeChatFactPairs(result?.facts);
+  let tenantName: string | null = null;
+  if (input.tenant && input.tenant !== MASTER_TENANT) {
+    try {
+      tenantName = await getTenantDisplayName(input.tenant);
+    } catch {
+      tenantName = null;
+    }
+  }
+  return normalizeChatFactPairs(result?.facts, tenantName);
 }
 
 /** Ids that mean "no new memory was stored" — titles must not attach to them. */
@@ -470,6 +495,21 @@ export async function rememberChatTurn(
   } catch (err) {
     console.error('[chat-extract] failed closed, transcript not saved:', err instanceof Error ? err.message : err);
     throw err;
+  }
+
+  // Multitenant: se o tenant tem nome de exibição, ele vale como âncora
+  // além de "o usuário" (o assistente pode chamar a pessoa pelo nome).
+  // Sem reescrever o texto — preserva inferFalse verbatim.
+  if (input.tenant && input.tenant !== MASTER_TENANT) {
+    let tenantName: string | null = null;
+    try {
+      tenantName = await getTenantDisplayName(input.tenant);
+    } catch {
+      tenantName = null;
+    }
+    if (tenantName) {
+      facts = facts.filter((f) => acceptChatFact(f.text, tenantName));
+    }
   }
 
   if (facts.length === 0) {
