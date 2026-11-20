@@ -41,6 +41,19 @@ let graph: Graph;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let autocleanTimer: ReturnType<typeof setInterval> | null = null;
 
+/** Persistence kill-switch (tests set false to avoid touching graph.json). */
+let persistEnabled = true;
+
+/** Test-only: disable/enable disk persistence (saveGraph/debouncedSave). */
+export function __setPersistEnabledForTests(v: boolean): void {
+  persistEnabled = v;
+}
+
+/** Test-only: inject a throwaway graph singleton (never production data). */
+export function __setGraphForTests(g: Graph): void {
+  graph = g;
+}
+
 /** The singleton. Undefined until initGraph() runs (same contract as before). */
 export function getGraph(): Graph {
   return graph;
@@ -91,7 +104,11 @@ export function tenantScope(tenant: string | undefined, project?: string): strin
 }
 
 export function normalizeProject(project: string): string {
-  return normalize(project).replace(/\s+/g, '-');
+  const base = normalize(project).replace(/\s+/g, '-');
+  // Keep the `tn-<tenant>--<project>::<name>` grammar unambiguous:
+  // strip colons (no `::` inside a scope segment) and collapse dashes
+  // (no `--` inside a segment, the tenant/project join token).
+  return base.replace(/:+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
 }
 
 /** Scoped node id. Preserves already-qualified ids (idempotent). */
@@ -100,7 +117,11 @@ export function scopedId(name: string, project?: string, tenant: string = MASTER
   const scope = tenantScope(tenant, project);
   if (!scope) return normalized;
   if (normalized.startsWith(`${scope}${SCOPE_SEPARATOR}`)) return normalized;
-  return `${scope}${SCOPE_SEPARATOR}${normalized}`;
+  // Sanitize separators out of the bare name so `::` / `--` can never
+  // forge a foreign scope (`tn-bob::x` as a *name* becomes `tn-bob x`).
+  const sanitized = normalized.replace(/:+/g, ' ').replace(/-+/g, '-').trim().replace(/\s+/g, ' ');
+  if (sanitized.startsWith(`${scope}${SCOPE_SEPARATOR}`)) return sanitized;
+  return `${scope}${SCOPE_SEPARATOR}${sanitized}`;
 }
 
 /** Project prefix of a node id, or undefined for global/legacy nodes. */
@@ -141,8 +162,34 @@ export function isNodeVisibleToProject(id: string, project?: string, tenant: str
 /** Resolve user input (bare or qualified) to a stored node id. */
 export function resolveNodeId(input: string, project?: string, tenant: string = MASTER_TENANT): string {
   const normalized = normalize(input);
-  if (normalized.includes(SCOPE_SEPARATOR)) return normalized;
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  if (normalized.includes(SCOPE_SEPARATOR)) {
+    if (t !== MASTER_TENANT) {
+      // Non-master: only accept ids already inside the caller's own scope.
+      // Anything else is returned verbatim so the caller-side ownership
+      // filter (`isNodeOwnedByTenant`) drops it (0 removed) instead of
+      // touching foreign data. Never re-prefix foreign ids.
+      const scope = normalized.slice(0, normalized.indexOf(SCOPE_SEPARATOR));
+      const base = `tn-${t}`;
+      if (scope !== base && !scope.startsWith(`${base}--`)) return normalized;
+    }
+    return normalized;
+  }
   return scopedId(normalized, project, tenant);
+}
+
+/**
+ * Ownership gate for destructive graph ops. Master owns everything
+ * (legacy). Non-master owns ONLY its own `tn-<t>` / `tn-<t>--<p>` scopes —
+ * never bare/master nodes, never another tenant's `tn-*` nodes.
+ */
+export function isNodeOwnedByTenant(key: string, tenant: string): boolean {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  if (t === MASTER_TENANT) return true;
+  const scope = nodeProject(key);
+  if (!scope) return false;
+  const base = `tn-${t}`;
+  return scope === base || scope.startsWith(`${base}--`);
 }
 
 /**
@@ -217,6 +264,7 @@ export async function initGraph(): Promise<void> {
 }
 
 export async function saveGraph(): Promise<void> {
+  if (!persistEnabled) return;
   const data: GraphFile = {
     version: GRAPH_SCHEMA_VERSION,
     exportedAt: Date.now(),
@@ -226,6 +274,7 @@ export async function saveGraph(): Promise<void> {
 }
 
 export function debouncedSave(): void {
+  if (!persistEnabled) return;
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveGraph().catch(err => console.error('[graphrag] Save error:', err));
