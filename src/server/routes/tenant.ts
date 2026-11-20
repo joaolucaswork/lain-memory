@@ -11,47 +11,29 @@
  * item (one bad id never aborts the sweep); counts are reported honestly.
  */
 
-import { getMemories, invalidateMem0Cache, deleteMemory } from '../../mem0.js';
+import { invalidateMem0Cache, deleteMemory } from '../../mem0.js';
 import { deleteState } from '../../memory-state.js';
 import {
   createTenant,
   getTenantProjects,
   MASTER_TENANT,
   deleteTenantBlocklistFile,
+  listMemoriesForWipe,
   resetTenantName,
   resetTenantProjects,
   normalizeTenant,
   upsertTenantForSub,
-  TENANT_MEMORY_CAP,
 } from '../../tenants.js';
 import { getBlocklistPath } from '../../forget-blocklist.js';
 import { removeTenantGraph, invalidateGraphCache, purgeTenantOutbox } from '../../graphrag.js';
 import { TRASH_PROJECT } from '../../mem0/lifecycle.js';
-import { json, tenantOf, type Handler } from '../http.js';
+import { json, requireMaster, tenantOf, type Handler } from '../http.js';
 
 /**
- * Write-path budget: at most TENANT_MEMORY_CAP memories per tenant+project
- * scope (global scope included). Counted live via getAll — one extra Qdrant
- * round-trip per remember, acceptable for the MVP (remember already does a
- * search + LLM calls). Master tenant is uncapped (legacy behavior).
+ * Re-exported from tenants.ts (canonical home). Kept here so existing
+ * import sites (`./tenant.js`) keep working.
  */
-export async function enforceTenantCap(
-  tenant: string,
-  project?: string
-): Promise<{ ok: true } | { ok: false; error: string }> {
-  if (tenant === MASTER_TENANT) return { ok: true };
-  try {
-    const existing = await getMemories(project, TENANT_MEMORY_CAP + 1, tenant);
-    if (existing.length >= TENANT_MEMORY_CAP) {
-      return { ok: false, error: `memory cap reached (${TENANT_MEMORY_CAP} per scope) — wipe via POST /api/tenant/wipe to start over` };
-    }
-    return { ok: true };
-  } catch {
-    // Fail-open on count errors: a Qdrant hiccup must not brick writes.
-    // The remember itself will surface backend errors honestly.
-    return { ok: true };
-  }
-}
+export { enforceTenantCap } from '../../tenants.js';
 
 export const handleTenantSignup: Handler = async (data) => {
   const name = typeof data.name === 'string' ? data.name.trim() : '';
@@ -73,7 +55,8 @@ export const handleTenantSignup: Handler = async (data) => {
  * access token server-side. Never open: it mints tenant keys.
  */
 export const handleTenantLink: Handler = async (data) => {
-  if (data.isMaster !== true) return json({ error: 'master only' }, 403);
+  const gate = requireMaster(data);
+  if (gate) return gate;
   const sub = typeof data.sub === 'string' ? data.sub.trim() : '';
   const email = typeof data.email === 'string' ? data.email.trim() : undefined;
   const name = typeof data.name === 'string' ? data.name.trim().slice(0, 40) : '';
@@ -170,9 +153,11 @@ export const handleTenantWipe: Handler = async (data) => {
 
 /**
  * Full account deletion (LGPD): same data sweep as the wipe, then the
- * tenant RECORD is purged (key ring, sub link, name). The slug is freed —
- * a later signup/link may reclaim it. Returns `sub` so the BFF can also
- * delete the Supabase Auth user. Master → 403.
+ * tenant record is TOMBSTONED (key ring cleared, sub unlinked — the slug
+ * stays reserved forever, never reusable). Fail-closed: when the sweep
+ * reports errors, the record is KEPT and a 500 is returned so the caller
+ * can retry safely instead of freeing a dirty slug. Returns `sub` so the
+ * BFF can also delete the Supabase Auth user. Master → 403.
  */
 export const handleTenantAccountDelete: Handler = async (data) => {
   const tenant = normalizeTenant(data.tenant) || tenantOf(data);
@@ -181,32 +166,43 @@ export const handleTenantAccountDelete: Handler = async (data) => {
   }
   const t = tenant;
   const wiped = await wipeTenantData(t);
+  if (wiped.errors.length > 0) {
+    try {
+      await invalidateMem0Cache();
+      await invalidateGraphCache();
+    } catch { /* best-effort */ }
+    return json({ success: false, tenant: t, ...wiped }, 500);
+  }
   let sub: string | undefined;
   try {
     const { deleteTenantRecord } = await import('../../tenants.js');
     sub = (await deleteTenantRecord(t)).supabaseSub;
   } catch (err) {
     wiped.errors.push(`record purge failed: ${err instanceof Error ? err.message : err}`);
+    return json({ success: false, tenant: t, sub, ...wiped }, 500);
   }
   try {
     await invalidateMem0Cache();
     await invalidateGraphCache();
   } catch (err) {
     wiped.errors.push(`cache reset failed: ${err instanceof Error ? err.message : err}`);
+    return json({ success: false, tenant: t, sub, ...wiped }, 500);
   }
 
   return json({ success: true, tenant: t, sub, ...wiped });
 };
 
 /**
- * Data sweep shared by wipe (record stays) and account delete (record goes).
+ * Data sweep shared by wipe (record stays) and account delete (tombstone).
  * Best-effort per item; counts reported honestly. Never throws — errors
  * accumulate in `errors` so a partial sweep is always reported, not lost.
  */
-async function wipeTenantData(t: string): Promise<{
+export async function wipeTenantData(t: string): Promise<{
   deletedMemories: number;
   removedNodes: number;
   purgedOutbox: number;
+  deletedSeeds: number;
+  deletedSessions: number;
   errors: string[];
 }> {
   let deletedMemories = 0;
@@ -222,9 +218,9 @@ async function wipeTenantData(t: string): Promise<{
 
   for (const scope of scopes) {
     for (;;) {
-      let batch: Awaited<ReturnType<typeof getMemories>>;
+      let batch: Awaited<ReturnType<typeof listMemoriesForWipe>>;
       try {
-        batch = await getMemories(scope, 200, t);
+        batch = await listMemoriesForWipe(scope, 200, t);
       } catch (err) {
         errors.push(`list ${scope ?? 'global'} failed: ${err instanceof Error ? err.message : err}`);
         break;
@@ -246,6 +242,8 @@ async function wipeTenantData(t: string): Promise<{
   // Derived projection + outbox + blocklist + registry.
   let removedNodes = 0;
   let purgedOutbox = 0;
+  let deletedSeeds = 0;
+  let deletedSessions = 0;
   try {
     purgedOutbox = purgeTenantOutbox(t);
   } catch (err) {
@@ -261,6 +259,19 @@ async function wipeTenantData(t: string): Promise<{
   } catch (err) {
     errors.push(`blocklist wipe failed: ${err instanceof Error ? err.message : err}`);
   }
+  try {
+    const { deleteTenantSeeds } = await import('../../seed-extraction.js');
+    deletedSeeds = deleteTenantSeeds(t);
+  } catch (err) {
+    errors.push(`seeds wipe failed: ${err instanceof Error ? err.message : err}`);
+  }
+  try {
+    const { deleteTenantPgsSessions } = await import('../../pgs/session.js');
+    const { PGS_SESSIONS_DIR } = await import('../../workspace.js');
+    deletedSessions = deleteTenantPgsSessions(t, PGS_SESSIONS_DIR);
+  } catch (err) {
+    errors.push(`pgs sessions wipe failed: ${err instanceof Error ? err.message : err}`);
+  }
 
-  return { deletedMemories, removedNodes, purgedOutbox, errors };
+  return { deletedMemories, removedNodes, purgedOutbox, deletedSeeds, deletedSessions, errors };
 }
