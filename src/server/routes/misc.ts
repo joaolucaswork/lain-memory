@@ -15,6 +15,9 @@ import { json, tenantOf, type Handler } from '../http.js';
 export const handleSeedExtract: Handler = async (data) => {
   // Chunked fact/entity extraction from raw text or PDFs into seed files.
   const tenant = tenantOf(data);
+  const { enforceTenantCap, recordTenantProject } = await import('../../tenants.js');
+  const cap = await enforceTenantCap(tenant, data.project);
+  if (!cap.ok) return json({ error: cap.error }, 429);
   const input = {
     type: data.type,
     source: data.source,
@@ -25,7 +28,6 @@ export const handleSeedExtract: Handler = async (data) => {
   };
   try {
     const output = await extractSeed(input);
-    const { recordTenantProject } = await import('../../tenants.js');
     await recordTenantProject(tenant, data.project);
     return json({
       success: true,
@@ -38,7 +40,12 @@ export const handleSeedExtract: Handler = async (data) => {
     });
   } catch (err: unknown) {
     console.error('[lain-memory] seed/extract handler error:', err);
-    return json({ success: false, error: err instanceof Error ? err.message : String(err) });
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/master-only/i.test(msg)) return json({ success: false, error: msg }, 403);
+    if (/blocked SSRF|private\/reserved|only http|too many redirects|redirect|exceeds 2 MiB|not allowed|invalid URL/i.test(msg)) {
+      return json({ success: false, error: msg }, 400);
+    }
+    return json({ success: false, error: msg }, 500);
   }
 };
 
@@ -50,6 +57,10 @@ export const handlePgsExecute: Handler = async (data) => {
   // Partition → route → sweep → synthesize over the local GraphRAG.
   if (!data.query) return json({ error: 'query required' });
   const tenant = tenantOf(data);
+  const { checkExpensiveOpAllowed } = await import('../../tenants.js');
+  if (!checkExpensiveOpAllowed(tenant, '/api/pgs/execute')) {
+    return json({ error: 'expensive op rate limit exceeded (5 req/min)' }, 429);
+  }
   const pgsGraph = await cachedGetGraphForPGS(data.project, tenant);
   if (pgsGraph.nodes.length === 0) return json({ error: 'Graph is empty' });
   const providers = createPGSProviders();
