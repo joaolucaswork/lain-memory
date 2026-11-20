@@ -497,21 +497,6 @@ export async function rememberChatTurn(
     throw err;
   }
 
-  // Multitenant: se o tenant tem nome de exibição, ele vale como âncora
-  // além de "o usuário" (o assistente pode chamar a pessoa pelo nome).
-  // Sem reescrever o texto — preserva inferFalse verbatim.
-  if (input.tenant && input.tenant !== MASTER_TENANT) {
-    let tenantName: string | null = null;
-    try {
-      tenantName = await getTenantDisplayName(input.tenant);
-    } catch {
-      tenantName = null;
-    }
-    if (tenantName) {
-      facts = facts.filter((f) => acceptChatFact(f.text, tenantName));
-    }
-  }
-
   if (facts.length === 0) {
     return [{ id: 'noop', memory: '', action: 'NOOP', reason: 'no durable user facts', superseded: [] }];
   }
