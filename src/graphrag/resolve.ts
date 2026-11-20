@@ -136,13 +136,21 @@ export async function pruneGraph(maxNodes: number = 5000): Promise<number> {
   const nodes = getGraph().mapNodes((key, attrs) => {
     const a = attrs as EntityAttrs;
     const daysSinceLastSeen = (Date.now() - (a.lastSeen || 0)) / 86400000;
+    const isTenantNode = key.startsWith('tn-');
     return {
       key,
       score: (a.mentions || 1) / (1 + daysSinceLastSeen),
+      isTenantNode,
     };
   });
 
-  nodes.sort((a, b) => a.score - b.score);
+  // Tenant-spam protection: prune tenant nodes before master/legacy nodes,
+  // so one tenant flooding the shared graph.json can never evict lucas data.
+  // Within each tier, lowest score (stale, low-mention) goes first.
+  nodes.sort((a, b) => {
+    if (a.isTenantNode !== b.isTenantNode) return a.isTenantNode ? -1 : 1;
+    return a.score - b.score;
+  });
   const toRemove = nodes.slice(0, getGraph().order - maxNodes);
   for (const { key } of toRemove) getGraph().dropNode(key);
   await saveGraph();
