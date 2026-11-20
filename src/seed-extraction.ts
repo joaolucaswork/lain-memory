@@ -167,7 +167,8 @@ export function isPrivateIP(ip: string): boolean {
   // IPv6
   if (v.includes(':')) {
     if (v === '::' || v === '::1') return true;
-    if (v.startsWith('fe80:') || v.startsWith('fe80::')) return true; // fe80::/10 link-local (prefix check)
+    // fe80::/10 link-local: fe80–febf (second hex digit 8–b).
+    if (/^fe[89ab][0-9a-f]:/.test(v)) return true;
     if (v.startsWith('fc') || v.startsWith('fd')) return true; // fc00::/7 ULA
     if (v.startsWith('::ffff:')) {
       const mapped = v.slice('::ffff:'.length);
@@ -231,8 +232,10 @@ export async function assertSafePublicUrl(
       return current;
     }
     const status = head.status;
-    // Drain/cancel the peek body so sockets don't leak.
-    try { await head.arrayBuffer(); } catch {}
+    // Drop the peek body WITHOUT buffering: the redirect pre-check only
+    // needs status + Location. Buffering an unbounded 200 body here would
+    // defeat the 2 MiB cap enforced on the real fetch below.
+    try { await head.body?.cancel(); } catch {}
     if (status < 300 || status >= 400) return current;
     const loc = head.headers.get('location');
     if (!loc) return current;
@@ -263,7 +266,8 @@ async function fetchPublicUrlText(url: string, enforceSsrf: boolean): Promise<st
   for (let i = 0; i < 3 && enforceSsrf && response.status >= 300 && response.status < 400; i++) {
     const loc = response.headers.get('location');
     if (!loc) break;
-    try { await response.arrayBuffer(); } catch {}
+    // Discard, don't buffer: this body is never consumed.
+    try { await response.body?.cancel(); } catch {}
     current = new URL(loc, current).toString();
     await assertSafePublicUrl(current);
     response = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
