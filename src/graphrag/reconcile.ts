@@ -12,6 +12,7 @@ import { incrementMetric } from '../mem-metrics.js';
 import { MASTER_TENANT, normalizeTenant } from '../tenants.js';
 import {
   getGraph,
+  isNodeOwnedByTenant,
   isNodeVisibleToProject,
   normalizeProject,
   resolveNodeId,
@@ -140,12 +141,15 @@ export async function reconcileGraph(): Promise<{
 /**
  * Remove specific nodes (and all their edges) from the graph.
  * Returns the list of nodes actually removed.
+ * Non-master tenants can only remove nodes they own (isNodeOwnedByTenant);
+ * foreign ids (other tenants, master bare nodes) are skipped (0 removed).
  */
 export async function removeNodes(nodeIds: string[], project?: string, tenant: string = MASTER_TENANT): Promise<string[]> {
   if (!getGraph()) return [];
   const removed: string[] = [];
   for (const id of nodeIds) {
     const key = resolveNodeId(id, project, tenant);
+    if (!isNodeOwnedByTenant(key, tenant)) continue;
     if (getGraph().hasNode(key)) {
       getGraph().dropNode(key);
       removed.push(key);
@@ -162,6 +166,8 @@ export async function removeNodes(nodeIds: string[], project?: string, tenant: s
 /**
  * Remove specific edges/relationships from a source node.
  * Returns count of edges removed.
+ * Non-master: the source AND every target must be owned by the caller,
+ * otherwise nothing is removed.
  */
 export async function removeRelationships(
   source: string,
@@ -172,14 +178,22 @@ export async function removeRelationships(
 ): Promise<number> {
   if (!getGraph()) return 0;
   const srcKey = resolveNodeId(source, project, tenant);
+  if (!isNodeOwnedByTenant(srcKey, tenant)) return 0;
   if (!getGraph().hasNode(srcKey)) return 0;
 
   const scopedTargets = targets?.map(t => resolveNodeId(t, project, tenant));
+  // Fail-closed: any foreign target aborts the whole op (0 removed).
+  // Prevents `source: own-node, targets: [foreign]` from pruning
+  // cross-tenant edges.
+  if (scopedTargets && !scopedTargets.every(t => isNodeOwnedByTenant(t, tenant))) return 0;
   const toRemove: string[] = [];
   getGraph().forEachOutEdge(srcKey, (edge, attrs, _src, tgt) => {
     const relAttrs = attrs as RelationshipAttrs;
     if (predicates && !predicates.includes(relAttrs.predicate)) return;
     if (scopedTargets && !scopedTargets.includes(tgt)) return;
+    // Never prune edges landing on nodes the caller doesn't own,
+    // even when no explicit target filter was given.
+    if (!isNodeOwnedByTenant(tgt, tenant)) return;
     toRemove.push(edge);
   });
 
