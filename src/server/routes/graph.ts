@@ -18,7 +18,7 @@ import {
   removeRelationships,
   runAutoclean,
 } from '../../graphrag.js';
-import { json, tenantOf, type Handler } from '../http.js';
+import { json, requireMaster, tenantOf, type Handler } from '../http.js';
 
 export const handleGraphQuery: Handler = async (data) => {
   const ctx = await graphQuery(data.query || '', { maxDepth: data.depth, maxNodes: data.maxNodes, project: data.project, tenant: tenantOf(data) });
@@ -45,7 +45,9 @@ export const handleGraphRemoveRelationships: Handler = async (data) => {
   return json({ removed: await removeRelationships(source, predicates, targets, project, tenantOf(data)) });
 };
 
-export const handleGraphAutoclean: Handler = async (_data) => {
+export const handleGraphAutoclean: Handler = async (data) => {
+  const gate = requireMaster(data);
+  if (gate) return gate;
   return json(await runAutoclean());
 };
 
@@ -58,6 +60,11 @@ export const handleGraphIngest: Handler = async (data) => {
   // Pre-extracted payload: applied directly (synchronous, no LLM).
   // On failure the payload is queued durably and reported (Fase 3).
   const tenant = tenantOf(data);
+  const { enforceTenantGraphCap } = await import('../../tenants.js');
+  const incoming = (data.entities?.length ?? 0) + (data.relationships?.length ?? 0);
+  const gcap = await enforceTenantGraphCap(tenant, data.entities?.length ?? 0);
+  if (!gcap.ok) return json({ error: gcap.error }, 429);
+  void incoming;
   try {
     await ingestExtracted(data.entities ?? [], data.relationships ?? [], data.project, { sourceIds: data.sourceIds, tenant });
     return json({ success: true });
@@ -77,7 +84,9 @@ export const handleGraphIngest: Handler = async (data) => {
   }
 };
 
-export const handleGraphSync: Handler = async (_data) => {
+export const handleGraphSync: Handler = async (data) => {
+  const gate = requireMaster(data);
+  if (gate) return gate;
   // Fase 3: drain outbox (incl. crash recovery) and report divergence state.
   const [report, status] = [await reconcileGraph(), getGraphSyncStatus()];
   return json({ ...report, lastError: status.lastError, lastReconciledAt: status.lastReconciledAt });
