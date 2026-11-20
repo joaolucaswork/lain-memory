@@ -20,7 +20,7 @@ export function expandHome(p: string): string {
 
 const WORKSPACE_DIR_ENV = process.env.LAIN_WORKSPACE_DIR;
 export const WORKSPACE_DIR = WORKSPACE_DIR_ENV ? expandHome(WORKSPACE_DIR_ENV) : join(homedir(), 'lain-memory-workspace');
-console.log(`[workspace] WORKSPACE_DIR=${WORKSPACE_DIR} (source: ${WORKSPACE_DIR_ENV ? 'env' : 'default'})`);
+console.error(`[workspace] WORKSPACE_DIR=${WORKSPACE_DIR} (source: ${WORKSPACE_DIR_ENV ? 'env' : 'default'})`);
 
 // Module-load guard: if env explicitly set a path that does NOT exist, fail
 // immediately. This catches stale env (e.g. dir renamed but MCP stdio process
