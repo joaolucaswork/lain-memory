@@ -16,7 +16,7 @@ import {
 import { getGraphSyncStatus, resolveEntities } from '../../graphrag.js';
 import { classifyMemoryAction } from '../../contradiction-detector.js';
 import { getMetrics } from '../../mem-metrics.js';
-import { json, tenantOf, type Handler } from '../http.js';
+import { json, requireMaster, tenantOf, type Handler } from '../http.js';
 
 export const handleRecall: Handler = async (data) => {
   const tenant = tenantOf(data);
@@ -46,7 +46,8 @@ export const handleContext: Handler = async (data) => {
 
 export const handleConsolidate: Handler = async (data) => {
   // Maintenance op on the shared pending-review queue — master only.
-  if (tenantOf(data) !== 'lucas') return json({ error: 'consolidation is a maintenance op (master only)' }, 403);
+  const gate = requireMaster(data);
+  if (gate) return gate;
   const result = await consolidateMemories(data.project);
   return json(result);
 };
@@ -103,11 +104,15 @@ export const handleContradictionScan: Handler = async (data) => {
   return json({ scanned: memories.length, issues: results.length, results, writes: 0, limit, offset });
 };
 
-export const handleMetrics: Handler = async (_data) => {
+export const handleMetrics: Handler = async (data) => {
+  const gate = requireMaster(data);
+  if (gate) return gate;
   return json({ ...getMetrics(), graphOutboxPending: getGraphSyncStatus().pending });
 };
 
 export const handleContradictions: Handler = async (data) => {
+  const gate = requireMaster(data);
+  if (gate) return gate;
   // Item 3: visible backlog — UPDATE merge candidates + DELETE
   // contradictions queued by the automatic sweep. Read-only.
   const { listPending } = await import('../../pending-review.js');
@@ -132,6 +137,8 @@ export const handleContradictions: Handler = async (data) => {
 };
 
 export const handleContradictionsDismiss: Handler = async (data) => {
+  const gate = requireMaster(data);
+  if (gate) return gate;
   if (!data?.id) return json({ error: 'id required' }, 400);
   const { dismissEntry } = await import('../../pending-review.js');
   const ok = await dismissEntry(data.id);
