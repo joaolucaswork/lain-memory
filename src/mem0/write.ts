@@ -131,14 +131,14 @@ Original: ${text}`
 }
 
 // Common PT-BR function words and accented characters used to detect Portuguese text.
-const PT_BR_MARKERS = /\b(?:não|uma|para|com|que|por|isso|está|foi|são|tem|seu|sua|dos|das|pelo|pela|quando|onde|também|então|porque|você|gente)\b/i;
+const PT_BR_MARKERS = /(?<![\p{L}\p{N}_])(?:não|uma|para|com|que|por|isso|está|foi|são|tem|seu|sua|dos|das|pelo|pela|quando|onde|também|então|porque|você|gente)(?![\p{L}\p{N}_])/giu;
 
 /**
  * Heuristic: detect if text is likely Portuguese (pt-BR).
  * Returns 'pt-BR' if confident, undefined if ambiguous.
  * No external dependency — pure regex on common PT-BR function words.
  */
-function detectLanguageHint(text: string): string | undefined {
+export function detectLanguageHint(text: string): string | undefined {
   if (!text) return undefined;
   const matches = (text.match(PT_BR_MARKERS) || []).length;
   // Require at least 2 hits to avoid false positives on short/technical texts
