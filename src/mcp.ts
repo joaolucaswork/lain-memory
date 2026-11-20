@@ -477,6 +477,9 @@ async function main(): Promise<void> {
 // Guard: importing this module (remote /mcp per-request server) must NOT
 // spawn the stdio transport — only `bun run src/mcp.ts` does.
 if (import.meta.main) {
+  // stdout é o canal JSON-RPC do MCP stdio: todo log de módulos
+  // compartilhados com o servidor HTTP vai para stderr.
+  console.log = (...args: unknown[]) => console.error(...(args as []));
   main().catch(e => {
     console.error('[lain-memory MCP] fatal boot error:', e);
     process.exit(1);
