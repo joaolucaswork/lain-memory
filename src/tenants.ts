@@ -168,6 +168,16 @@ interface TenantFileCache {
 
 let tenantFileCache: TenantFileCache | null = null;
 
+/** Constant-time string equality (no early-exit oracle on prefix). */
+function timingSafeEq(a: string, b: string): boolean {
+  if (!a || a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
+    return a === b;
+  }
+}
+
 /** Test-only: clear the in-memory tenants file cache. */
 export function __clearTenantsCacheForTests(): void {
   tenantFileCache = null;
@@ -177,7 +187,15 @@ function saveTenantsSync(records: TenantFile): void {
   const file = getTenantsPath();
   mkdirSync(dirname(file), { recursive: true });
   // 0600: holds key hashes. safeWriteFileSync is atomic (temp + rename).
-  safeWriteFileSync(file, JSON.stringify(records, null, 2), 0o600);
+  try {
+    safeWriteFileSync(file, JSON.stringify(records, null, 2), 0o600);
+  } catch (err) {
+    // The caller mutated the (cached) records object before this throw —
+    // drop the cache so the dirty mutation never serves reads. Disk is
+    // still the authority on the next load.
+    tenantFileCache = null;
+    throw err;
+  }
   try {
     const st = statSync(file);
     tenantFileCache = { file, mtimeMs: st.mtimeMs, records };
@@ -221,18 +239,10 @@ export async function findTenantByKey(key: string): Promise<TenantIdentity | nul
     return await withFileLock(file, () => {
       const records = loadTenantsSync();
       const hash = hashTenantKey(key);
-      const eq = (a: string, b: string): boolean => {
-        if (!a || a.length !== b.length) return false;
-        try {
-          return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-        } catch {
-          return a === b;
-        }
-      };
       for (const rec of Object.values(records)) {
         if (rec.deletedAt) continue; // tombstone: no keys, never resolves
-        if (rec.keyHash && eq(rec.keyHash, hash)) return { tenant: rec.tenant, isMaster: false };
-        if (Array.isArray(rec.pastKeyHashes) && rec.pastKeyHashes.includes(hash)) {
+        if (rec.keyHash && timingSafeEq(rec.keyHash, hash)) return { tenant: rec.tenant, isMaster: false };
+        if (Array.isArray(rec.pastKeyHashes) && rec.pastKeyHashes.some(h => timingSafeEq(h, hash))) {
           return { tenant: rec.tenant, isMaster: false };
         }
       }
@@ -369,7 +379,7 @@ export async function mintTenantKey(tenantSlug: string): Promise<{ tenant: strin
   await withFileLock(file, () => {
     const records = loadTenantsSync();
     const rec = records[t];
-    if (!rec) throw new Error(`unknown tenant '${t}'`);
+    if (!rec || rec.deletedAt) throw new Error(`unknown tenant '${t}'`);
     const ring = Array.isArray(rec.pastKeyHashes) ? rec.pastKeyHashes : [];
     ring.unshift(rec.keyHash);
     rec.keyHash = hashTenantKey(apiKey);
@@ -392,7 +402,7 @@ export async function recordTenantProject(tenant: string, project: string | unde
     await withFileLock(file, () => {
       const records = loadTenantsSync();
       const rec = records[t];
-      if (!rec) return;
+      if (!rec || rec.deletedAt) return; // unknown or tombstoned: nothing to record
       if (!rec.projects.includes(clean)) {
         rec.projects = [...rec.projects, clean].slice(-200);
         saveTenantsSync(records);
@@ -434,7 +444,11 @@ export async function getTenantDisplayName(tenantSlug: string): Promise<string |
   if (!t || t === MASTER_TENANT) return null;
   const file = getTenantsPath();
   try {
-    return await withFileLock(file, () => loadTenantsSync()[t]?.name ?? null);
+    return await withFileLock(file, () => {
+      const rec = loadTenantsSync()[t];
+      if (!rec || rec.deletedAt) return null; // unknown or tombstoned
+      return rec.name ?? null;
+    });
   } catch {
     return null;
   }
@@ -456,7 +470,7 @@ export async function updateTenantName(tenantSlug: string, rawName: unknown): Pr
   await withFileLock(file, () => {
     const records = loadTenantsSync();
     const rec = records[t];
-    if (!rec) throw new Error(`unknown tenant '${t}'`);
+    if (!rec || rec.deletedAt) throw new Error(`unknown tenant '${t}'`);
     rec.name = clean.name;
     saveTenantsSync(records);
     renamed = true;
@@ -615,14 +629,20 @@ export const TENANT_GRAPH_NODE_CAP = 500;
 /**
  * Graph ingest budget: at most TENANT_GRAPH_NODE_CAP nodes per non-master
  * tenant. Master is uncapped (shared legacy graph).
+ * Counts unique NEW scoped ids from BOTH entities and relationship endpoints
+ * (rel subject/object auto-create nodes via upsertEntity) that are not
+ * already in the graph — so `entities: []` + node-bearing relationships
+ * cannot bypass the cap.
  */
 export async function enforceTenantGraphCap(
   tenant: string,
-  incomingNodes = 0
+  entities: Array<{ name: string }> = [],
+  relationships: Array<{ subject: string; object: string }> = [],
+  project?: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (tenant === MASTER_TENANT) return { ok: true };
   try {
-    const { getGraph } = await import('./graphrag/store.js');
+    const { getGraph, scopedId } = await import('./graphrag/store.js');
     const g = getGraph();
     if (!g) return { ok: true };
     const base = `tn-${normalizeTenant(tenant)}`;
@@ -632,7 +652,23 @@ export async function enforceTenantGraphCap(
       const scope = idx <= 0 ? null : key.slice(0, idx);
       if (scope === base || (scope && scope.startsWith(`${base}--`))) owned++;
     });
-    if (owned + incomingNodes > TENANT_GRAPH_NODE_CAP) {
+    const incoming = new Set<string>();
+    const collect = (rawName: unknown): void => {
+      if (typeof rawName !== 'string' || !rawName.trim()) return;
+      let id: string;
+      try {
+        id = scopedId(rawName, project, tenant);
+      } catch {
+        return;
+      }
+      if (!g.hasNode(id)) incoming.add(id);
+    };
+    for (const e of entities) collect(e?.name);
+    for (const r of relationships) {
+      collect(r?.subject);
+      collect(r?.object);
+    }
+    if (owned + incoming.size > TENANT_GRAPH_NODE_CAP) {
       return { ok: false, error: `graph node cap reached (${TENANT_GRAPH_NODE_CAP} nodes) — remove nodes before ingesting more` };
     }
     return { ok: true };
