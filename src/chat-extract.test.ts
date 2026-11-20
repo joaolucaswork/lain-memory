@@ -20,6 +20,7 @@ import {
   sanitizeChatRating,
   TITLE_IDEAL_WORDS,
 } from './chat-extract.js';
+import { detectLanguageHint } from './mem0/write.js';
 
 /** Cards that recall actually stored from the 2026-11-14 Seinfeld turn. */
 const ASSISTANT_FESTIVUS =
@@ -410,5 +411,84 @@ describe('rememberChatTurn estado do extrator', () => {
       },
     );
     expect(result[0]).toMatchObject({ id: 'atom-9' });
+  });
+});
+
+describe('prompt reforça "o usuário" mesmo com nome próprio', () => {
+  test('buildChatExtractPrompt exige SEMPRE "o usuário" (nome do assistente não contamina)', () => {
+    const prompt = buildChatExtractPrompt({
+      user: 'prefiro café forte',
+      assistant: 'Entendi, Ana! Vou lembrar disso.',
+      date: '2026-11-20',
+    });
+    expect(prompt).toContain('deve SEMPRE usar "o usuário"');
+    expect(prompt).toContain('mesmo que o assistente a chame pelo nome próprio');
+  });
+});
+
+describe('tenant anchor (multitenant)', () => {
+  test('acceptChatFact aceita fato ancorado no nome do tenant', () => {
+    expect(acceptChatFact('Ana prefere café forte.', 'Ana')).toBe(true);
+    expect(acceptChatFact('Ana prefere café forte.', 'ana')).toBe(true);
+    expect(acceptChatFact('Ana Maria prefere café forte.', 'Ana Maria')).toBe(true);
+    expect(acceptChatFact('A Ana prefere café forte e pontual.', 'Ana')).toBe(true);
+  });
+
+  test('sem tenantName, nome próprio sozinho não ancora', () => {
+    expect(acceptChatFact('Ana prefere café forte.')).toBe(false);
+    expect(acceptChatFact('Ana prefere café forte.', null)).toBe(false);
+  });
+
+  test('voz do assistente perde mesmo com nome do tenant', () => {
+    expect(acceptChatFact('Segundo o assistente, Ana prefere café forte.', 'Ana')).toBe(false);
+  });
+
+  test('texto sem âncora continua rejeitado mesmo com tenantName', () => {
+    expect(acceptChatFact('Café forte é bom demais à tarde.', 'Ana')).toBe(false);
+    expect(acceptChatFact('sim', 'Ana')).toBe(false);
+  });
+
+  test('normalizeChatFactPairs aceita âncora do tenant e mantém verbatim', () => {
+    const pairs = normalizeChatFactPairs(
+      [{ text: 'Ana prefere café forte.', title: 'Café forte' }],
+      'Ana',
+    );
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0].text).toBe('Ana prefere café forte.');
+  });
+
+  test('extractChatFacts com tenant resolve display name (mock LLM devolve nome próprio)', async () => {
+    const facts = await extractChatFacts(
+      { user: 'prefiro café forte', assistant: 'Anotado, Ana!', date: '2026-11-20', tenant: 'nope-tenant-inexistente' },
+      async () => ({ facts: ['Ana prefere café forte e coado na hora.'] }),
+    );
+    // Sem registro de display name, o slug vira âncora (fallback) — aqui o
+    // slug não casa com "Ana", então cai no legado: só "o usuário" entra.
+    expect(facts).toEqual([]);
+  });
+});
+
+describe('detectLanguageHint (PT-BR)', () => {
+  test('PT-BR com palavras acentuadas → pt-BR', () => {
+    expect(detectLanguageHint('não está tudo bem, você também vai')).toBe('pt-BR');
+    expect(detectLanguageHint('quando você chega, então a gente conversa porque isso importa')).toBe('pt-BR');
+  });
+
+  test('inglês → undefined', () => {
+    expect(detectLanguageHint('User prefers Bun over npm')).toBeUndefined();
+    expect(detectLanguageHint('The quick brown fox jumps over the lazy dog')).toBeUndefined();
+  });
+
+  test('texto curto com só 1 marcador → undefined', () => {
+    expect(detectLanguageHint('para')).toBeUndefined();
+    expect(detectLanguageHint('hello para world')).toBeUndefined();
+    expect(detectLanguageHint('')).toBeUndefined();
+  });
+
+  test('acentos no limite da palavra não quebram o matching', () => {
+    // "não" e "está" precisam contar como 2 hits mesmo com \b quebrado em JS.
+    expect(detectLanguageHint('não está')).toBe('pt-BR');
+    // "nãoX" colado não é palavra — só 1 hit ("você") → undefined.
+    expect(detectLanguageHint('nãoXyz você')).toBeUndefined();
   });
 });
