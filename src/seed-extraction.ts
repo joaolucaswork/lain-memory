@@ -8,13 +8,14 @@
 
 import path from 'path';
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'fs';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { z } from 'zod';
 import { runFastLlmJson, runFastLlm } from './llm-client.js';
 import { addMemoryWithConflictCheck } from './mem0.js';
 import { scoreActionability, scoreFactQuality } from './memory-patterns.js';
 import { isGraphEnabled, ingestExtracted, appendGraphOutbox } from './graphrag.js';
 import { SEEDS_DIR } from './workspace.js';
-import { MASTER_TENANT } from './tenants.js';
+import { MASTER_TENANT, normalizeTenant } from './tenants.js';
 import { safeWriteFileSync } from './file-io-lock.js';
 const ENABLED = process.env.LAIN_SEED_ENABLED !== 'false';
 const MAX_CHUNKS = parseInt(process.env.LAIN_SEED_MAX_CHUNKS || '10', 10);
@@ -137,7 +138,169 @@ function detectType(source: string): SeedInput['type'] {
 
 // ─── Content Extractors ───
 
-async function extractFromUrl(url: string): Promise<string> {
+/** Non-master tenants: only master reads the server filesystem. */
+export const LOCAL_ONLY_MASTER_MESSAGE =
+  'local file paths are master-only — pass type:"text" with rawText';
+
+function tenantOfInput(input: SeedInput): string {
+  return normalizeTenant(input.tenant ?? '') || MASTER_TENANT;
+}
+
+function isMasterInput(input: SeedInput): boolean {
+  return tenantOfInput(input) === MASTER_TENANT;
+}
+
+function isPrivateIPv4(parts: number[]): boolean {
+  const [a, b] = parts;
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 10) return true; // 10/8 RFC1918
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+  if (a === 192 && b === 168) return true; // 192.168/16
+  if (a === 169 && b === 254) return true; // 169.254/16 link-local/cloud metadata
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT
+  if (a === 0) return true; // 0.0.0.0/8 unspecified
+  return false;
+}
+
+export function isPrivateIP(ip: string): boolean {
+  const v = ip.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  // IPv6
+  if (v.includes(':')) {
+    if (v === '::' || v === '::1') return true;
+    if (v.startsWith('fe80:') || v.startsWith('fe80::')) return true; // fe80::/10 link-local (prefix check)
+    if (v.startsWith('fc') || v.startsWith('fd')) return true; // fc00::/7 ULA
+    if (v.startsWith('::ffff:')) {
+      const mapped = v.slice('::ffff:'.length);
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(mapped)) {
+        return isPrivateIPv4(mapped.split('.').map(Number));
+      }
+      return true;
+    }
+    return false;
+  }
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(v);
+  if (!m) return true; // fail-closed: unparseable → treat as private
+  return isPrivateIPv4([Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]);
+}
+
+/**
+ * SSRF guard for non-master URL fetches (and optionally always outside tests).
+ * Rejects non-http(s), private/reserved DNS, and unsafe redirects (max 3 hops).
+ * `lookup` is injectable for offline redirect tests (defaults to dns.lookup).
+ */
+export async function assertSafePublicUrl(
+  rawUrl: string,
+  maxRedirects = 3,
+  lookup: (host: string) => Promise<Array<{ address: string }>> = (host) =>
+    dnsLookup(host, { all: true }) as Promise<Array<{ address: string }>>
+): Promise<URL> {
+  let current: URL;
+  try {
+    current = new URL(rawUrl);
+  } catch {
+    throw new Error(`blocked SSRF: invalid URL`);
+  }
+  if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+    throw new Error(`blocked SSRF: only http/https URLs are allowed (got ${current.protocol})`);
+  }
+  const seen = new Set<string>();
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const host = current.hostname;
+    if (seen.has(current.toString())) throw new Error('blocked SSRF: redirect loop');
+    seen.add(current.toString());
+    let addrs: Array<{ address: string }>;
+    try {
+      addrs = await lookup(host);
+    } catch {
+      throw new Error(`blocked SSRF: DNS lookup failed for ${host}`);
+    }
+    if (!addrs.length) throw new Error(`blocked SSRF: no DNS records for ${host}`);
+    for (const a of addrs) {
+      if (isPrivateIP(a.address)) {
+        throw new Error(`blocked SSRF: ${host} resolves to private/reserved IP (${a.address})`);
+      }
+    }
+    if (hop === maxRedirects) return current;
+    // Peek redirect without following it.
+    let head: Response;
+    try {
+      head = await fetch(current.toString(), { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(15000) });
+    } catch (e) {
+      // Network errors surface here; DNS already validated — let the real
+      // fetch report the failure. Stop redirect pre-check.
+      return current;
+    }
+    const status = head.status;
+    // Drain/cancel the peek body so sockets don't leak.
+    try { await head.arrayBuffer(); } catch {}
+    if (status < 300 || status >= 400) return current;
+    const loc = head.headers.get('location');
+    if (!loc) return current;
+    try {
+      current = new URL(loc, current);
+    } catch {
+      throw new Error('blocked SSRF: invalid redirect location');
+    }
+    if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+      throw new Error(`blocked SSRF: redirect to forbidden protocol (${current.protocol})`);
+    }
+  }
+  throw new Error('blocked SSRF: too many redirects');
+}
+
+async function fetchPublicUrlText(url: string, enforceSsrf: boolean): Promise<string> {
+  let target = url;
+  if (enforceSsrf) {
+    target = (await assertSafePublicUrl(url)).toString();
+  }
+  const res = await fetch(target, {
+    redirect: enforceSsrf ? 'manual' : 'follow',
+    signal: AbortSignal.timeout(15000),
+  });
+  // Manual-redirect fallback (already pre-validated hop-by-hop).
+  let current = target;
+  let response = res;
+  for (let i = 0; i < 3 && enforceSsrf && response.status >= 300 && response.status < 400; i++) {
+    const loc = response.headers.get('location');
+    if (!loc) break;
+    try { await response.arrayBuffer(); } catch {}
+    current = new URL(loc, current).toString();
+    await assertSafePublicUrl(current);
+    response = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(15000) });
+  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  // 2 MiB streaming cap — avoid memory DoS.
+  const MAX_BYTES = 2 * 1024 * 1024;
+  const body = response.body;
+  if (!body) {
+    const text = await response.text();
+    if (text.length > MAX_BYTES) throw new Error('seed URL body exceeds 2 MiB limit');
+    const { NodeHtmlMarkdown } = await import('node-html-markdown');
+    return NodeHtmlMarkdown.translate(text);
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BYTES) {
+      try { await reader.cancel(); } catch {}
+      throw new Error('seed URL body exceeds 2 MiB limit');
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { bytes.set(c, off); off += c.byteLength; }
+  const html = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  const { NodeHtmlMarkdown } = await import('node-html-markdown');
+  return NodeHtmlMarkdown.translate(html);
+}
+
+async function extractFromUrl(url: string, enforceSsrf = false): Promise<string> {
+  if (enforceSsrf) return fetchPublicUrlText(url, true);
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   const html = await response.text();
@@ -162,8 +325,9 @@ async function extractFromTxt(filePath: string): Promise<string> {
 }
 
 async function extractContent(input: SeedInput): Promise<string> {
+  const enforceSsrf = !isMasterInput(input);
   switch (input.type) {
-    case 'url': return extractFromUrl(input.source);
+    case 'url': return extractFromUrl(input.source, enforceSsrf);
     case 'pdf': return extractFromPdf(input.source);
     case 'docx': return extractFromDocx(input.source);
     case 'txt': return extractFromTxt(input.source);
@@ -240,7 +404,29 @@ interface ChunkResult {
   relationships: ExtractedRelationship[];
 }
 
+type ChunkProcessor = (chunk: string, language?: string) => Promise<ChunkResult>;
+let _processChunkOverride: ChunkProcessor | null = null;
+
+/** Test-only: stub the LLM chunk processor (pass null to restore). */
+export function __setProcessChunkForTests(fn: ChunkProcessor | null): void {
+  _processChunkOverride = fn;
+}
+
+type SeedMemorySaver = (
+  text: string,
+  project?: string,
+  opts?: Record<string, unknown>,
+  tenant?: string,
+) => Promise<Array<{ id: string }>>;
+let _seedMemorySaver: SeedMemorySaver | null = null;
+
+/** Test-only: stub the Mem0 save used by seed storage (pass null to restore). */
+export function __setSeedMemorySaverForTests(fn: SeedMemorySaver | null): void {
+  _seedMemorySaver = fn;
+}
+
 async function processChunk(chunk: string, language?: string, retries = 1): Promise<ChunkResult> {
+  if (_processChunkOverride) return _processChunkOverride(chunk, language);
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await runFastLlmJson<ChunkResult>(buildExtractionPrompt(language) + chunk);
@@ -324,9 +510,11 @@ async function mergeChunkResults(results: ChunkResult[]): Promise<{
 
 async function storeSeedResults(output: SeedOutput, project?: string, tenant?: string): Promise<string[]> {
   const memoryIds: string[] = [];
+  const saver: SeedMemorySaver = _seedMemorySaver
+    ?? ((text, proj, opts, ten) => addMemoryWithConflictCheck(text, proj, opts as never, ten) as Promise<Array<{ id: string }>>);
 
   try {
-    const results = await addMemoryWithConflictCheck(`[Seed: ${output.title}] ${output.summary}`, project, { skipQualityCheck: true }, tenant);
+    const results = await saver(`[Seed: ${output.title}] ${output.summary}`, project, { skipQualityCheck: true }, tenant);
     if (Array.isArray(results) && results[0]?.id) memoryIds.push(results[0].id);
   } catch (err) {
     console.error('[seed] Failed to save summary:', err);
@@ -342,7 +530,7 @@ async function storeSeedResults(output: SeedOutput, project?: string, tenant?: s
   for (let i = 0; i < factsToSave.length; i += BATCH_SIZE) {
     const batch = factsToSave.slice(i, i + BATCH_SIZE);
     const batchResults = await Promise.allSettled(
-      batch.map(fact => addMemoryWithConflictCheck(`[Seed: ${output.title}] ${fact}`, project, { skipQualityCheck: true }, tenant))
+      batch.map(fact => saver(`[Seed: ${output.title}] ${fact}`, project, { skipQualityCheck: true }, tenant))
     );
     for (const res of batchResults) {
       if (res.status === 'fulfilled' && Array.isArray(res.value) && res.value[0]?.id) {
@@ -370,7 +558,19 @@ async function storeSeedResults(output: SeedOutput, project?: string, tenant?: s
 }
 
 function ensureSeedsDir(): void {
-  if (!existsSync(SEEDS_DIR)) mkdirSync(SEEDS_DIR, { recursive: true });
+  if (!existsSync(seedsDir())) mkdirSync(seedsDir(), { recursive: true });
+}
+
+/** Test-only override for the seeds directory (never production data). */
+let _seedsDirOverride: string | null = null;
+
+/** Test-only: redirect seed storage (pass null to restore). */
+export function __setSeedsDirForTests(p: string | null): void {
+  _seedsDirOverride = p;
+}
+
+function seedsDir(): string {
+  return _seedsDirOverride ?? SEEDS_DIR;
 }
 
 // ─── Public API ───
@@ -378,7 +578,23 @@ function ensureSeedsDir(): void {
 export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
   if (!ENABLED) throw new Error('Seed extraction is disabled');
 
-  if (!input.type || input.type === 'text') {
+  // Multitenant hardening: non-master tenants never touch the server filesystem.
+  // Auto-detection must not fall through to pdf/docx/txt for them.
+  if (!isMasterInput(input)) {
+    if (input.type === 'pdf' || input.type === 'docx' || input.type === 'txt') {
+      throw new Error(LOCAL_ONLY_MASTER_MESSAGE);
+    }
+    if (!input.type) {
+      if (input.rawText) {
+        input.type = 'text';
+      } else if (input.source?.startsWith('http://') || input.source?.startsWith('https://')) {
+        input.type = 'url';
+      } else {
+        throw new Error(LOCAL_ONLY_MASTER_MESSAGE);
+      }
+    }
+    // Explicit type:'text' stays text (rawText) — never auto-detect from source.
+  } else if (!input.type) {
     input.type = input.source ? detectType(input.source) : 'text';
   }
 
@@ -455,7 +671,7 @@ export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
   output.memoryIds = await storeSeedResults(output, input.project, input.tenant);
 
   ensureSeedsDir();
-  const seedPath = path.join(SEEDS_DIR, `${seedId}.json`);
+  const seedPath = path.join(seedsDir(), `${seedId}.json`);
   safeWriteFileSync(seedPath, JSON.stringify(output, null, 2));
 
   console.log(`[seed] Extracted ${merged.facts.length} facts, ${merged.entities.length} entities from "${merged.title}"`);
@@ -464,11 +680,11 @@ export async function extractSeed(input: SeedInput): Promise<SeedOutput> {
 
 export function listSeeds(project?: string, tenant?: string): SeedOutput[] {
   ensureSeedsDir();
-  const files = readdirSync(SEEDS_DIR).filter(f => f.endsWith('.json'));
+  const files = readdirSync(seedsDir()).filter(f => f.endsWith('.json'));
   const seeds: SeedOutput[] = [];
   for (const file of files) {
     try {
-      const seed = parseSeedFile(readFileSync(path.join(SEEDS_DIR, file), 'utf-8'));
+      const seed = parseSeedFile(readFileSync(path.join(seedsDir(), file), 'utf-8'));
       // Legacy seeds carry no tenant → visible only to the master tenant.
       // Tenant seeds are visible only to their owner.
       const seedTenant = seed?.tenant;
@@ -486,7 +702,7 @@ export function listSeeds(project?: string, tenant?: string): SeedOutput[] {
 }
 
 export function getSeed(id: string): SeedOutput | null {
-  const seedPath = path.join(SEEDS_DIR, `${id}.json`);
+  const seedPath = path.join(seedsDir(), `${id}.json`);
   if (!existsSync(seedPath)) return null;
   return parseSeedFile(readFileSync(seedPath, 'utf-8'));
 }
@@ -502,7 +718,7 @@ export async function deleteSeed(id: string): Promise<boolean> {
     }
   }
 
-  const seedPath = path.join(SEEDS_DIR, `${id}.json`);
+  const seedPath = path.join(seedsDir(), `${id}.json`);
   try { unlinkSync(seedPath); } catch {}
   return true;
 }
@@ -523,4 +739,31 @@ export async function reprocessSeed(id: string): Promise<SeedOutput> {
   await deleteSeed(id);
 
   return extractSeed({ source, type: type as SeedInput['type'], project, language, force: true });
+}
+
+/**
+ * LGPD wipe helper: remove every seed file owned by `tenant`.
+ * Returns the number of seed files deleted. Never touches other tenants.
+ */
+export function deleteTenantSeeds(tenant: string): number {
+  const t = normalizeTenant(tenant);
+  if (!t || t === MASTER_TENANT) return 0;
+  ensureSeedsDir();
+  let deleted = 0;
+  let files: string[] = [];
+  try {
+    files = readdirSync(seedsDir()).filter(f => f.endsWith('.json'));
+  } catch {
+    return 0;
+  }
+  for (const file of files) {
+    try {
+      const seed = parseSeedFile(readFileSync(path.join(seedsDir(), file), 'utf-8'));
+      if (seed?.tenant === t) {
+        unlinkSync(path.join(seedsDir(), file));
+        deleted++;
+      }
+    } catch { /* best-effort per file */ }
+  }
+  return deleted;
 }
