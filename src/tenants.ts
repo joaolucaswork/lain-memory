@@ -13,12 +13,11 @@
  * the plaintext key is shown once at signup).
  */
 
-import { randomBytes, createHash } from 'node:crypto';
-import { readFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { readFileSync, mkdirSync, unlinkSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { withFileLock, safeWriteFileSync } from './file-io-lock.js';
 import { WORKSPACE_DIR } from './workspace.js';
-import { TtlCache } from './lib/ttl-cache.js';
 
 /** Legacy single-user tenant. Master bearer key maps here; scoping is a no-op. */
 export const MASTER_TENANT = 'lucas';
@@ -49,6 +48,8 @@ export interface TenantRecord {
   supabaseSub?: string;
   /** Login email (display + future password-reset; never a secret). */
   email?: string;
+  /** Tombstone marker: set when the account was deleted. Slug stays reserved. */
+  deletedAt?: string;
 }
 
 type TenantFile = Record<string, TenantRecord>;
@@ -65,6 +66,7 @@ export function getTenantsPath(): string {
 /** Test-only: redirect the tenants file (pass null to restore). */
 export function __setTenantsPathForTests(p: string | null): void {
   _pathOverride = p;
+  tenantFileCache = null;
 }
 
 export function masterApiKey(): string {
@@ -110,16 +112,35 @@ export function validateTenantSlug(slug: string): { ok: true } | { ok: false; er
 
 function loadTenantsSync(): TenantFile {
   const file = getTenantsPath();
+  // Fast path: cached records when the file mtime is unchanged.
+  try {
+    const cached = tenantFileCache;
+    if (cached && cached.file === file) {
+      try {
+        const st = statSync(file);
+        if (st.mtimeMs === cached.mtimeMs) return cached.records;
+      } catch {
+        if (cached.missing) return cached.records;
+      }
+    }
+  } catch { /* fall through to disk read */ }
   let raw: string;
   try {
     raw = readFileSync(file, 'utf8');
   } catch (err) {
     if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      tenantFileCache = { file, mtimeMs: 0, missing: true, records: {} };
       return {}; // fresh install — no tenants yet
     }
     throw err;
   }
-  if (!raw.trim()) return {};
+  if (!raw.trim()) {
+    try {
+      const st = statSync(file);
+      tenantFileCache = { file, mtimeMs: st.mtimeMs, records: {} };
+    } catch {}
+    return {};
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -129,7 +150,27 @@ function loadTenantsSync(): TenantFile {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error(`tenants file corrupt (expected object): ${file}`);
   }
+  try {
+    const st = statSync(file);
+    tenantFileCache = { file, mtimeMs: st.mtimeMs, records: parsed as TenantFile };
+  } catch {
+    tenantFileCache = { file, mtimeMs: 0, records: parsed as TenantFile };
+  }
   return parsed as TenantFile;
+}
+
+interface TenantFileCache {
+  file: string;
+  mtimeMs: number;
+  missing?: boolean;
+  records: TenantFile;
+}
+
+let tenantFileCache: TenantFileCache | null = null;
+
+/** Test-only: clear the in-memory tenants file cache. */
+export function __clearTenantsCacheForTests(): void {
+  tenantFileCache = null;
 }
 
 function saveTenantsSync(records: TenantFile): void {
@@ -137,6 +178,12 @@ function saveTenantsSync(records: TenantFile): void {
   mkdirSync(dirname(file), { recursive: true });
   // 0600: holds key hashes. safeWriteFileSync is atomic (temp + rename).
   safeWriteFileSync(file, JSON.stringify(records, null, 2), 0o600);
+  try {
+    const st = statSync(file);
+    tenantFileCache = { file, mtimeMs: st.mtimeMs, records };
+  } catch {
+    tenantFileCache = null;
+  }
 }
 
 export interface TenantIdentity {
@@ -155,14 +202,36 @@ export interface TenantIdentity {
 export async function findTenantByKey(key: string): Promise<TenantIdentity | null> {
   if (!key) return null;
   const master = masterApiKey();
-  if (master && key === master) return { tenant: MASTER_TENANT, isMaster: true };
+  // Constant-time master comparison (no early-exit oracle on prefix).
+  if (master) {
+    if (key.length === master.length) {
+      try {
+        if (timingSafeEqual(Buffer.from(key), Buffer.from(master))) {
+          return { tenant: MASTER_TENANT, isMaster: true };
+        }
+      } catch {
+        if (key === master) return { tenant: MASTER_TENANT, isMaster: true };
+      }
+    } else if (key === master) {
+      return { tenant: MASTER_TENANT, isMaster: true };
+    }
+  }
   try {
     const file = getTenantsPath();
     return await withFileLock(file, () => {
       const records = loadTenantsSync();
       const hash = hashTenantKey(key);
+      const eq = (a: string, b: string): boolean => {
+        if (!a || a.length !== b.length) return false;
+        try {
+          return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+        } catch {
+          return a === b;
+        }
+      };
       for (const rec of Object.values(records)) {
-        if (rec.keyHash === hash) return { tenant: rec.tenant, isMaster: false };
+        if (rec.deletedAt) continue; // tombstone: no keys, never resolves
+        if (rec.keyHash && eq(rec.keyHash, hash)) return { tenant: rec.tenant, isMaster: false };
         if (Array.isArray(rec.pastKeyHashes) && rec.pastKeyHashes.includes(hash)) {
           return { tenant: rec.tenant, isMaster: false };
         }
@@ -444,10 +513,12 @@ export async function deleteTenantBlocklistFile(path: string): Promise<void> {
 }
 
 /**
- * Full account removal: drops the tenant record (key ring, sub link, name,
- * projects). The slug is freed — a later signup/link may reclaim it.
- * Throws on master and unknown tenants. Returns the removed record so the
- * caller can finish external cleanup (e.g. Supabase Auth user deletion).
+ * Full account removal: tombstones the tenant record (key ring cleared, sub
+ * link dropped, name reset to the slug). The slug stays RESERVED forever —
+ * no future signup/link may reclaim it, so orphaned Qdrant/graph data from
+ * a partially-failed wipe can never leak into a new account with the same
+ * name. Throws on master and unknown tenants. Returns the removed record
+ * so the caller can finish external cleanup (e.g. Supabase Auth deletion).
  */
 export async function deleteTenantRecord(tenantSlug: string): Promise<TenantRecord> {
   const t = normalizeTenant(tenantSlug);
@@ -458,32 +529,172 @@ export async function deleteTenantRecord(tenantSlug: string): Promise<TenantReco
     const records = loadTenantsSync();
     const rec = records[t];
     if (!rec) throw new Error(`unknown tenant '${t}'`);
-    removed = rec;
-    delete records[t];
+    if (rec.deletedAt) throw new Error(`unknown tenant '${t}'`);
+    removed = { ...rec };
+    records[t] = {
+      tenant: t,
+      name: t,
+      keyHash: '',
+      pastKeyHashes: [],
+      createdAt: rec.createdAt,
+      projects: [],
+      deletedAt: new Date().toISOString(),
+    };
     saveTenantsSync(records);
   });
   return removed!;
 }
 
-// ─── Rate limits (in-memory TTL, single-instance — same contract as TtlCache) ───
+/** True when the slug is tombstoned (deleted, permanently reserved). */
+export function isTenantTombstoned(slug: string): boolean {
+  try {
+    const records = loadTenantsSync();
+    return Boolean(records[normalizeTenant(slug)]?.deletedAt);
+  } catch {
+    return false;
+  }
+}
 
-const tenantMinuteBudget = new TtlCache<number>({ maxEntries: 5000 });
-const signupHourBudget = new TtlCache<number>({ maxEntries: 1000 });
+// ─── Write-path budgets (moved here from routes/tenant.ts) ───
+
+/**
+ * Write-path budget: at most TENANT_MEMORY_CAP memories per tenant+project
+ * scope (global scope included). Counted live via getAll — one extra Qdrant
+ * round-trip per remember, acceptable for the MVP (remember already does a
+ * search + LLM calls). Master tenant is uncapped (legacy behavior).
+ * Dynamic import of mem0 avoids a static tenants↔mem0 cycle.
+ */
+type CountRow = { id: string };
+type GetMemoriesFn = (project?: string, limit?: number, tenant?: string) => Promise<CountRow[]>;
+
+let _getMemoriesOverride: GetMemoriesFn | null = null;
+
+/** Test-only: stub the memory count source (pass null to restore). */
+export function __setGetMemoriesForTests(fn: GetMemoriesFn | null): void {
+  _getMemoriesOverride = fn;
+}
+
+/**
+ * Memory listing shared by quota checks and LGPD wipe enumeration.
+ * Prefers the test override when set (offline suites), otherwise the real
+ * Mem0 backend. Keeps wipe fail-closed testing deterministic.
+ */
+export async function listMemoriesForWipe(
+  project: string | undefined,
+  limit: number,
+  tenant: string,
+): Promise<Array<{ id: string }>> {
+  const fn: GetMemoriesFn = _getMemoriesOverride
+    ?? (await import('./mem0.js')).getMemories;
+  return fn(project, limit, tenant);
+}
+
+export async function enforceTenantCap(
+  tenant: string,
+  project?: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (tenant === MASTER_TENANT) return { ok: true };
+  try {
+    const getMemories: GetMemoriesFn = _getMemoriesOverride
+      ?? (await import('./mem0.js')).getMemories;
+    const existing = await getMemories(project, TENANT_MEMORY_CAP + 1, tenant);
+    if (existing.length >= TENANT_MEMORY_CAP) {
+      return { ok: false, error: `memory cap reached (${TENANT_MEMORY_CAP} per scope) — wipe via DELETE /api/tenant/data to start over` };
+    }
+    return { ok: true };
+  } catch {
+    // Fail-open on count errors: a Qdrant hiccup must not brick writes.
+    // The remember itself will surface backend errors honestly.
+    return { ok: true };
+  }
+}
+
+/** Max graph nodes owned by a single non-master tenant. */
+export const TENANT_GRAPH_NODE_CAP = 500;
+
+/**
+ * Graph ingest budget: at most TENANT_GRAPH_NODE_CAP nodes per non-master
+ * tenant. Master is uncapped (shared legacy graph).
+ */
+export async function enforceTenantGraphCap(
+  tenant: string,
+  incomingNodes = 0
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (tenant === MASTER_TENANT) return { ok: true };
+  try {
+    const { getGraph } = await import('./graphrag/store.js');
+    const g = getGraph();
+    if (!g) return { ok: true };
+    const base = `tn-${normalizeTenant(tenant)}`;
+    let owned = 0;
+    g.forEachNode((key) => {
+      const idx = key.indexOf('::');
+      const scope = idx <= 0 ? null : key.slice(0, idx);
+      if (scope === base || (scope && scope.startsWith(`${base}--`))) owned++;
+    });
+    if (owned + incomingNodes > TENANT_GRAPH_NODE_CAP) {
+      return { ok: false, error: `graph node cap reached (${TENANT_GRAPH_NODE_CAP} nodes) — remove nodes before ingesting more` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: true };
+  }
+}
+
+// ─── Rate limits (in-memory fixed-window, single-instance) ───
+
+/** Fixed-window limiter: stores {count, resetAt}, preserves resetAt until expiry. */
+export class FixedWindowLimiter {
+  private store = new Map<string, { count: number; resetAt: number }>();
+  constructor(private maxEntries = 5000) {}
+
+  /** True when the call fits the budget (and counts it). */
+  check(key: string, limit: number, windowMs: number, now = Date.now()): boolean {
+    const entry = this.store.get(key);
+    if (!entry || now >= entry.resetAt) {
+      if (this.store.size >= this.maxEntries && !this.store.has(key)) {
+        const oldest = this.store.keys().next();
+        if (!oldest.done) this.store.delete(oldest.value);
+      }
+      this.store.set(key, { count: 1, resetAt: now + windowMs });
+      return true;
+    }
+    if (entry.count >= limit) return false;
+    entry.count++;
+    return true;
+  }
+
+  clear(): void {
+    this.store.clear();
+  }
+}
+
+const tenantMinuteBudget = new FixedWindowLimiter(5000);
+const signupHourBudget = new FixedWindowLimiter(1000);
+const expensiveOpBudget = new FixedWindowLimiter(5000);
+
+/** Reset all in-memory rate-limit buckets (tests). */
+export function __resetRateLimitersForTests(): void {
+  tenantMinuteBudget.clear();
+  signupHourBudget.clear();
+  expensiveOpBudget.clear();
+}
 
 /** True when the call fits the 60 req/min tenant budget (and counts it). */
 export function checkTenantRateLimit(tenant: string): boolean {
   const key = `ratelimit:${normalizeTenant(tenant) || 'unknown'}`;
-  const used = tenantMinuteBudget.get(key) ?? 0;
-  if (used >= RATE_LIMIT_PER_MIN) return false;
-  tenantMinuteBudget.set(key, used + 1, 60);
-  return true;
+  return tenantMinuteBudget.check(key, RATE_LIMIT_PER_MIN, 60_000);
 }
 
 /** True when a signup from this IP fits the 10/hour anti-abuse budget. */
 export function checkSignupAllowed(ip: string): boolean {
   const key = `signup:${ip || 'unknown'}`;
-  const used = signupHourBudget.get(key) ?? 0;
-  if (used >= SIGNUP_MAX_PER_HOUR) return false;
-  signupHourBudget.set(key, used + 1, 3600);
-  return true;
+  return signupHourBudget.check(key, SIGNUP_MAX_PER_HOUR, 3_600_000);
+}
+
+/** Stricter 5 req/min budget for expensive LLM endpoints (non-master). */
+export function checkExpensiveOpAllowed(tenant: string, endpoint: string): boolean {
+  const t = normalizeTenant(tenant) || MASTER_TENANT;
+  if (t === MASTER_TENANT) return true;
+  return expensiveOpBudget.check(`expensive:${t}:${endpoint}`, 5, 60_000);
 }
