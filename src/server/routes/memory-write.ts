@@ -16,11 +16,43 @@ import {
   addToBlocklist,
 } from '../../mem0.js';
 import { rememberChatTurn } from '../../chat-extract.js';
-import { recordTenantProject } from '../../tenants.js';
+import { MASTER_TENANT, enforceTenantCap, recordTenantProject } from '../../tenants.js';
 import { json, tenantOf, type Handler } from '../http.js';
+
+/** Internal Mem0 metadata keys tenants must never set directly. */
+const RESERVED_METADATA_KEYS = new Set([
+  'lain_feedback',
+  'lain_importance',
+  'lain_relevance',
+  'lain_state_snapshot',
+  'deleted_from',
+  'original_id',
+  'trashed_at',
+]);
+
+/**
+ * Strip internal Mem0 metadata keys from a caller-supplied opts object.
+ * Non-master only; master keeps the legacy passthrough. Mutates in place.
+ */
+export function stripReservedMetadata(opts: unknown, tenant: string): void {
+  if (tenant === MASTER_TENANT) return;
+  if (typeof opts !== 'object' || opts === null) return;
+  const rec = opts as Record<string, unknown>;
+  const meta = rec['metadata'];
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return;
+  for (const k of RESERVED_METADATA_KEYS) {
+    if (k in (meta as Record<string, unknown>)) delete (meta as Record<string, unknown>)[k];
+  }
+}
+
+function sanitizeMetadata(opts: unknown, tenant: string): void {
+  stripReservedMetadata(opts, tenant);
+}
 
 export const handleRemember: Handler = async (data) => {
   const tenant = tenantOf(data);
+  const cap = await enforceTenantCap(tenant, data.project);
+  if (!cap.ok) return json({ error: cap.error }, 429);
   if (data.mode === 'chat') {
     const result = await rememberChatTurn({
       user: data.text,
@@ -37,9 +69,6 @@ export const handleRemember: Handler = async (data) => {
   else if (data.mode === 'bundle') memOpts.bundleMode = true;
   else if (data.mode === 'raw') memOpts.inferFalse = true;
   if (data.skipQualityCheck) memOpts.skipQualityCheck = true;
-  const { enforceTenantCap } = await import('./tenant.js');
-  const cap = await enforceTenantCap(tenant, data.project);
-  if (!cap.ok) return json({ error: cap.error }, 429);
   const result = await addMemoryWithConflictCheck(data.text, data.project, memOpts, tenant);
   await recordTenantProject(tenant, data.project);
   return json(result);
@@ -49,7 +78,7 @@ export const handleAdd: Handler = async (data) => {
   // Direct addMemory (no conflict check). Used by notes/file ingests
   // that pre-filter. Same AddMemoryOpts shape as in-process calls.
   const tenant = tenantOf(data);
-  const { enforceTenantCap } = await import('./tenant.js');
+  sanitizeMetadata(data.opts, tenant);
   const cap = await enforceTenantCap(tenant, data.project);
   if (!cap.ok) return json({ error: cap.error }, 429);
   const result = await addMemory(data.text, data.project, data.opts, tenant);
@@ -122,6 +151,10 @@ export const handleUpdate: Handler = async (data) => {
 export const handleBundle: Handler = async (data) => {
   const { runBundleSweep } = await import('../../bundle-sweep.js');
   const tenant = tenantOf(data);
+  if (!data.dry_run) {
+    const cap = await enforceTenantCap(tenant, 'diario');
+    if (!cap.ok) return json({ error: cap.error }, 429);
+  }
   const result = await runBundleSweep(data.dry_run ? { dryRun: true, tenant } : { tenant });
   await recordTenantProject(tenant, 'diario');
   return json(result);
